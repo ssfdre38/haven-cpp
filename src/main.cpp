@@ -294,7 +294,7 @@ int main(int argc, char** argv) {
         std::cout << "💭 (Aura is processing...)\r" << std::flush;
 
         // Format turn with Gemma 4 chat template and dynamic plugin capabilities
-        std::string turn_prompt = "<start_of_turn>user\n" + user_input + "<end_of_turn>\n<start_of_turn>model\n";
+        std::string turn_prompt = "<|turn>user\n" + user_input + "<turn|>\n<|turn>model\n";
         auto turn_tokens = haven_engine.tokenize(turn_prompt, false);
         haven_engine.get_plugin_manager().dispatch_prompt_prefill(turn_prompt, turn_tokens);
 
@@ -314,16 +314,17 @@ int main(int argc, char** argv) {
                 logits.data(), haven_engine.get_config().vocab_size, turn_generated_tokens);
             turn_generated_tokens.push_back(next_tok);
 
-            // Gemma 4 end of turn tokens: <eos> (1), <start_of_turn> (105), <end_of_turn> (106), </s> (212)
-            if (next_tok == haven_engine.get_tokenizer().eos_token() || next_tok == 1 || next_tok == 105 || next_tok == 106 || next_tok == 212) {
+            // Gemma 4 end of turn tokens: <eos> (1), <turn|> (106), </s> (212)
+            if (next_tok == haven_engine.get_tokenizer().eos_token() || next_tok == 1 || next_tok == 106 || next_tok == 212) {
                 ended_with_turn_tag = true;
                 break;
             }
 
             std::string piece = haven_engine.detokenize(next_tok);
-            if (piece.find("<end_of_turn>") != std::string::npos || 
-                piece.find("<start_of_turn>") != std::string::npos || 
-                piece.find("<turn|>") != std::string::npos || 
+            if (piece.find("<turn|>") != std::string::npos || 
+                piece.find("</end_of_turn>") != std::string::npos || 
+                piece.find("<end_of_turn") != std::string::npos || 
+                piece.find("<start_of_turn") != std::string::npos || 
                 piece.find("<eos>") != std::string::npos ||
                 piece.find("<|turn") != std::string::npos) 
             {
@@ -368,18 +369,18 @@ int main(int argc, char** argv) {
 
         // Forward closing turn tag to KV cache only if not already emitted
         if (!ended_with_turn_tag) {
-            auto closing_tokens = haven_engine.tokenize("<end_of_turn>\n", false);
-            for (uint32_t ct : closing_tokens) {
+            auto close_toks = haven_engine.tokenize("<turn|>\n", false);
+            for (uint32_t ct : close_toks) {
                 haven_engine.forward(ct, active_kv_pos++, nullptr);
             }
         }
+        std::cout << "\n" << std::flush;
 
 #ifdef _WIN32
         SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
         EmptyWorkingSet(GetCurrentProcess());
 #endif
 
-        std::cout << "\n";
     }
 
     return 0;

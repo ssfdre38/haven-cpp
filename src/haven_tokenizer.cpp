@@ -39,8 +39,10 @@ std::vector<uint32_t> HavenTokenizer::encode(const std::string& text, bool add_b
 
     // List of priority control tokens in Gemma 4
     static const std::vector<std::string> control_tokens = {
-        "<start_of_turn>", "<end_of_turn>", "<bos>", "<eos>", "<pad>",
-        "<|thought>", "</thought>", "<|tool_call|>", "<|tool_response|>"
+        "<|turn>", "<turn|>", "<bos>", "<eos>", "<pad>",
+        "<|think|>", "<|channel>", "<channel|>",
+        "<|tool_call>", "<tool_call|>", "<|tool_response>", "<tool_response|>",
+        "<start_of_turn>", "<end_of_turn>", "</end_of_turn>"
     };
 
     size_t pos = 0;
@@ -138,7 +140,9 @@ std::string HavenTokenizer::decode_token(uint32_t token_id) const {
     const std::string& raw = vocab_[token_id];
 
     // Filter control tokens
-    if (raw == "<bos>" || raw == "<eos>" || raw == "<start_of_turn>" || raw == "<end_of_turn>" || raw == "<pad>") {
+    if (raw == "<bos>" || raw == "<eos>" || raw == "<|turn>" || raw == "<turn|>" ||
+        raw == "<start_of_turn>" || raw == "<end_of_turn>" || raw == "</end_of_turn>" || 
+        raw == "<pad>" || raw == "</s>") {
         return "";
     }
 
