@@ -39,8 +39,8 @@ std::vector<uint32_t> HavenTokenizer::encode(const std::string& text, bool add_b
 
     // List of priority control tokens in Gemma 4
     static const std::vector<std::string> control_tokens = {
-        "<|turn>", "<turn|>", "<|thought>", "</thought>",
-        "<start_of_turn>", "<end_of_turn>", "<bos>", "<eos>", "<pad>"
+        "<start_of_turn>", "<end_of_turn>", "<bos>", "<eos>", "<pad>",
+        "<|thought>", "</thought>", "<|tool_call|>", "<|tool_response|>"
     };
 
     size_t pos = 0;
@@ -62,13 +62,20 @@ std::vector<uint32_t> HavenTokenizer::encode(const std::string& text, bool add_b
         }
         if (matched_control) continue;
 
-        // Otherwise, consume regular text until next control token or end
+        // Otherwise, find the next valid control token that exists in vocab
         size_t next_ctrl = len;
         for (const auto& ct : control_tokens) {
-            size_t c_pos = text.find(ct, pos);
-            if (c_pos != std::string::npos && c_pos < next_ctrl) {
-                next_ctrl = c_pos;
+            if (token_to_id_.find(ct) != token_to_id_.end()) {
+                size_t c_pos = text.find(ct, pos);
+                if (c_pos != std::string::npos && c_pos < next_ctrl) {
+                    next_ctrl = c_pos;
+                }
             }
+        }
+
+        // If next_ctrl == pos (unrecognized control token), consume at least 1 character to avoid infinite loop
+        if (next_ctrl == pos) {
+            next_ctrl = pos + 1;
         }
 
         std::string segment = text.substr(pos, next_ctrl - pos);
