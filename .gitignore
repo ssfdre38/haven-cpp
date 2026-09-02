@@ -11,6 +11,10 @@ obj/
 *.obj
 *.o
 
+# Python caches
+__pycache__/
+*.pyc
+
 # Models and Large Binaries
 *.gguf
 *.bin
