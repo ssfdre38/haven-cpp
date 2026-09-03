@@ -111,12 +111,21 @@ uint32_t PersonaSampler::sample(
             }
         }
 
-        // 2c. Consecutive Hyphen / Run-on Suppression (Token 236772 = '-')
-        if (last_token == 236772 && vocab_size > 236772) {
-            logits[236772] -= 8.0f; // Strongly suppress hyphen-chains (e.g. I-don't-don't-can't)
+        // 2c. Turn-Start Parenthetical Action Suppression (Tokens 568 = ' (', 236769 = '(')
+        if (n_tokens <= 2) {
+            if (vocab_size > 568) logits[568] -= 6.0f; // Prevent starting turn with "(chuckles..."
+            if (vocab_size > 236769) logits[236769] -= 6.0f;
         }
 
-        // 2d. Roleplay Asterisk Suppression (Token 236829 = '*')
+        // 2d. General & Consecutive Hyphen / Run-on Suppression (Token 236772 = '-')
+        if (vocab_size > 236772) {
+            logits[236772] -= 1.5f; // Mildly discourage coining hyphenated adjective compounds (anxious-storming)
+            if (last_token == 236772) {
+                logits[236772] -= 8.0f; // Strongly suppress hyphen-chains (e.g. I-don't-don't-can't)
+            }
+        }
+
+        // 2e. Roleplay Asterisk Suppression (Token 236829 = '*')
         if (vocab_size > 236829) {
             logits[236829] -= 5.0f; // Suppress roleplay asterisks (*telling you*)
         }
