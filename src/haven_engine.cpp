@@ -125,15 +125,18 @@ bool HavenEngine::load_model(const std::string& gguf_filepath) {
     }
 
     // Initialize Universal Default Persona Sampler Configuration (Single Source of Truth across CLI & Server)
-    sampler_.get_params().temperature = 0.40f;
-    sampler_.get_params().top_p = 0.95f;
+    sampler_.get_params().temperature = 0.65f;
+    sampler_.get_params().top_p = 0.90f;
     sampler_.get_params().top_k = 40;
     sampler_.get_params().min_p = 0.05f;
-    sampler_.get_params().repetition_penalty = 1.0f;
-    sampler_.get_params().dry_multiplier = 0.0f;
+    sampler_.get_params().repetition_penalty = 1.15f;
+    sampler_.get_params().dry_multiplier = 0.5f;
     sampler_.get_params().dry_base = 1.75f;
     sampler_.get_params().dry_allowed_length = 2;
     sampler_.get_params().dry_penalty_last_n = 64;
+
+    // Initialize cross-token lemma duplicate suppression map (e.g. ▁just vs just)
+    sampler_.initialize_vocab_counterparts(loader_.get_vocabulary());
 
     return true;
 }

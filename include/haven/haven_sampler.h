@@ -40,12 +40,16 @@ public:
         int embedding_dim = 0
     );
 
+    // Builds bidirectional lemma map to eliminate cross-token stutter (e.g. ▁just vs just)
+    void initialize_vocab_counterparts(const std::vector<std::string>& vocab);
+
     SamplerParams& get_params() { return params_; }
 
 private:
     SamplerParams params_;
     std::vector<float> persona_embedding_;
     std::unordered_map<uint32_t, float> token_penalties_;
+    std::vector<uint32_t> counterparts_;
     std::mt19937 rng_;
 };
 

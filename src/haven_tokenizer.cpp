@@ -84,12 +84,16 @@ std::vector<uint32_t> HavenTokenizer::encode(const std::string& text, bool add_b
         pos = next_ctrl;
 
         // Replace regular spaces with SentencePiece space indicator (\xe2\x96\x81 =  )
+        // and prepend dummy prefix (\xe2\x96\x81) at the start of segments or right after newlines
         std::string normalized;
         normalized.reserve(segment.length() * 2);
         for (size_t i = 0; i < segment.length(); ++i) {
             if (segment[i] == ' ') {
                 normalized += "\xe2\x96\x81";
             } else {
+                if (normalized.empty() || normalized.back() == '\n') {
+                    normalized += "\xe2\x96\x81";
+                }
                 normalized += segment[i];
             }
         }
@@ -188,7 +192,7 @@ std::string HavenTokenizer::decode(const std::vector<uint32_t>& tokens) const {
 }
 
 std::string HavenTokenizer::format_turn(const std::string& role, const std::string& content) const {
-    return "<start_of_turn>" + role + "\n" + content + "<end_of_turn>\n";
+    return "<|turn>" + role + "\n" + content + "<turn|>\n";
 }
 
 } // namespace haven
