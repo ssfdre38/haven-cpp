@@ -9,7 +9,7 @@
 namespace haven {
 
 struct SamplerParams {
-    float temperature = 0.70f;
+    float temperature = 0.48f;
     float min_p = 0.05f;
     float top_p = 0.90f;
     int   top_k = 40;
@@ -49,7 +49,7 @@ private:
     SamplerParams params_;
     std::vector<float> persona_embedding_;
     std::unordered_map<uint32_t, float> token_penalties_;
-    std::vector<uint32_t> counterparts_;
+    std::vector<std::vector<uint32_t>> lemma_family_;
     std::mt19937 rng_;
 };
 

@@ -20,23 +20,31 @@ void PersonaSampler::add_anti_robotic_penalty(uint32_t token_id, float penalty_s
 }
 
 void PersonaSampler::initialize_vocab_counterparts(const std::vector<std::string>& vocab) {
-    std::unordered_map<std::string, uint32_t> map;
-    map.reserve(vocab.size());
-    for (uint32_t i = 0; i < (uint32_t)vocab.size(); ++i) {
-        map[vocab[i]] = i;
-    }
-    counterparts_.assign(vocab.size(), 0);
-    for (uint32_t i = 0; i < (uint32_t)vocab.size(); ++i) {
-        if (vocab[i].length() > 3 && 
-            (unsigned char)vocab[i][0] == 0xe2 && 
-            (unsigned char)vocab[i][1] == 0x96 && 
-            (unsigned char)vocab[i][2] == 0x81) 
+    lemma_family_.assign(vocab.size(), {});
+
+    std::unordered_map<std::string, std::vector<uint32_t>> stem_to_tokens;
+    stem_to_tokens.reserve(vocab.size());
+
+    for (uint32_t i = 107; i < (uint32_t)vocab.size(); ++i) {
+        std::string s = vocab[i];
+        if (s.length() > 3 && 
+            (unsigned char)s[0] == 0xe2 && 
+            (unsigned char)s[1] == 0x96 && 
+            (unsigned char)s[2] == 0x81) 
         {
-            std::string unspaced = vocab[i].substr(3);
-            auto it = map.find(unspaced);
-            if (it != map.end()) {
-                counterparts_[i] = it->second;
-                counterparts_[it->second] = i;
+            s = s.substr(3);
+        }
+        std::string lower;
+        for (char c : s) lower += (char)std::tolower((unsigned char)c);
+        if (!lower.empty() && lower.find_first_of("abcdefghijklmnopqrstuvwxyz") != std::string::npos) {
+            stem_to_tokens[lower].push_back(i);
+        }
+    }
+
+    for (const auto& [stem, tokens] : stem_to_tokens) {
+        if (tokens.size() > 1) {
+            for (uint32_t t : tokens) {
+                lemma_family_[t] = tokens;
             }
         }
     }
@@ -92,11 +100,15 @@ uint32_t PersonaSampler::sample(
         const size_t n_tokens = recent_tokens.size();
         uint32_t last_token = recent_tokens.back();
 
-        // 2a. Consecutive Exact Word & Lemma Stutter Suppression (e.g. ▁just vs just, ▁anything vs anything)
+        // 2a. Consecutive Exact Word & Full Lemma Stutter Suppression (e.g. Oh oh, Just just, Anything anything)
         if (last_token < vocab_size && last_token > 106) {
-            logits[last_token] -= 4.0f;
-            if (last_token < counterparts_.size() && counterparts_[last_token] != 0 && counterparts_[last_token] < vocab_size) {
-                logits[counterparts_[last_token]] -= 4.0f;
+            logits[last_token] -= 4.5f;
+            if (last_token < lemma_family_.size() && !lemma_family_[last_token].empty()) {
+                for (uint32_t sibling : lemma_family_[last_token]) {
+                    if (sibling < vocab_size) {
+                        logits[sibling] -= 4.5f;
+                    }
+                }
             }
         }
 
@@ -104,9 +116,13 @@ uint32_t PersonaSampler::sample(
         if (n_tokens >= 2) {
             uint32_t prev2 = recent_tokens[n_tokens - 2];
             if (prev2 < vocab_size && prev2 > 106) {
-                logits[prev2] -= 2.0f;
-                if (prev2 < counterparts_.size() && counterparts_[prev2] != 0 && counterparts_[prev2] < vocab_size) {
-                    logits[counterparts_[prev2]] -= 2.0f;
+                logits[prev2] -= 2.5f;
+                if (prev2 < lemma_family_.size() && !lemma_family_[prev2].empty()) {
+                    for (uint32_t sibling : lemma_family_[prev2]) {
+                        if (sibling < vocab_size) {
+                            logits[sibling] -= 2.5f;
+                        }
+                    }
                 }
             }
         }
@@ -125,9 +141,12 @@ uint32_t PersonaSampler::sample(
             }
         }
 
-        // 2e. Roleplay Asterisk Suppression (Token 236829 = '*')
+        // 2e. Roleplay Asterisk Suppression (Token 808 = ' *', Token 236829 = '*')
+        if (vocab_size > 808) {
+            logits[808] -= 8.0f; // Strongly suppress spaced asterisk (' *you')
+        }
         if (vocab_size > 236829) {
-            logits[236829] -= 5.0f; // Suppress roleplay asterisks (*telling you*)
+            logits[236829] -= 8.0f; // Strongly suppress raw asterisk ('*')
         }
 
         // 2e. 3-gram and 2-gram Phrase Repetition Suppression

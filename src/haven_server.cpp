@@ -59,7 +59,7 @@ public:
                 std::cout << "[HavenServer] ✓ Sovereign Model Loaded in-process! Standalone generation active.\n" << std::flush;
 
                 // Optimal default hyperparameters for Gemma 4 Sovereign Persona
-                haven_engine_.get_sampler().get_params().temperature = 0.70f;
+                haven_engine_.get_sampler().get_params().temperature = 0.48f;
                 haven_engine_.get_sampler().get_params().top_p = 0.90f;
                 haven_engine_.get_sampler().get_params().top_k = 40;
                 haven_engine_.get_sampler().get_params().min_p = 0.05f;

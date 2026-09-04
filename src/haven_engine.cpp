@@ -125,7 +125,7 @@ bool HavenEngine::load_model(const std::string& gguf_filepath) {
     }
 
     // Initialize Universal Default Persona Sampler Configuration (Single Source of Truth across CLI & Server)
-    sampler_.get_params().temperature = 0.65f;
+    sampler_.get_params().temperature = 0.48f;
     sampler_.get_params().top_p = 0.90f;
     sampler_.get_params().top_k = 40;
     sampler_.get_params().min_p = 0.05f;
