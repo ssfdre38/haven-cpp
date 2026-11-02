@@ -62,6 +62,12 @@ add_executable(test-quant
     ${HAVEN_CORE_SRCS}
 )
 
+# Test Lazy Plugin Manager Executable
+add_executable(test-lazy-plugins
+    tests/test_lazy_plugins.cpp
+    ${HAVEN_CORE_SRCS}
+)
+
 # Native Sovereign Plugins
 add_library(plugin_yt_music SHARED
     plugins/yt_music_plugin.cpp
@@ -203,6 +209,7 @@ if (WIN32)
     target_link_libraries(haven-server ws2_32 psapi)
     target_link_libraries(test-standalone ws2_32)
     target_link_libraries(test-quant ws2_32)
+    target_link_libraries(test-lazy-plugins ws2_32 psapi)
     target_link_libraries(plugin_system_sensory psapi)
     target_link_libraries(plugin_screen_vision psapi)
     target_link_libraries(plugin_web_research winhttp)

@@ -195,8 +195,8 @@ int main(int argc, char** argv) {
     std::cout << "==================================================================\n";
     std::cout << "✓ GGUF Model: " << model_path << " (" << std::fixed << std::setprecision(1) << load_ms << " ms)\n";
     std::cout << "✓ Cognitive Memories: " << haven_engine.get_memory_count() << " active memory anchors\n";
-    std::cout << "✓ Sovereign Plugins: " << haven_engine.get_plugin_manager().get_plugin_count() << " active native extensions\n";
-    std::cout << "✓ Commands: /reset, /memory, /plugins, /tool <action>, /exit\n";
+    std::cout << "✓ Sovereign Plugins: " << haven_engine.get_plugin_manager().get_plugin_count() << " registered (" << haven_engine.get_plugin_manager().get_active_plugin_count() << " active in RAM, on-demand hot-loading)\n";
+    std::cout << "✓ Commands: /reset, /memory, /plugins, /plugins unload, /tool <action>, /exit\n";
     std::cout << "------------------------------------------------------------------\n\n";
 
     const std::string system_prompt = haven::HavenEngine::get_default_system_prompt();
@@ -260,15 +260,22 @@ int main(int argc, char** argv) {
             continue;
         }
 
+        if (user_input == "/plugins unload") {
+            size_t freed = haven_engine.get_plugin_manager().unload_idle_plugins(0);
+            std::cout << "✨ [Plugin Cache Flushed] Released " << freed << " plugins from RAM back to cold storage. Active in RAM: " << haven_engine.get_plugin_manager().get_active_plugin_count() << "\n";
+            continue;
+        }
+
         if (user_input == "/plugins") {
             const auto& plugins = haven_engine.get_plugin_manager().get_loaded_plugins();
-            std::cout << "🔌 Active Sovereign Plugins (" << plugins.size() << " loaded):\n";
+            size_t active = haven_engine.get_plugin_manager().get_active_plugin_count();
+            std::cout << "🔌 Sovereign Plugins (" << plugins.size() << " registered, " << active << " active in RAM):\n";
             int idx = 1;
             for (const auto& [id, record] : plugins) {
                 std::cout << "   [" << idx++ << "] " << record.metadata.name 
-                          << " (v" << record.metadata.version << ") - " << record.metadata.description << "\n";
+                          << " (v" << record.metadata.version << ") [" << (record.is_loaded ? "ACTIVE IN RAM" : "COLD ON DISK") << "] - " << record.metadata.description << "\n";
             }
-            std::cout << "   Tip: Use '/plugins reload' to hot-swap new plugins mid-session!\n";
+            std::cout << "   Tip: Use '/plugins unload' to flush idle plugins or '/plugins reload' to re-probe.\n";
             continue;
         }
 

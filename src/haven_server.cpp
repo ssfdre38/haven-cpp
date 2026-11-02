@@ -884,7 +884,9 @@ private:
         }
         else if (path == "/api/plugins") {
             const auto& plugins = haven_engine_.get_plugin_manager().get_loaded_plugins();
-            std::string json = "{\"ok\":true,\"total\":" + std::to_string(plugins.size()) + ",\"plugins\":[";
+            size_t active = haven_engine_.get_plugin_manager().get_active_plugin_count();
+            std::string json = "{\"ok\":true,\"total\":" + std::to_string(plugins.size()) 
+                             + ",\"active_in_ram\":" + std::to_string(active) + ",\"plugins\":[";
             bool first = true;
             for (const auto& [id, record] : plugins) {
                 if (!first) json += ",";
@@ -892,13 +894,22 @@ private:
                      + "\",\"name\":\"" + escape_json_string(record.metadata.name) 
                      + "\",\"version\":\"" + escape_json_string(record.metadata.version)
                      + "\",\"author\":\"" + escape_json_string(record.metadata.author)
-                     + "\",\"description\":\"" + escape_json_string(record.metadata.description) + "\"}";
+                     + "\",\"description\":\"" + escape_json_string(record.metadata.description) 
+                     + "\",\"is_loaded\":" + std::string(record.is_loaded ? "true" : "false") + "}";
                 first = false;
             }
             json += "]}";
             std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
                              + std::to_string(json.length()) + "\r\n\r\n" + json;
             send_all(sock, resp.c_str(), (int)resp.length());
+        }
+        else if (path == "/api/plugins/unload") {
+            size_t freed = haven_engine_.get_plugin_manager().unload_idle_plugins(0);
+            size_t active = haven_engine_.get_plugin_manager().get_active_plugin_count();
+            std::string json = "{\"ok\":true,\"unloaded\":" + std::to_string(freed) + ",\"active_in_ram\":" + std::to_string(active) + ",\"message\":\"Flushed idle plugins from memory.\"}";
+            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
+                             + std::to_string(json.length()) + "\r\n\r\n" + json;
+            send(sock, resp.c_str(), (int)resp.length(), 0);
         }
         else if (path == "/api/plugins/reload") {
             size_t reloaded = haven_engine_.get_plugin_manager().reload_all("plugins");
