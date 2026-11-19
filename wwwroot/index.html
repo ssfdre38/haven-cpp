@@ -1165,6 +1165,20 @@
                 <button class="icon-btn" onclick="closeModelModal()">✕</button>
             </div>
             <div class="modal-body">
+                <!-- Custom Models Directory Card -->
+                <div style="background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius-sm); padding: 10px 12px; margin-bottom: 12px;">
+                    <div style="font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-dim); margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center;">
+                        <span>Custom Models Directory</span>
+                        <span id="folder-status-pill" style="font-size: 11px; font-weight: 500; color: var(--accent-blue);"></span>
+                    </div>
+                    <div style="display: flex; gap: 8px;">
+                        <input type="text" id="custom-folder-input" placeholder="e.g. C:\Users\admin\gemma4-turbo-family or D:\AI\Models"
+                               style="flex: 1; padding: 7px 10px; border-radius: var(--radius-sm); background: var(--bg-body); border: 1px solid var(--border-color); color: #fff; font-size: 12px; font-family: var(--font-mono); outline: none;"
+                               onkeydown="if(event.key==='Enter') setCustomModelFolder()">
+                        <button class="btn-primary" onclick="setCustomModelFolder()" style="padding: 0 14px; font-size: 12px; white-space: nowrap; height: 32px;">Scan Folder</button>
+                    </div>
+                </div>
+
                 <div style="margin-bottom: 12px;">
                     <input type="text" id="model-search-input" placeholder="Search available GGUF models..." oninput="filterModels(this.value)"
                            style="width: 100%; padding: 8px 12px; border-radius: var(--radius-sm); background: var(--bg-body); border: 1px solid var(--border-color); color: #fff; font-size: 13px; outline: none; font-family: inherit;">
@@ -1235,12 +1249,76 @@
             }
 
             fetchModelInfo();
+            fetchCurrentModelDirectory();
             updateContextMeter();
         }
 
         let availableModels = [];
         let currentModelName = 'haven-chat-v5.0';
         let currentModelFilename = 'haven-chat-v5.0.gguf';
+
+        async function fetchCurrentModelDirectory() {
+            try {
+                const input = document.getElementById('custom-folder-input');
+                const saved = localStorage.getItem('haven_custom_model_dir');
+                if (input && saved) {
+                    input.value = saved;
+                }
+
+                const res = await fetch('/api/models/directory');
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data.active_directory && input && !input.value) {
+                        input.value = data.active_directory;
+                    }
+                }
+            } catch (e) {
+                console.warn('Failed to load model directory:', e);
+            }
+        }
+
+        async function setCustomModelFolder() {
+            const input = document.getElementById('custom-folder-input');
+            const pill = document.getElementById('folder-status-pill');
+            if (!input) return;
+            const dir = input.value.trim();
+            if (!dir) {
+                if (pill) { pill.innerText = 'Enter folder path'; pill.style.color = '#ef4444'; }
+                return;
+            }
+
+            if (pill) {
+                pill.innerText = 'Scanning...';
+                pill.style.color = 'var(--accent-blue)';
+            }
+
+            try {
+                const res = await fetch('/api/models/directory', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ directory: dir })
+                });
+                const data = await res.json();
+                if (res.ok && data.ok) {
+                    localStorage.setItem('haven_custom_model_dir', dir);
+                    if (pill) {
+                        pill.innerText = `✓ Found ${data.model_count || 0} model(s)`;
+                        pill.style.color = '#10b981';
+                    }
+                    await fetchModelInfo();
+                } else {
+                    if (pill) {
+                        pill.innerText = `Error: ${data.error || 'Invalid folder'}`;
+                        pill.style.color = '#ef4444';
+                    }
+                }
+            } catch (err) {
+                if (pill) {
+                    pill.innerText = `Scan error: ${err.message}`;
+                    pill.style.color = '#ef4444';
+                }
+            }
+        }
 
         async function fetchModelInfo() {
             try {
@@ -1271,8 +1349,11 @@
 
         function openModelModal() {
             fetchModelInfo();
+            fetchCurrentModelDirectory();
             const search = document.getElementById('model-search-input');
             if (search) search.value = '';
+            const pill = document.getElementById('folder-status-pill');
+            if (pill) pill.innerText = '';
             document.getElementById('model-modal').style.display = 'flex';
         }
 

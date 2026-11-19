@@ -59,6 +59,7 @@ public:
             load_model_internal(path_to_load, err);
         }
         load_persona();
+        load_model_dirs();
     }
 
     ~HavenMicroServer() {
@@ -241,6 +242,83 @@ private:
         }
         data_json += "]";
         return "{\"object\":\"list\",\"data\":" + data_json + "}";
+    }
+
+    std::string get_model_directories_json() {
+        std::lock_guard<std::mutex> lock(engine_mutex_);
+        std::string dirs_json = "[";
+        for (size_t i = 0; i < model_search_dirs_.size(); ++i) {
+            if (i > 0) dirs_json += ",";
+            dirs_json += "\"" + escape_json_string(model_search_dirs_[i]) + "\"";
+        }
+        dirs_json += "]";
+        std::string active = model_search_dirs_.empty() ? "" : model_search_dirs_[0];
+        return "{\"ok\":true,\"active_directory\":\"" + escape_json_string(active) + "\",\"directories\":" + dirs_json + "}";
+    }
+
+    void load_model_dirs() {
+        FILE* f = fopen("models_config.json", "rb");
+        if (!f) f = fopen("wwwroot/models_config.json", "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            long sz = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            std::string content(sz, '\0');
+            fread(content.data(), 1, sz, f);
+            fclose(f);
+
+            size_t pos = content.find("\"directories\"");
+            if (pos != std::string::npos) {
+                size_t arr_start = content.find("[", pos);
+                size_t arr_end = content.find("]", arr_start);
+                if (arr_start != std::string::npos && arr_end != std::string::npos) {
+                    std::string inside = content.substr(arr_start + 1, arr_end - arr_start - 1);
+                    std::stringstream ss(inside);
+                    std::string item;
+                    while (std::getline(ss, item, ',')) {
+                        size_t q1 = item.find('"');
+                        size_t q2 = item.rfind('"');
+                        if (q1 != std::string::npos && q2 != std::string::npos && q2 > q1) {
+                            std::string dir = item.substr(q1 + 1, q2 - q1 - 1);
+                            std::string unescaped;
+                            for (size_t i = 0; i < dir.length(); ++i) {
+                                if (dir[i] == '\\' && i + 1 < dir.length() && dir[i+1] == '\\') {
+                                    unescaped += '\\';
+                                    i++;
+                                } else {
+                                    unescaped += dir[i];
+                                }
+                            }
+                            std::error_code ec;
+                            if (std::filesystem::exists(unescaped, ec) && std::filesystem::is_directory(unescaped, ec)) {
+                                auto it = std::find(model_search_dirs_.begin(), model_search_dirs_.end(), unescaped);
+                                if (it == model_search_dirs_.end()) {
+                                    model_search_dirs_.insert(model_search_dirs_.begin(), unescaped);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    void save_model_dirs() {
+        std::string json = "{\n  \"directories\": [\n";
+        for (size_t i = 0; i < model_search_dirs_.size(); ++i) {
+            json += "    \"" + escape_json_string(model_search_dirs_[i]) + "\"" + (i + 1 < model_search_dirs_.size() ? "," : "") + "\n";
+        }
+        json += "  ]\n}\n";
+        FILE* f = fopen("models_config.json", "wb");
+        if (f) {
+            fwrite(json.data(), 1, json.length(), f);
+            fclose(f);
+        }
+        FILE* f2 = fopen("wwwroot/models_config.json", "wb");
+        if (f2) {
+            fwrite(json.data(), 1, json.length(), f2);
+            fclose(f2);
+        }
     }
 
     std::string companion_name_ = "Aura";
@@ -1091,6 +1169,65 @@ private:
             std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
                              + std::to_string(body.length()) + "\r\n\r\n" + body;
             send_all(sock, resp.c_str(), (int)resp.length());
+        }
+        else if (path == "/api/models/directory" || path == "/v1/models/directory") {
+            if (method == "GET") {
+                std::string body = get_model_directories_json();
+                std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
+                                 + std::to_string(body.length()) + "\r\n\r\n" + body;
+                send_all(sock, resp.c_str(), (int)resp.length());
+            } else if (method == "POST") {
+                size_t body_pos = request.find("\r\n\r\n");
+                std::string body = (body_pos != std::string::npos) ? request.substr(body_pos + 4) : "";
+                std::string req_dir = extract_json_string(body, "directory");
+                if (req_dir.empty()) req_dir = extract_json_string(body, "path");
+
+                if (req_dir.empty()) {
+                    std::string err = "{\"ok\":false,\"error\":\"Missing 'directory' or 'path' in request body.\"}";
+                    std::string resp = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
+                                     + std::to_string(err.length()) + "\r\n\r\n" + err;
+                    send_all(sock, resp.c_str(), (int)resp.length());
+                } else {
+                    std::error_code ec;
+                    if (!std::filesystem::exists(req_dir, ec) || !std::filesystem::is_directory(req_dir, ec)) {
+                        std::string err = "{\"ok\":false,\"error\":\"Directory does not exist or is not a folder: " + escape_json_string(req_dir) + "\"}";
+                        std::string resp = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
+                                         + std::to_string(err.length()) + "\r\n\r\n" + err;
+                        send_all(sock, resp.c_str(), (int)resp.length());
+                    } else {
+                        int count = 0;
+                        {
+                            std::lock_guard<std::mutex> lock(engine_mutex_);
+                            auto it = std::find(model_search_dirs_.begin(), model_search_dirs_.end(), req_dir);
+                            if (it != model_search_dirs_.end()) {
+                                model_search_dirs_.erase(it);
+                            }
+                            model_search_dirs_.insert(model_search_dirs_.begin(), req_dir);
+
+                            for (const auto& entry : std::filesystem::directory_iterator(req_dir, ec)) {
+                                if (ec) break;
+                                if (entry.is_regular_file()) {
+                                    auto path_obj = entry.path();
+                                    if (path_obj.extension() == ".gguf" && path_obj.filename().string().find("mmproj") == std::string::npos) {
+                                        count++;
+                                    }
+                                }
+                            }
+                            save_model_dirs();
+                        }
+                        std::cout << "[HavenServer] Custom model folder added & scanned: " << req_dir << " (" << count << " GGUF models found)\n" << std::flush;
+                        std::string res = "{\"ok\":true,\"directory\":\"" + escape_json_string(req_dir) + "\",\"model_count\":" + std::to_string(count) + ",\"message\":\"Folder registered and scanned successfully.\"}";
+                        std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
+                                         + std::to_string(res.length()) + "\r\n\r\n" + res;
+                        send_all(sock, resp.c_str(), (int)resp.length());
+                    }
+                }
+            } else {
+                std::string err = "{\"ok\":false,\"error\":\"Method not allowed\"}";
+                std::string resp = "HTTP/1.1 405 Method Not Allowed\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
+                                 + std::to_string(err.length()) + "\r\n\r\n" + err;
+                send_all(sock, resp.c_str(), (int)resp.length());
+            }
         }
         else if (path == "/v1/tools" || path == "/api/tools") {
             const auto& plugins = haven_engine_.get_plugin_manager().get_loaded_plugins();
