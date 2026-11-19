@@ -868,7 +868,54 @@ private:
             std::string body = "{\"status\":\"sovereign_online\",\"engine\":\"haven-cpp-v2.0\",\"gateway\":true}";
             std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
                              + std::to_string(body.length()) + "\r\n\r\n" + body;
-            send(sock, resp.c_str(), (int)resp.length(), 0);
+            send_all(sock, resp.c_str(), (int)resp.length());
+        }
+        else if (path == "/props" || path.starts_with("/props?")) {
+            std::string model_name = "haven-chat-v5.0.gguf";
+            const auto& p = haven_engine_.get_sampler().get_params();
+
+            std::string json = "{"
+                "\"default_generation_settings\":{"
+                    "\"id\":0,"
+                    "\"id_task\":0,"
+                    "\"n_ctx\":16384,"
+                    "\"speculative\":false,"
+                    "\"is_processing\":false,"
+                    "\"params\":{"
+                        "\"n_predict\":2048,"
+                        "\"seed\":-1,"
+                        "\"temperature\":" + std::to_string(p.temperature) + ","
+                        "\"dynatemp_range\":0.0,"
+                        "\"dynatemp_exponent\":1.0,"
+                        "\"top_k\":" + std::to_string(p.top_k) + ","
+                        "\"top_p\":" + std::to_string(p.top_p) + ","
+                        "\"min_p\":" + std::to_string(p.min_p) + ","
+                        "\"top_n_sigma\":-1.0,"
+                        "\"xtc_probability\":0.0,"
+                        "\"xtc_threshold\":0.1,"
+                        "\"typ_p\":1.0,"
+                        "\"repeat_last_n\":64,"
+                        "\"repeat_penalty\":" + std::to_string(p.repetition_penalty) + ","
+                        "\"presence_penalty\":0.0,"
+                        "\"frequency_penalty\":0.0,"
+                        "\"samplers\":[\"top_k\",\"top_p\",\"min_p\",\"temperature\"]"
+                    "}"
+                "},"
+                "\"total_slots\":1,"
+                "\"model_path\":\"" + escape_json_string(model_name) + "\","
+                "\"modalities\":{\"text\":true,\"vision\":false},"
+                "\"chat_template\":\"{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>' + '\\n'}}{% endfor %}{% if add_generation_prompt %}{{'<|im_start|>assistant\\n'}}{% endif %}\""
+            "}";
+
+            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
+                             + std::to_string(json.length()) + "\r\n\r\n" + json;
+            send_all(sock, resp.c_str(), (int)resp.length());
+        }
+        else if (path == "/slots" || path.starts_with("/slots?")) {
+            std::string json = "[{\"id\":0,\"id_task\":0,\"is_processing\":false,\"n_ctx\":16384,\"state\":0}]";
+            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
+                             + std::to_string(json.length()) + "\r\n\r\n" + json;
+            send_all(sock, resp.c_str(), (int)resp.length());
         }
         else if (path == "/v1/models") {
             std::string body = "{\"object\":\"list\",\"data\":[{\"id\":\"haven-chat-v5.0\",\"object\":\"model\",\"owned_by\":\"sovereign\"},{\"id\":\"aura\",\"object\":\"model\",\"owned_by\":\"sovereign\"},{\"id\":\"gemma4-e4b\",\"object\":\"model\",\"owned_by\":\"sovereign\"}]}";
@@ -996,10 +1043,12 @@ private:
         }
         else {
             // Check for static file in wwwroot
-            std::string local_path = "wwwroot" + path;
+            std::string rel_path = path;
+            if (rel_path == "/" || rel_path.empty()) rel_path = "/index.html";
+            std::string local_path = "wwwroot" + rel_path;
             FILE* f = fopen(local_path.c_str(), "rb");
             if (!f) {
-                local_path = "C:\\Users\\admin\\source\\haven-cpp\\wwwroot" + path;
+                local_path = "C:\\Users\\admin\\source\\haven-cpp\\wwwroot" + rel_path;
                 for (char& c : local_path) if (c == '/') c = '\\';
                 f = fopen(local_path.c_str(), "rb");
             }
@@ -1016,26 +1065,28 @@ private:
                 fclose(f);
 
                 std::string mime = "application/octet-stream";
-                if (path.ends_with(".html")) mime = "text/html; charset=utf-8";
-                else if (path.ends_with(".png")) mime = "image/png";
-                else if (path.ends_with(".jpg") || path.ends_with(".jpeg")) mime = "image/jpeg";
-                else if (path.ends_with(".webp")) mime = "image/webp";
-                else if (path.ends_with(".css")) mime = "text/css";
-                else if (path.ends_with(".js")) mime = "application/javascript";
-                else if (path.ends_with(".json")) mime = "application/json";
+                if (rel_path.ends_with(".html")) mime = "text/html; charset=utf-8";
+                else if (rel_path.ends_with(".png")) mime = "image/png";
+                else if (rel_path.ends_with(".jpg") || rel_path.ends_with(".jpeg")) mime = "image/jpeg";
+                else if (rel_path.ends_with(".webp")) mime = "image/webp";
+                else if (rel_path.ends_with(".svg")) mime = "image/svg+xml";
+                else if (rel_path.ends_with(".css")) mime = "text/css; charset=utf-8";
+                else if (rel_path.ends_with(".js") || rel_path.ends_with(".mjs")) mime = "application/javascript; charset=utf-8";
+                else if (rel_path.ends_with(".json")) mime = "application/json; charset=utf-8";
+                else if (rel_path.ends_with(".wasm")) mime = "application/wasm";
 
                 std::string header = "HTTP/1.1 200 OK\r\nContent-Type: " + mime + 
                                      "\r\nCache-Control: no-cache, no-store, must-revalidate\r\nPragma: no-cache\r\nExpires: 0\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + 
                                      std::to_string(sz) + "\r\n\r\n";
-                send(sock, header.c_str(), (int)header.length(), 0);
+                send_all(sock, header.c_str(), (int)header.length());
                 if (sz > 0) {
-                    send(sock, file_data.data(), (int)sz, 0);
+                    send_all(sock, file_data.data(), (int)sz);
                 }
             } else {
                 std::string body = "{\"ok\":true,\"msg\":\"Haven Sovereign Micro-Server Active\"}";
                 std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
                                  + std::to_string(body.length()) + "\r\n\r\n" + body;
-                send(sock, resp.c_str(), (int)resp.length(), 0);
+                send_all(sock, resp.c_str(), (int)resp.length());
             }
         }
 
