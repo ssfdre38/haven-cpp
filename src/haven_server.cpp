@@ -1,4 +1,5 @@
 #include "haven/haven_engine.h"
+#include "haven/haven_mlx.h"
 #include <iostream>
 #include <string>
 #include <vector>
@@ -86,6 +87,8 @@ private:
     bool running_;
     std::thread server_thread_;
     HavenEngine haven_engine_;
+    HavenMLXEngine mlx_engine_;
+    bool is_mlx_active_ = false;
     std::mutex engine_mutex_;
     std::vector<uint32_t> cached_tokens_;
     bool model_loaded_;
@@ -114,6 +117,8 @@ private:
     bool load_model_internal(const std::string& target_path, std::string& err_out) {
         std::cout << "[HavenServer] Loading Sovereign Model into Memory: " << target_path << "...\n" << std::flush;
         cached_tokens_.clear();
+        is_mlx_active_ = false;
+        mlx_engine_.unload();
 
         if (!haven_engine_.load_model(target_path)) {
             err_out = "Failed to load GGUF file: " + target_path;
@@ -147,6 +152,34 @@ private:
     bool switch_model(const std::string& model_input, std::string& err_out) {
         std::unique_lock<std::mutex> lock(engine_mutex_);
 
+        // 1. Check if target is an MLX / Safetensors directory
+        std::string mlx_target = "";
+        if (HavenMLXEngine::is_mlx_model_dir(model_input)) {
+            mlx_target = model_input;
+        } else {
+            for (const auto& dir : model_search_dirs_) {
+                std::filesystem::path p = std::filesystem::path(dir) / model_input;
+                if (HavenMLXEngine::is_mlx_model_dir(p.string())) {
+                    mlx_target = p.string();
+                    break;
+                }
+            }
+        }
+
+        if (!mlx_target.empty()) {
+            if (mlx_engine_.load_model(mlx_target, err_out)) {
+                current_model_path_ = mlx_target;
+                current_model_name_ = std::filesystem::path(mlx_target).filename().string();
+                is_mlx_active_ = true;
+                model_loaded_ = true;
+                cached_tokens_.clear();
+                return true;
+            } else {
+                return false;
+            }
+        }
+
+        // 2. Otherwise search for GGUF model file
         std::string target_path = "";
         std::error_code ec;
 
@@ -187,10 +220,20 @@ private:
             seen.insert(current_model_name_);
             std::error_code ec;
             uintmax_t sz = 0;
-            if (std::filesystem::exists(current_model_path_, ec)) {
-                sz = std::filesystem::file_size(current_model_path_, ec);
+            std::string size_str = "0 B";
+            std::string format_str = is_mlx_active_ ? "mlx" : "gguf";
+            std::string owned_by_str = is_mlx_active_ ? "apple-mlx" : "sovereign";
+
+            if (is_mlx_active_) {
+                sz = mlx_engine_.get_metadata().total_bytes;
+                size_str = mlx_engine_.get_metadata().size_formatted;
+            } else {
+                if (std::filesystem::exists(current_model_path_, ec)) {
+                    sz = std::filesystem::file_size(current_model_path_, ec);
+                }
+                size_str = format_bytes(sz);
             }
-            std::string size_str = format_bytes(sz);
+
             std::string model_id = current_model_name_;
             if (model_id.ends_with(".gguf")) model_id = model_id.substr(0, model_id.length() - 5);
 
@@ -198,7 +241,8 @@ private:
                 "\"id\":\"" + escape_json_string(model_id) + "\","
                 "\"filename\":\"" + escape_json_string(current_model_name_) + "\","
                 "\"object\":\"model\","
-                "\"owned_by\":\"sovereign\","
+                "\"owned_by\":\"" + owned_by_str + "\","
+                "\"format\":\"" + format_str + "\","
                 "\"size\":\"" + size_str + "\","
                 "\"size_bytes\":" + std::to_string(sz) + ","
                 "\"active\":true"
@@ -212,7 +256,32 @@ private:
 
             for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
                 if (ec) break;
-                if (entry.is_regular_file()) {
+                // Check if entry is an MLX / Safetensors directory
+                if (entry.is_directory()) {
+                    std::string subdir = entry.path().string();
+                    if (HavenMLXEngine::is_mlx_model_dir(subdir)) {
+                        std::string dirname = entry.path().filename().string();
+                        if (seen.count(dirname)) continue;
+                        seen.insert(dirname);
+
+                        MLXModelMetadata meta;
+                        HavenMLXEngine::inspect_mlx_dir(subdir, meta);
+
+                        if (!first) data_json += ",";
+                        data_json += "{"
+                            "\"id\":\"" + escape_json_string(dirname) + "\","
+                            "\"filename\":\"" + escape_json_string(dirname) + "\","
+                            "\"object\":\"model\","
+                            "\"owned_by\":\"apple-mlx\","
+                            "\"format\":\"mlx\","
+                            "\"size\":\"" + meta.size_formatted + "\","
+                            "\"size_bytes\":" + std::to_string(meta.total_bytes) + ","
+                            "\"active\":" + std::string((is_mlx_active_ && current_model_path_ == subdir) ? "true" : "false") +
+                        "}";
+                        first = false;
+                    }
+                }
+                else if (entry.is_regular_file()) {
                     auto path = entry.path();
                     if (path.extension() == ".gguf") {
                         std::string fname = path.filename().string();
@@ -231,9 +300,10 @@ private:
                             "\"filename\":\"" + escape_json_string(fname) + "\","
                             "\"object\":\"model\","
                             "\"owned_by\":\"sovereign\","
+                            "\"format\":\"gguf\","
                             "\"size\":\"" + size_str + "\","
                             "\"size_bytes\":" + std::to_string(sz) + ","
-                            "\"active\":" + std::string(fname == current_model_name_ ? "true" : "false") +
+                            "\"active\":" + std::string((!is_mlx_active_ && fname == current_model_name_) ? "true" : "false") +
                         "}";
                         first = false;
                     }
@@ -1211,11 +1281,15 @@ private:
                                     if (path_obj.extension() == ".gguf" && path_obj.filename().string().find("mmproj") == std::string::npos) {
                                         count++;
                                     }
+                                } else if (entry.is_directory()) {
+                                    if (HavenMLXEngine::is_mlx_model_dir(entry.path().string())) {
+                                        count++;
+                                    }
                                 }
                             }
                             save_model_dirs();
                         }
-                        std::cout << "[HavenServer] Custom model folder added & scanned: " << req_dir << " (" << count << " GGUF models found)\n" << std::flush;
+                        std::cout << "[HavenServer] Custom model folder added & scanned: " << req_dir << " (" << count << " models found, GGUF + MLX)\n" << std::flush;
                         std::string res = "{\"ok\":true,\"directory\":\"" + escape_json_string(req_dir) + "\",\"model_count\":" + std::to_string(count) + ",\"message\":\"Folder registered and scanned successfully.\"}";
                         std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
                                          + std::to_string(res.length()) + "\r\n\r\n" + res;

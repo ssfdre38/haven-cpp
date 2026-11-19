@@ -12,7 +12,13 @@ else()
     add_link_options(-fopenmp)
 endif()
 
-include_directories(include)
+include_directories(include "C:/Users/admin/source/ollama-main/mlx/include")
+
+link_directories(
+    "C:/Users/admin/source/ollama-main/build/mlx/mlx/_deps/mlx-c-build"
+    "C:/Users/admin/source/ollama-main/build/mlx/mlx/_deps/mlx-build"
+    "C:/Users/admin/source/ollama-main/build/mlx/mlx"
+)
 
 set(HAVEN_CORE_SRCS
     src/haven_avx2.cpp
@@ -33,6 +39,7 @@ set(HAVEN_CORE_SRCS
     src/haven_plugin_manager.cpp
     src/haven_topology.cpp
     src/haven_pathways.cpp
+    src/haven_mlx.cpp
 )
 
 # Shared Library (haven_engine.dll / libhaven.so) for C# Gemmi & Android JNI
@@ -226,10 +233,15 @@ set_target_properties(plugin_smart_home PROPERTIES
 )
 
 if (WIN32)
-    target_link_libraries(haven-server ws2_32 psapi)
-    target_link_libraries(test-standalone ws2_32)
-    target_link_libraries(test-quant ws2_32)
-    target_link_libraries(test-lazy-plugins ws2_32 psapi)
+    target_link_libraries(haven_engine mlxc mlx openblas)
+    target_link_libraries(haven-cli mlxc mlx openblas)
+    target_link_libraries(haven-server ws2_32 psapi mlxc mlx openblas)
+    target_link_libraries(test-standalone ws2_32 mlxc mlx openblas)
+    target_link_libraries(test-quant ws2_32 mlxc mlx openblas)
+    target_link_libraries(test-lazy-plugins ws2_32 psapi mlxc mlx openblas)
+    target_link_libraries(test-topology-pathways mlxc mlx openblas)
+    target_link_libraries(test-pathways-e2e mlxc mlx openblas)
+    target_link_libraries(test-multi-model-arch mlxc mlx openblas)
     target_link_libraries(plugin_system_sensory psapi)
     target_link_libraries(plugin_screen_vision psapi)
     target_link_libraries(plugin_web_research winhttp)
