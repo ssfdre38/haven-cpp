@@ -2,6 +2,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <set>
 #include <thread>
 #include <sstream>
 #include <chrono>
@@ -54,27 +55,8 @@ public:
             }
         }
         if (!path_to_load.empty()) {
-            std::cout << "[HavenServer] Loading Sovereign Gemma 4 Model into Memory: " << path_to_load << "...\n" << std::flush;
-            if (haven_engine_.load_model(path_to_load)) {
-                model_loaded_ = true;
-                std::cout << "[HavenServer] ✓ Sovereign Model Loaded in-process! Standalone generation active.\n" << std::flush;
-
-                // Optimal default hyperparameters for Gemma 4 Sovereign Persona
-                haven_engine_.get_sampler().get_params().temperature = 0.48f;
-                haven_engine_.get_sampler().get_params().top_p = 0.90f;
-                haven_engine_.get_sampler().get_params().top_k = 40;
-                haven_engine_.get_sampler().get_params().min_p = 0.05f;
-                haven_engine_.get_sampler().get_params().repetition_penalty = 1.08f;
-
-                // Suppress loose asterisks for clean, grounded spoken conversation
-                auto& tokenizer = haven_engine_.get_tokenizer();
-                for (const std::string& ast : {"*", " *", "**", " **", "***"}) {
-                    auto toks = tokenizer.encode(ast, false);
-                    for (uint32_t t : toks) {
-                        haven_engine_.get_sampler().add_anti_robotic_penalty(t, 2.5f);
-                    }
-                }
-            }
+            std::string err;
+            load_model_internal(path_to_load, err);
         }
         load_persona();
     }
@@ -106,6 +88,160 @@ private:
     std::mutex engine_mutex_;
     std::vector<uint32_t> cached_tokens_;
     bool model_loaded_;
+
+    std::string current_model_name_ = "";
+    std::string current_model_path_ = "";
+    std::vector<std::string> model_search_dirs_ = {
+        "C:\\Users\\admin\\gemma4-turbo-family",
+        "models",
+        "."
+    };
+
+    static std::string format_bytes(uintmax_t bytes) {
+        if (bytes == 0) return "0 B";
+        char buf[32];
+        if (bytes >= 1024ULL * 1024 * 1024) {
+            snprintf(buf, sizeof(buf), "%.2f GB", (double)bytes / (1024.0 * 1024.0 * 1024.0));
+        } else if (bytes >= 1024ULL * 1024) {
+            snprintf(buf, sizeof(buf), "%.1f MB", (double)bytes / (1024.0 * 1024.0));
+        } else {
+            snprintf(buf, sizeof(buf), "%llu B", (unsigned long long)bytes);
+        }
+        return std::string(buf);
+    }
+
+    bool load_model_internal(const std::string& target_path, std::string& err_out) {
+        std::cout << "[HavenServer] Loading Sovereign Model into Memory: " << target_path << "...\n" << std::flush;
+        cached_tokens_.clear();
+
+        if (!haven_engine_.load_model(target_path)) {
+            err_out = "Failed to load GGUF file: " + target_path;
+            model_loaded_ = false;
+            return false;
+        }
+
+        current_model_path_ = target_path;
+        current_model_name_ = std::filesystem::path(target_path).filename().string();
+        model_loaded_ = true;
+        std::cout << "[HavenServer] ✓ Sovereign Model Loaded in-process (" << current_model_name_ << ")! Standalone generation active.\n" << std::flush;
+
+        // Optimal default hyperparameters for Gemma 4 Sovereign Persona
+        haven_engine_.get_sampler().get_params().temperature = 0.48f;
+        haven_engine_.get_sampler().get_params().top_p = 0.90f;
+        haven_engine_.get_sampler().get_params().top_k = 40;
+        haven_engine_.get_sampler().get_params().min_p = 0.05f;
+        haven_engine_.get_sampler().get_params().repetition_penalty = 1.08f;
+
+        // Suppress loose asterisks for clean, grounded spoken conversation
+        auto& tokenizer = haven_engine_.get_tokenizer();
+        for (const std::string& ast : {"*", " *", "**", " **", "***"}) {
+            auto toks = tokenizer.encode(ast, false);
+            for (uint32_t t : toks) {
+                haven_engine_.get_sampler().add_anti_robotic_penalty(t, 2.5f);
+            }
+        }
+        return true;
+    }
+
+    bool switch_model(const std::string& model_input, std::string& err_out) {
+        std::unique_lock<std::mutex> lock(engine_mutex_);
+
+        std::string target_path = "";
+        std::error_code ec;
+
+        if (std::filesystem::exists(model_input, ec) && !std::filesystem::is_directory(model_input, ec)) {
+            target_path = model_input;
+        } else {
+            for (const auto& dir : model_search_dirs_) {
+                std::filesystem::path p = std::filesystem::path(dir) / model_input;
+                if (std::filesystem::exists(p, ec) && !std::filesystem::is_directory(p, ec)) {
+                    target_path = p.string();
+                    break;
+                }
+                if (!model_input.ends_with(".gguf")) {
+                    p = std::filesystem::path(dir) / (model_input + ".gguf");
+                    if (std::filesystem::exists(p, ec) && !std::filesystem::is_directory(p, ec)) {
+                        target_path = p.string();
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (target_path.empty()) {
+            err_out = "Model not found in configured paths: " + model_input;
+            return false;
+        }
+
+        return load_model_internal(target_path, err_out);
+    }
+
+    std::string get_models_json() {
+        std::lock_guard<std::mutex> lock(engine_mutex_);
+        std::set<std::string> seen;
+        std::string data_json = "[";
+        bool first = true;
+
+        if (!current_model_name_.empty()) {
+            seen.insert(current_model_name_);
+            std::error_code ec;
+            uintmax_t sz = 0;
+            if (std::filesystem::exists(current_model_path_, ec)) {
+                sz = std::filesystem::file_size(current_model_path_, ec);
+            }
+            std::string size_str = format_bytes(sz);
+            std::string model_id = current_model_name_;
+            if (model_id.ends_with(".gguf")) model_id = model_id.substr(0, model_id.length() - 5);
+
+            data_json += "{"
+                "\"id\":\"" + escape_json_string(model_id) + "\","
+                "\"filename\":\"" + escape_json_string(current_model_name_) + "\","
+                "\"object\":\"model\","
+                "\"owned_by\":\"sovereign\","
+                "\"size\":\"" + size_str + "\","
+                "\"size_bytes\":" + std::to_string(sz) + ","
+                "\"active\":true"
+            "}";
+            first = false;
+        }
+
+        for (const auto& dir : model_search_dirs_) {
+            std::error_code ec;
+            if (!std::filesystem::exists(dir, ec) || !std::filesystem::is_directory(dir, ec)) continue;
+
+            for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+                if (ec) break;
+                if (entry.is_regular_file()) {
+                    auto path = entry.path();
+                    if (path.extension() == ".gguf") {
+                        std::string fname = path.filename().string();
+                        if (fname.find("mmproj") != std::string::npos) continue;
+                        if (seen.count(fname)) continue;
+                        seen.insert(fname);
+
+                        uintmax_t sz = entry.file_size(ec);
+                        std::string size_str = format_bytes(sz);
+                        std::string model_id = fname;
+                        if (model_id.ends_with(".gguf")) model_id = model_id.substr(0, model_id.length() - 5);
+
+                        if (!first) data_json += ",";
+                        data_json += "{"
+                            "\"id\":\"" + escape_json_string(model_id) + "\","
+                            "\"filename\":\"" + escape_json_string(fname) + "\","
+                            "\"object\":\"model\","
+                            "\"owned_by\":\"sovereign\","
+                            "\"size\":\"" + size_str + "\","
+                            "\"size_bytes\":" + std::to_string(sz) + ","
+                            "\"active\":" + std::string(fname == current_model_name_ ? "true" : "false") +
+                        "}";
+                        first = false;
+                    }
+                }
+            }
+        }
+        data_json += "]";
+        return "{\"object\":\"list\",\"data\":" + data_json + "}";
+    }
 
     std::string companion_name_ = "Aura";
     std::string companion_avatar_ = "🌸";
@@ -380,6 +516,35 @@ private:
         size_t body_pos = request.find("\r\n\r\n");
         std::string body = (body_pos != std::string::npos) ? request.substr(body_pos + 4) : request;
 
+        std::string requested_model = extract_json_string(body, "model");
+        if (!requested_model.empty()) {
+            std::string cur_id = current_model_name_;
+            if (cur_id.ends_with(".gguf")) cur_id = cur_id.substr(0, cur_id.length() - 5);
+            if (requested_model != current_model_name_ && requested_model != cur_id) {
+                std::string err;
+                std::string target_path = "";
+                std::error_code ec;
+                for (const auto& dir : model_search_dirs_) {
+                    std::filesystem::path p = std::filesystem::path(dir) / requested_model;
+                    if (std::filesystem::exists(p, ec) && !std::filesystem::is_directory(p, ec)) {
+                        target_path = p.string(); break;
+                    }
+                    if (!requested_model.ends_with(".gguf")) {
+                        p = std::filesystem::path(dir) / (requested_model + ".gguf");
+                        if (std::filesystem::exists(p, ec) && !std::filesystem::is_directory(p, ec)) {
+                            target_path = p.string(); break;
+                        }
+                    }
+                }
+                if (!target_path.empty() && target_path != current_model_path_) {
+                    load_model_internal(target_path, err);
+                }
+            }
+        }
+
+        std::string active_model_id = current_model_name_.empty() ? "haven-chat-v5.0" : current_model_name_;
+        if (active_model_id.ends_with(".gguf")) active_model_id = active_model_id.substr(0, active_model_id.length() - 5);
+
         bool stream = (body.find("\"stream\": true") != std::string::npos || body.find("\"stream\":true") != std::string::npos);
 
         int max_tokens = 512;
@@ -483,13 +648,13 @@ private:
 
                 accumulated_response += piece;
                 std::string esc_text = escape_json_string(piece);
-                std::string chunk = "data: {\"content\":\"" + esc_text + "\",\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion.chunk\",\"model\":\"haven-chat-v5.0\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" + esc_text + "\"},\"finish_reason\":null}]}\n\n";
+                std::string chunk = "data: {\"content\":\"" + esc_text + "\",\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion.chunk\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" + esc_text + "\"},\"finish_reason\":null}]}\n\n";
                 if (!send_all(client_sock, chunk.c_str(), (int)chunk.length())) break;
 
                 haven_engine_.forward(next_tok, active_pos++, logits.data());
             }
 
-            std::string done_chunk = "data: {\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion.chunk\",\"model\":\"haven-chat-v5.0\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            std::string done_chunk = "data: {\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion.chunk\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
             send_all(client_sock, done_chunk.c_str(), (int)done_chunk.length());
         } else {
             for (int gen = 0; gen < max_tokens; ++gen) {
@@ -516,7 +681,7 @@ private:
             }
 
             std::string esc_content = escape_json_string(accumulated_response);
-            std::string json_resp = "{\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion\",\"model\":\"haven-chat-v5.0\",\"content\":\"" + esc_content + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" + esc_content + "\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(tokens.size()) + ",\"completion_tokens\":" + std::to_string(accumulated_response.length() / 4) + ",\"total_tokens\":" + std::to_string(tokens.size() + accumulated_response.length() / 4) + "}}";
+            std::string json_resp = "{\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"content\":\"" + esc_content + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" + esc_content + "\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(tokens.size()) + ",\"completion_tokens\":" + std::to_string(accumulated_response.length() / 4) + ",\"total_tokens\":" + std::to_string(tokens.size() + accumulated_response.length() / 4) + "}}";
 
             std::string http_resp = "HTTP/1.1 200 OK\r\n"
                                     "Content-Type: application/json; charset=utf-8\r\n"
@@ -806,7 +971,7 @@ private:
             send_all(sock, resp.c_str(), (int)resp.length());
         }
         else if (path == "/props" || path.starts_with("/props?")) {
-            std::string model_name = "haven-chat-v5.0.gguf";
+            std::string model_name = current_model_name_.empty() ? "haven-chat-v5.0.gguf" : current_model_name_;
             const auto& p = haven_engine_.get_sampler().get_params();
 
             std::string json = "{"
@@ -852,11 +1017,39 @@ private:
                              + std::to_string(json.length()) + "\r\n\r\n" + json;
             send_all(sock, resp.c_str(), (int)resp.length());
         }
-        else if (path == "/v1/models") {
-            std::string body = "{\"object\":\"list\",\"data\":[{\"id\":\"haven-chat-v5.0\",\"object\":\"model\",\"owned_by\":\"sovereign\"},{\"id\":\"aura\",\"object\":\"model\",\"owned_by\":\"sovereign\"},{\"id\":\"gemma4-e4b\",\"object\":\"model\",\"owned_by\":\"sovereign\"}]}";
-            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
+        else if (path == "/v1/models" || path == "/api/models") {
+            std::string body = get_models_json();
+            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
                              + std::to_string(body.length()) + "\r\n\r\n" + body;
-            send(sock, resp.c_str(), (int)resp.length(), 0);
+            send_all(sock, resp.c_str(), (int)resp.length());
+        }
+        else if (path == "/v1/models/load" || path == "/api/models/load" || path == "/v1/models/switch") {
+            size_t body_pos = request.find("\r\n\r\n");
+            std::string body = (body_pos != std::string::npos) ? request.substr(body_pos + 4) : "";
+            std::string req_model = extract_json_string(body, "model");
+            if (req_model.empty()) req_model = extract_json_string(body, "filename");
+            if (req_model.empty()) req_model = extract_json_string(body, "id");
+
+            if (req_model.empty()) {
+                std::string err = "{\"ok\":false,\"error\":\"Missing 'model' or 'filename' parameter in request body.\"}";
+                std::string resp = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
+                                 + std::to_string(err.length()) + "\r\n\r\n" + err;
+                send_all(sock, resp.c_str(), (int)resp.length());
+            } else {
+                std::string err_out;
+                if (switch_model(req_model, err_out)) {
+                    std::string json = "{\"ok\":true,\"status\":\"loaded\",\"model\":\"" + escape_json_string(current_model_name_) 
+                                     + "\",\"path\":\"" + escape_json_string(current_model_path_) + "\"}";
+                    std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
+                                     + std::to_string(json.length()) + "\r\n\r\n" + json;
+                    send_all(sock, resp.c_str(), (int)resp.length());
+                } else {
+                    std::string err = "{\"ok\":false,\"error\":\"" + escape_json_string(err_out) + "\"}";
+                    std::string resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
+                                     + std::to_string(err.length()) + "\r\n\r\n" + err;
+                    send_all(sock, resp.c_str(), (int)resp.length());
+                }
+            }
         }
         else if (path == "/v1/chat/completions" || path == "/completion" || path == "/v1/completions") {
             if (model_loaded_) {
@@ -973,7 +1166,7 @@ private:
                              + "\"top_k\":" + std::to_string(p.top_k) + ","
                              + "\"min_p\":" + std::to_string(p.min_p) + ","
                              + "\"repetition_penalty\":" + std::to_string(p.repetition_penalty) + ","
-                             + "\"model\":\"haven-chat-v5.0.gguf\","
+                             + "\"model\":\"" + escape_json_string(current_model_name_.empty() ? "haven-chat-v5.0.gguf" : current_model_name_) + "\","
                              + "\"plugins_count\":" + std::to_string(haven_engine_.get_plugin_manager().get_plugin_count()) + "}";
             std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
                              + std::to_string(json.length()) + "\r\n\r\n" + json;
@@ -1044,13 +1237,19 @@ int main(int argc, char** argv) {
     SetConsoleCP(CP_UTF8);
 #endif
     int port = 11436;
+    std::string model_arg = "";
     if (argc > 1) {
         try {
             port = std::stoi(argv[1]);
-        } catch (...) {}
+        } catch (...) {
+            model_arg = argv[1];
+        }
+    }
+    if (argc > 2) {
+        model_arg = argv[2];
     }
 
-    haven::HavenMicroServer server(port);
+    haven::HavenMicroServer server(port, model_arg);
     server.start();
 
     std::cout << "[HavenServer] Featherlight Studio Daemon running on http://0.0.0.0:" << port << " (<10MB RAM)...\n" << std::flush;
