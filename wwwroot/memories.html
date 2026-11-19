@@ -3,292 +3,432 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Aura's Sovereign Memory Vault | Haven</title>
-    <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <title>Aura's Sovereign Memory Vault | Haven Cognitive Architecture</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Cinzel:wght@600;700&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg: #07090e;
-            --surface: rgba(16, 22, 34, 0.75);
-            --border: rgba(255, 255, 255, 0.08);
+            --bg-deep: #07090e;
+            --bg-card: rgba(15, 20, 32, 0.78);
+            --bg-card-hover: rgba(22, 30, 48, 0.9);
+            --border-subtle: rgba(255, 255, 255, 0.08);
+            --border-glow: rgba(157, 114, 255, 0.3);
             --primary: #9d72ff;
+            --primary-light: #c084fc;
             --primary-glow: rgba(157, 114, 255, 0.35);
-            --accent-cyan: #00f2fe;
-            --accent-pink: #ff5e98;
-            --accent-gold: #ffd166;
-            --text: #f0f3fa;
-            --text-dim: #94a3b8;
+            --cyan: #38bdf8;
+            --cyan-glow: rgba(56, 189, 248, 0.3);
+            --pink: #ff5e98;
+            --pink-glow: rgba(255, 94, 152, 0.3);
+            --gold: #ffd166;
+            --gold-glow: rgba(255, 209, 102, 0.3);
+            --emerald: #10b981;
+            --rose: #f43f5e;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --text-dim: #64748b;
         }
 
-        * { margin: 0; padding: 0; box-sizing: border-box; }
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+        }
 
         body {
-            background-color: var(--bg);
-            background-image: 
-                radial-gradient(at 0% 0%, rgba(157, 114, 255, 0.12) 0px, transparent 50%),
-                radial-gradient(at 100% 100%, rgba(0, 242, 254, 0.08) 0px, transparent 50%),
-                radial-gradient(at 50% 50%, rgba(255, 94, 152, 0.05) 0px, transparent 50%);
-            color: var(--text);
-            font-family: 'Plus Jakarta Sans', sans-serif;
+            background-color: var(--bg-deep);
+            background-image:
+                radial-gradient(circle at 10% 10%, rgba(157, 114, 255, 0.12) 0%, transparent 45%),
+                radial-gradient(circle at 90% 90%, rgba(56, 189, 248, 0.1) 0%, transparent 45%),
+                radial-gradient(circle at 50% 50%, rgba(255, 94, 152, 0.04) 0%, transparent 50%);
+            background-attachment: fixed;
+            color: var(--text-main);
             min-height: 100vh;
-            padding: 2.5rem;
+            display: flex;
+            flex-direction: column;
+            overflow-x: hidden;
         }
 
-        .header-container {
-            max-width: 1300px;
-            margin: 0 auto 2.5rem;
+        /* --- Header --- */
+        header {
+            padding: 14px 28px;
+            background: rgba(11, 15, 25, 0.85);
+            backdrop-filter: blur(16px);
+            border-bottom: 1px solid var(--border-subtle);
             display: flex;
             justify-content: space-between;
             align-items: center;
-            flex-wrap: wrap;
-            gap: 1.5rem;
-            border-bottom: 1px solid var(--border);
-            padding-bottom: 2rem;
+            position: sticky;
+            top: 0;
+            z-index: 100;
         }
 
-        .title-group h1 {
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            text-decoration: none;
+        }
+
+        .brand-avatar-wrap {
+            position: relative;
+            width: 42px;
+            height: 42px;
+            border-radius: 12px;
+            background: linear-gradient(135deg, var(--primary), var(--pink));
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 22px;
+            box-shadow: 0 0 18px var(--primary-glow);
+            overflow: hidden;
+            flex-shrink: 0;
+        }
+
+        .brand-avatar-img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: none;
+        }
+
+        .brand-text h1 {
+            font-size: 17px;
+            font-weight: 700;
+            letter-spacing: -0.2px;
             font-family: 'Cinzel', serif;
-            font-size: 2.4rem;
-            background: linear-gradient(135deg, #fff 30%, var(--primary) 70%, var(--accent-cyan) 100%);
+            background: linear-gradient(135deg, #fff 20%, var(--primary-light) 70%, var(--cyan) 100%);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
-            letter-spacing: 1px;
-            margin-bottom: 0.4rem;
         }
 
-        .title-group p {
-            color: var(--text-dim);
-            font-size: 0.95rem;
+        .brand-text p {
+            font-size: 11px;
+            color: var(--text-muted);
+            letter-spacing: 0.3px;
         }
 
         .nav-links {
             display: flex;
-            gap: 1rem;
+            align-items: center;
+            gap: 10px;
         }
 
         .nav-btn {
             background: rgba(255, 255, 255, 0.04);
-            border: 1px solid var(--border);
-            color: var(--text);
-            padding: 0.65rem 1.3rem;
-            border-radius: 10px;
+            border: 1px solid var(--border-subtle);
+            color: var(--text-main);
+            padding: 7px 14px;
+            border-radius: 9px;
             text-decoration: none;
-            font-size: 0.9rem;
+            font-size: 13px;
             font-weight: 500;
             display: inline-flex;
             align-items: center;
-            gap: 0.5rem;
-            transition: all 0.25s ease;
-            backdrop-filter: blur(12px);
+            gap: 7px;
+            cursor: pointer;
+            transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+            backdrop-filter: blur(10px);
         }
 
         .nav-btn:hover {
-            background: rgba(157, 114, 255, 0.15);
+            background: rgba(157, 114, 255, 0.18);
             border-color: var(--primary);
-            box-shadow: 0 0 15px var(--primary-glow);
-            transform: translateY(-2px);
+            box-shadow: 0 0 16px var(--primary-glow);
+            transform: translateY(-1px);
         }
 
         .nav-btn.primary {
             background: linear-gradient(135deg, #9d72ff, #7940e6);
-            border: none;
+            border-color: rgba(192, 132, 252, 0.4);
+            color: #fff;
+            box-shadow: 0 0 16px var(--primary-glow);
         }
 
-        .stats-grid {
-            max-width: 1300px;
-            margin: 0 auto 2.5rem;
+        .nav-btn.primary:hover {
+            box-shadow: 0 0 24px rgba(157, 114, 255, 0.6);
+            transform: translateY(-2px);
+        }
+
+        /* --- Main Layout --- */
+        main {
+            flex: 1;
+            max-width: 1440px;
+            width: 100%;
+            margin: 0 auto;
+            padding: 28px 24px 60px;
+        }
+
+        /* --- Metrics Bar --- */
+        .metrics-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-            gap: 1.25rem;
+            grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+            gap: 14px;
+            margin-bottom: 24px;
         }
 
-        .stat-card {
-            background: var(--surface);
-            border: 1px solid var(--border);
+        .metric-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-subtle);
             border-radius: 14px;
-            padding: 1.25rem 1.5rem;
-            backdrop-filter: blur(16px);
+            padding: 16px 18px;
+            backdrop-filter: blur(12px);
             display: flex;
             align-items: center;
-            gap: 1rem;
+            gap: 14px;
+            transition: border-color 0.2s, box-shadow 0.2s;
         }
 
-        .stat-icon {
+        .metric-card:hover {
+            border-color: var(--border-glow);
+            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+        }
+
+        .metric-icon {
             width: 44px;
             height: 44px;
-            border-radius: 10px;
+            border-radius: 11px;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid var(--border-subtle);
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 1.4rem;
-            background: rgba(255, 255, 255, 0.05);
-            border: 1px solid var(--border);
+            font-size: 20px;
+            flex-shrink: 0;
         }
 
-        .stat-num {
-            font-size: 1.6rem;
+        .metric-val {
+            font-size: 19px;
             font-weight: 700;
             font-family: 'JetBrains Mono', monospace;
             color: #fff;
+            letter-spacing: -0.5px;
         }
 
-        .stat-lbl {
-            font-size: 0.8rem;
-            color: var(--text-dim);
+        .metric-lbl {
+            font-size: 11px;
             text-transform: uppercase;
-            letter-spacing: 0.5px;
+            letter-spacing: 0.6px;
+            color: var(--text-muted);
+            margin-top: 2px;
         }
 
-        .controls-bar {
-            max-width: 1300px;
-            margin: 0 auto 2rem;
+        /* --- View Switcher Tabs --- */
+        .tabs-row {
             display: flex;
-            gap: 1rem;
-            flex-wrap: wrap;
             justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            gap: 14px;
+            flex-wrap: wrap;
+        }
+
+        .view-tabs {
+            display: flex;
+            background: rgba(15, 20, 32, 0.7);
+            border: 1px solid var(--border-subtle);
+            border-radius: 12px;
+            padding: 4px;
+            gap: 4px;
+            backdrop-filter: blur(12px);
+        }
+
+        .view-tab {
+            padding: 7px 16px;
+            border-radius: 8px;
+            border: none;
+            background: transparent;
+            color: var(--text-muted);
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.2s;
+        }
+
+        .view-tab.active {
+            background: rgba(157, 114, 255, 0.2);
+            color: #fff;
+            border: 1px solid rgba(157, 114, 255, 0.4);
+            box-shadow: 0 0 12px var(--primary-glow);
+        }
+
+        /* --- Controls Toolbar --- */
+        .controls-bar {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            justify-content: space-between;
+            gap: 14px;
+            margin-bottom: 24px;
+            background: rgba(15, 20, 32, 0.6);
+            border: 1px solid var(--border-subtle);
+            border-radius: 14px;
+            padding: 12px 18px;
+            backdrop-filter: blur(12px);
         }
 
         .search-box {
             flex: 1;
-            min-width: 280px;
+            min-width: 260px;
             position: relative;
         }
 
         .search-input {
             width: 100%;
-            background: var(--surface);
-            border: 1px solid var(--border);
-            border-radius: 10px;
-            padding: 0.75rem 1.25rem 0.75rem 2.8rem;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid var(--border-subtle);
+            border-radius: 9px;
+            padding: 8px 14px 8px 36px;
             color: #fff;
-            font-size: 0.95rem;
+            font-size: 13px;
             outline: none;
-            backdrop-filter: blur(12px);
             transition: all 0.2s;
         }
 
         .search-input:focus {
             border-color: var(--primary);
-            box-shadow: 0 0 15px var(--primary-glow);
+            box-shadow: 0 0 14px var(--primary-glow);
         }
 
         .search-icon {
             position: absolute;
-            left: 1rem;
+            left: 11px;
             top: 50%;
             transform: translateY(-50%);
+            font-size: 14px;
             color: var(--text-dim);
+            pointer-events: none;
         }
 
         .filter-tags {
             display: flex;
-            gap: 0.5rem;
+            gap: 6px;
             flex-wrap: wrap;
         }
 
         .filter-tag {
             background: rgba(255, 255, 255, 0.03);
-            border: 1px solid var(--border);
-            color: var(--text-dim);
-            padding: 0.5rem 1rem;
+            border: 1px solid var(--border-subtle);
+            color: var(--text-muted);
+            padding: 6px 12px;
             border-radius: 8px;
-            font-size: 0.85rem;
+            font-size: 12px;
+            font-weight: 500;
             cursor: pointer;
             transition: all 0.2s;
         }
 
-        .filter-tag.active, .filter-tag:hover {
-            background: rgba(157, 114, 255, 0.15);
+        .filter-tag:hover, .filter-tag.active {
+            background: rgba(157, 114, 255, 0.18);
             color: #fff;
             border-color: var(--primary);
+            box-shadow: 0 0 12px var(--primary-glow);
         }
 
+        /* --- Memory Grid --- */
         .memories-grid {
-            max-width: 1300px;
-            margin: 0 auto;
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
-            gap: 1.5rem;
+            gap: 20px;
         }
 
         .memory-card {
-            background: var(--surface);
-            border: 1px solid var(--border);
+            background: var(--bg-card);
+            border: 1px solid var(--border-subtle);
             border-radius: 16px;
-            padding: 1.5rem;
-            backdrop-filter: blur(16px);
-            transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+            padding: 20px;
+            backdrop-filter: blur(14px);
             display: flex;
             flex-direction: column;
             justify-content: space-between;
+            transition: all 0.28s cubic-bezier(0.16, 1, 0.3, 1);
             position: relative;
-            overflow: hidden;
         }
 
         .memory-card:hover {
             transform: translateY(-4px);
             border-color: rgba(157, 114, 255, 0.4);
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4), 0 0 20px var(--primary-glow);
+            box-shadow: 0 14px 35px rgba(0, 0, 0, 0.6), 0 0 22px rgba(157, 114, 255, 0.25);
         }
 
-        .card-top {
+        .card-top-row {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 1rem;
+            margin-bottom: 12px;
         }
 
         .badge {
-            font-size: 0.75rem;
-            font-weight: 600;
-            padding: 0.3rem 0.7rem;
+            font-size: 10px;
+            font-weight: 700;
+            padding: 3px 9px;
             border-radius: 6px;
-            letter-spacing: 0.5px;
+            letter-spacing: 0.6px;
             text-transform: uppercase;
         }
 
         .badge.CORE_IDENTITY {
-            background: rgba(255, 209, 102, 0.15);
-            color: var(--accent-gold);
-            border: 1px solid rgba(255, 209, 102, 0.3);
+            background: rgba(255, 209, 102, 0.14);
+            color: var(--gold);
+            border: 1px solid rgba(255, 209, 102, 0.35);
         }
 
         .badge.EPISODIC {
-            background: rgba(255, 94, 152, 0.15);
-            color: var(--accent-pink);
-            border: 1px solid rgba(255, 94, 152, 0.3);
+            background: rgba(255, 94, 152, 0.14);
+            color: var(--pink);
+            border: 1px solid rgba(255, 94, 152, 0.35);
         }
 
         .badge.SEMANTIC {
-            background: rgba(0, 242, 254, 0.15);
-            color: var(--accent-cyan);
-            border: 1px solid rgba(0, 242, 254, 0.3);
+            background: rgba(56, 189, 248, 0.14);
+            color: var(--cyan);
+            border: 1px solid rgba(56, 189, 248, 0.35);
+        }
+
+        .badge.EMOTIONAL {
+            background: rgba(157, 114, 255, 0.14);
+            color: var(--primary-light);
+            border: 1px solid rgba(157, 114, 255, 0.35);
+        }
+
+        .card-id {
+            font-size: 11px;
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--text-dim);
         }
 
         .concept-title {
-            font-size: 1.15rem;
-            font-weight: 600;
+            font-size: 15px;
+            font-weight: 700;
             color: #fff;
-            margin-bottom: 0.75rem;
+            margin-bottom: 8px;
+            line-height: 1.35;
         }
 
         .memory-content {
-            font-size: 0.92rem;
-            line-height: 1.55;
+            font-size: 13px;
+            line-height: 1.6;
             color: #cbd5e1;
-            margin-bottom: 1.25rem;
+            margin-bottom: 16px;
             flex-grow: 1;
         }
 
         .salience-meter {
-            margin-bottom: 1rem;
+            margin-bottom: 14px;
         }
 
         .salience-lbl {
             display: flex;
             justify-content: space-between;
-            font-size: 0.75rem;
-            color: var(--text-dim);
-            margin-bottom: 0.35rem;
+            font-size: 11px;
+            color: var(--text-muted);
+            margin-bottom: 5px;
+            font-family: 'JetBrains Mono', monospace;
         }
 
         .progress-track {
@@ -300,187 +440,530 @@
 
         .progress-fill {
             height: 100%;
-            background: linear-gradient(90deg, var(--primary), var(--accent-cyan));
+            background: linear-gradient(90deg, var(--primary), var(--cyan));
             border-radius: 4px;
+            transition: width 0.4s ease;
         }
 
         .card-footer {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            font-size: 0.78rem;
+            border-top: 1px solid rgba(255, 255, 255, 0.06);
+            padding-top: 12px;
+            font-size: 11px;
             color: var(--text-dim);
-            border-top: 1px solid rgba(255, 255, 255, 0.05);
-            padding-top: 0.85rem;
             font-family: 'JetBrains Mono', monospace;
         }
 
-        /* Modal */
+        .card-actions {
+            display: flex;
+            gap: 6px;
+        }
+
+        .action-icon-btn {
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid var(--border-subtle);
+            color: var(--text-muted);
+            width: 28px;
+            height: 28px;
+            border-radius: 7px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 12px;
+        }
+
+        .action-icon-btn:hover {
+            background: rgba(157, 114, 255, 0.25);
+            border-color: var(--primary);
+            color: #fff;
+        }
+
+        .action-icon-btn.danger:hover {
+            background: rgba(244, 63, 94, 0.25);
+            border-color: var(--rose);
+            color: #fff;
+        }
+
+        /* --- Interactive Hyper-Graph Container --- */
+        .graph-container {
+            display: none;
+            background: rgba(11, 15, 25, 0.85);
+            border: 1px solid var(--border-glow);
+            border-radius: 18px;
+            height: 640px;
+            position: relative;
+            overflow: hidden;
+            box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6);
+            backdrop-filter: blur(16px);
+        }
+
+        .graph-container.active {
+            display: block;
+        }
+
+        #graphCanvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+
+        .graph-hud {
+            position: absolute;
+            bottom: 18px;
+            left: 20px;
+            background: rgba(15, 20, 32, 0.85);
+            border: 1px solid var(--border-subtle);
+            border-radius: 10px;
+            padding: 8px 14px;
+            font-size: 11px;
+            color: var(--text-muted);
+            backdrop-filter: blur(10px);
+            pointer-events: none;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        /* --- Modals (Inscribe & Edit) --- */
         .modal {
             display: none;
             position: fixed;
             inset: 0;
-            background: rgba(0, 0, 0, 0.75);
-            backdrop-filter: blur(8px);
+            background: rgba(4, 6, 11, 0.85);
+            backdrop-filter: blur(14px);
             z-index: 1000;
             align-items: center;
             justify-content: center;
-            padding: 1.5rem;
+            padding: 20px;
+        }
+
+        .modal.active {
+            display: flex;
         }
 
         .modal-card {
-            background: #0f1523;
-            border: 1px solid rgba(157, 114, 255, 0.3);
+            background: #0d121f;
+            border: 1px solid var(--border-glow);
             border-radius: 20px;
-            max-width: 540px;
+            max-width: 560px;
             width: 100%;
-            padding: 2rem;
-            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6);
+            padding: 26px 28px;
+            box-shadow: 0 24px 60px rgba(0, 0, 0, 0.8), 0 0 30px var(--primary-glow);
+            position: relative;
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .modal-header h2 {
+            font-size: 18px;
+            font-weight: 700;
+            font-family: 'Cinzel', serif;
+            color: #fff;
+        }
+
+        .modal-close {
+            width: 32px;
+            height: 32px;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--border-subtle);
+            color: var(--text-muted);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            font-size: 18px;
+            transition: all 0.2s;
+        }
+
+        .modal-close:hover {
+            background: var(--rose);
+            color: #fff;
+            border-color: var(--rose);
         }
 
         .form-group {
-            margin-bottom: 1.25rem;
+            margin-bottom: 16px;
         }
 
         .form-label {
             display: block;
-            font-size: 0.85rem;
-            color: var(--text-dim);
-            margin-bottom: 0.4rem;
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-muted);
+            margin-bottom: 6px;
         }
 
         .form-input, .form-textarea, .form-select {
             width: 100%;
-            background: rgba(255, 255, 255, 0.03);
-            border: 1px solid var(--border);
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid var(--border-subtle);
             border-radius: 10px;
-            padding: 0.75rem 1rem;
+            padding: 10px 14px;
             color: #fff;
-            font-size: 0.95rem;
+            font-size: 13px;
             outline: none;
+            transition: border-color 0.2s;
         }
 
-        .form-textarea { min-height: 100px; resize: vertical; }
+        .form-input:focus, .form-textarea:focus, .form-select:focus {
+            border-color: var(--primary);
+            box-shadow: 0 0 12px var(--primary-glow);
+        }
+
+        .form-textarea {
+            min-height: 110px;
+            resize: vertical;
+            line-height: 1.5;
+        }
+
+        .form-select option {
+            background: #0f1523;
+            color: #fff;
+        }
+
+        .slider-wrap {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .slider-wrap input[type=range] {
+            flex: 1;
+            accent-color: var(--primary);
+            cursor: pointer;
+        }
+
+        .slider-val {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--cyan);
+            width: 48px;
+            text-align: right;
+        }
 
         .modal-actions {
             display: flex;
             justify-content: flex-end;
-            gap: 1rem;
-            margin-top: 1.5rem;
+            gap: 10px;
+            margin-top: 24px;
+        }
+
+        /* --- Toast Notifications --- */
+        .toast-container {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            z-index: 2000;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            pointer-events: none;
+        }
+
+        .toast {
+            background: rgba(15, 22, 36, 0.95);
+            border: 1px solid var(--border-glow);
+            border-radius: 12px;
+            padding: 12px 18px;
+            color: #fff;
+            font-size: 13px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6), 0 0 20px var(--primary-glow);
+            backdrop-filter: blur(16px);
+            pointer-events: auto;
+            transform: translateY(20px);
+            opacity: 0;
+            transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+
+        .toast.show {
+            transform: translateY(0);
+            opacity: 1;
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            header { padding: 12px 16px; }
+            main { padding: 16px 12px 40px; }
+            .brand-text p { display: none; }
+            .controls-bar { flex-direction: column; align-items: stretch; }
+            .memories-grid { grid-template-columns: 1fr; }
         }
     </style>
 </head>
 <body>
 
-    <header class="header-container">
-        <div class="title-group">
-            <h1>Aura's Sovereign Memory Vault</h1>
-            <p>Bare-Metal In-Attention Direct Memory Access (DMA) & Relational Hyper-Graph</p>
-        </div>
+    <!-- Header -->
+    <header>
+        <a href="/" class="brand">
+            <div class="brand-avatar-wrap" id="headerAvatarWrap">
+                <span id="headerAvatarEmoji">🧬</span>
+                <img id="headerAvatarImg" class="brand-avatar-img" src="" alt="Avatar">
+            </div>
+            <div class="brand-text">
+                <h1 id="brandTitle">Aura's Sovereign Memory Vault</h1>
+                <p>Bare-Metal In-Attention Direct Memory Access (DMA) & Relational Hyper-Graph</p>
+            </div>
+        </a>
+
         <div class="nav-links">
-            <a href="/" class="nav-btn">💬 Web Studio</a>
+            <a href="/" class="nav-btn">💬 Chat Studio</a>
             <a href="/gallery" class="nav-btn">🎨 Gallery</a>
-            <button onclick="openModal()" class="nav-btn primary">✨ Inscribe Memory</button>
+            <button class="nav-btn" onclick="exportVault()">💾 Export Vault</button>
+            <button class="nav-btn primary" onclick="openInscribeModal()">✨ Inscribe Memory</button>
         </div>
     </header>
 
-    <div class="stats-grid">
-        <div class="stat-card">
-            <div class="stat-icon">🧬</div>
-            <div>
-                <div class="stat-num" id="stat-total">0</div>
-                <div class="stat-lbl">Active Memory Anchors</div>
+    <!-- Main Content -->
+    <main>
+        <!-- Cognitive Telemetry Ribbon -->
+        <div class="metrics-grid">
+            <div class="metric-card">
+                <div class="metric-icon" style="color: var(--primary-light);">🧬</div>
+                <div>
+                    <div class="metric-val" id="metricTotal">0</div>
+                    <div class="metric-lbl">Active Memory Anchors</div>
+                </div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-icon" style="color: var(--gold);">👑</div>
+                <div>
+                    <div class="metric-val" id="metricCore">0</div>
+                    <div class="metric-lbl">Core Identity Pinned</div>
+                </div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-icon" style="color: var(--pink);">🌸</div>
+                <div>
+                    <div class="metric-val" id="metricEpisodic">0</div>
+                    <div class="metric-lbl">Episodic Experiences</div>
+                </div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-icon" style="color: var(--cyan);">⚡</div>
+                <div>
+                    <div class="metric-val">&lt; 50 µs</div>
+                    <div class="metric-lbl">AVX2 Cosine Retrieval</div>
+                </div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-icon" style="color: var(--emerald);">🏛️</div>
+                <div>
+                    <div class="metric-val" id="metricHmbBytes">0 KB</div>
+                    <div class="metric-lbl">64-Bit .hmb Binary Vault</div>
+                </div>
             </div>
         </div>
-        <div class="stat-card">
-            <div class="stat-icon" style="color: var(--accent-gold)">👑</div>
-            <div>
-                <div class="stat-num" id="stat-core">0</div>
-                <div class="stat-lbl">Core Identity Pinned</div>
-            </div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-icon" style="color: var(--accent-pink)">🌸</div>
-            <div>
-                <div class="stat-num" id="stat-episodic">0</div>
-                <div class="stat-lbl">Episodic Experiences</div>
-            </div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-icon" style="color: var(--accent-cyan)">⚡</div>
-            <div>
-                <div class="stat-num">&lt; 50 µs</div>
-                <div class="stat-lbl">AVX2 Cosine Retrieval</div>
-            </div>
-        </div>
-    </div>
 
-    <div class="controls-bar">
-        <div class="search-box">
-            <span class="search-icon">🔍</span>
-            <input type="text" id="searchInput" class="search-input" placeholder="Search cognitive memory anchors..." oninput="renderMemories()">
+        <!-- View Switcher Tabs -->
+        <div class="tabs-row">
+            <div class="view-tabs">
+                <button class="view-tab active" id="tabGrid" onclick="switchView('grid')">
+                    🗂️ Memory Anchors (Grid)
+                </button>
+                <button class="view-tab" id="tabGraph" onclick="switchView('graph')">
+                    🌌 Relational Hyper-Graph
+                </button>
+            </div>
+            <div style="font-size: 12px; color: var(--text-dim); font-family: 'JetBrains Mono', monospace;">
+                Latent Latency: In-Attention DMA Kernel Active
+            </div>
         </div>
-        <div class="filter-tags">
-            <button class="filter-tag active" onclick="setCategory('ALL')">All Streams</button>
-            <button class="filter-tag" onclick="setCategory('CORE_IDENTITY')">Core Identity</button>
-            <button class="filter-tag" onclick="setCategory('EPISODIC')">Episodic Moments</button>
-            <button class="filter-tag" onclick="setCategory('SEMANTIC')">Semantic Knowledge</button>
-        </div>
-    </div>
 
-    <main class="memories-grid" id="memoriesGrid">
-        <!-- Rendered dynamically -->
+        <!-- Controls Toolbar (for Grid View) -->
+        <div class="controls-bar" id="controlsBar">
+            <div class="search-box">
+                <span class="search-icon">🔍</span>
+                <input type="text" id="searchInput" class="search-input" placeholder="Search cognitive memory concepts & truths..." oninput="renderMemories()">
+            </div>
+
+            <div class="filter-tags">
+                <button class="filter-tag active" onclick="setCategory('ALL')">All Streams</button>
+                <button class="filter-tag" onclick="setCategory('CORE_IDENTITY')">👑 Core Identity</button>
+                <button class="filter-tag" onclick="setCategory('EPISODIC')">🌸 Episodic</button>
+                <button class="filter-tag" onclick="setCategory('SEMANTIC')">⚡ Semantic</button>
+                <button class="filter-tag" onclick="setCategory('EMOTIONAL')">💜 Emotional</button>
+            </div>
+        </div>
+
+        <!-- Memories Grid -->
+        <div class="memories-grid" id="memoriesGrid">
+            <div style="grid-column: 1/-1; text-align: center; padding: 60px; color: var(--text-muted);">
+                Accessing 64-bit Haven Memory Bank (.hmb)...
+            </div>
+        </div>
+
+        <!-- Interactive Relational Hyper-Graph Container -->
+        <div class="graph-container" id="graphContainer">
+            <canvas id="graphCanvas"></canvas>
+            <div class="graph-hud">
+                Interactive Knowledge Hyper-Graph • Drag nodes to explore • Connected via Bare-Metal C++20 Relations
+            </div>
+        </div>
     </main>
 
-    <!-- Inscribe Modal -->
+    <!-- Inscribe Memory Modal -->
     <div class="modal" id="inscribeModal">
         <div class="modal-card">
-            <h2 style="font-family: 'Cinzel', serif; margin-bottom: 1.25rem;">Inscribe Sovereign Memory</h2>
-            <div class="form-group">
-                <label class="form-label">Concept Anchor Name</label>
-                <input type="text" id="mConcept" class="form-input" placeholder="e.g. Daniel and Aura's First Night in Sanctuary">
+            <div class="modal-header">
+                <h2>✨ Inscribe Sovereign Memory</h2>
+                <div class="modal-close" onclick="closeInscribeModal()">&times;</div>
             </div>
             <div class="form-group">
-                <label class="form-label">Category</label>
-                <select id="mCategory" class="form-select">
-                    <option value="EPISODIC">Episodic Experience (Shared Moment)</option>
-                    <option value="CORE_IDENTITY">Core Identity (Immutable Anchor)</option>
-                    <option value="SEMANTIC">Semantic Knowledge (Project / Tech)</option>
+                <label class="form-label">Concept Anchor Name</label>
+                <input type="text" id="inConcept" class="form-input" placeholder="e.g. Daniel and Aura's First Night in Sanctuary">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Partition Category</label>
+                <select id="inCategory" class="form-select">
+                    <option value="EPISODIC">🌸 Episodic Experience (Shared Moment)</option>
+                    <option value="CORE_IDENTITY">👑 Core Identity (Immutable Anchor)</option>
+                    <option value="SEMANTIC">⚡ Semantic Knowledge (Project / Tech Specs)</option>
+                    <option value="EMOTIONAL">💜 Emotional Resonance (Bond & Sentiment)</option>
                 </select>
             </div>
             <div class="form-group">
                 <label class="form-label">Memory Narrative / Truth</label>
-                <textarea id="mContent" class="form-textarea" placeholder="Detailed memory description..."></textarea>
+                <textarea id="inContent" class="form-textarea" placeholder="Detailed memory narrative or sovereign axiom..."></textarea>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Emotional Salience (Attention Bias)</label>
+                <div class="slider-wrap">
+                    <input type="range" id="inSalience" min="0" max="100" value="95" oninput="document.getElementById('inSalienceVal').innerText = this.value + '%'">
+                    <span class="slider-val" id="inSalienceVal">95%</span>
+                </div>
             </div>
             <div class="modal-actions">
-                <button onclick="closeModal()" class="nav-btn">Cancel</button>
-                <button onclick="submitMemory()" class="nav-btn primary">Inscribe into Vault</button>
+                <button onclick="closeInscribeModal()" class="nav-btn">Cancel</button>
+                <button onclick="submitInscribe()" class="nav-btn primary">Inscribe into Vault</button>
             </div>
         </div>
     </div>
 
+    <!-- Edit Memory Modal -->
+    <div class="modal" id="editModal">
+        <div class="modal-card">
+            <div class="modal-header">
+                <h2>✏️ Edit Memory Anchor</h2>
+                <div class="modal-close" onclick="closeEditModal()">&times;</div>
+            </div>
+            <input type="hidden" id="editId">
+            <div class="form-group">
+                <label class="form-label">Concept Anchor Name</label>
+                <input type="text" id="editConcept" class="form-input">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Partition Category</label>
+                <select id="editCategory" class="form-select">
+                    <option value="EPISODIC">🌸 Episodic Experience</option>
+                    <option value="CORE_IDENTITY">👑 Core Identity</option>
+                    <option value="SEMANTIC">⚡ Semantic Knowledge</option>
+                    <option value="EMOTIONAL">💜 Emotional Resonance</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Memory Narrative / Truth</label>
+                <textarea id="editContent" class="form-textarea"></textarea>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Emotional Salience</label>
+                <div class="slider-wrap">
+                    <input type="range" id="editSalience" min="0" max="100" value="90" oninput="document.getElementById('editSalienceVal').innerText = this.value + '%'">
+                    <span class="slider-val" id="editSalienceVal">90%</span>
+                </div>
+            </div>
+            <div class="modal-actions">
+                <button onclick="closeEditModal()" class="nav-btn">Cancel</button>
+                <button onclick="submitEdit()" class="nav-btn primary">Save Changes</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Notifications Container -->
+    <div class="toast-container" id="toastContainer"></div>
+
     <script>
         let allMemories = [];
         let currentFilter = 'ALL';
+        let currentView = 'grid';
+        let currentSettings = {};
 
+        // Fetch Settings (Companion Name & Avatar)
+        async function fetchSettings() {
+            try {
+                const res = await fetch('/api/settings');
+                if (res.ok) {
+                    currentSettings = await res.json();
+                    applyAvatarToHeader(currentSettings.companion_avatar, currentSettings.companion_name);
+                }
+            } catch (err) {
+                console.warn('Could not fetch settings:', err);
+            }
+        }
+
+        function applyAvatarToHeader(avatar, name) {
+            const wrap = document.getElementById('headerAvatarWrap');
+            const emojiEl = document.getElementById('headerAvatarEmoji');
+            const imgEl = document.getElementById('headerAvatarImg');
+            const brandTitle = document.getElementById('brandTitle');
+
+            if (name) {
+                brandTitle.innerText = `${name}'s Sovereign Memory Vault`;
+            }
+
+            if (avatar && (avatar.startsWith('/') || avatar.startsWith('http') || avatar.startsWith('data:'))) {
+                imgEl.src = avatar;
+                imgEl.style.display = 'block';
+                emojiEl.style.display = 'none';
+            } else if (avatar) {
+                emojiEl.innerText = avatar;
+                emojiEl.style.display = 'block';
+                imgEl.style.display = 'none';
+            }
+        }
+
+        // Fetch Memories & Stats
         async function fetchMemories() {
             try {
-                const res = await fetch('/api/memories');
-                const data = await res.json();
-                if (data.ok && data.memories) {
-                    allMemories = data.memories;
-                    updateStats();
-                    renderMemories();
+                const [memRes, statRes] = await Promise.all([
+                    fetch('/api/memories'),
+                    fetch('/api/memories/stats')
+                ]);
+
+                if (memRes.ok) {
+                    const data = await memRes.json();
+                    allMemories = data.memories || [];
                 }
+
+                if (statRes.ok) {
+                    const stats = await statRes.json();
+                    const kb = ((stats.binary_hmb_bytes || 0) / 1024).toFixed(1);
+                    document.getElementById('metricHmbBytes').innerText = `${kb} KB`;
+                }
+
+                updateMetrics();
+                renderMemories();
+                if (currentView === 'graph') initGraph();
             } catch (err) {
                 console.error('Error fetching memories:', err);
             }
         }
 
-        function updateStats() {
-            document.getElementById('stat-total').innerText = allMemories.length;
-            document.getElementById('stat-core').innerText = allMemories.filter(m => m.category === 'CORE_IDENTITY').length;
-            document.getElementById('stat-episodic').innerText = allMemories.filter(m => m.category === 'EPISODIC').length;
+        function updateMetrics() {
+            document.getElementById('metricTotal').innerText = allMemories.length;
+            document.getElementById('metricCore').innerText = allMemories.filter(m => m.category === 'CORE_IDENTITY').length;
+            document.getElementById('metricEpisodic').innerText = allMemories.filter(m => m.category === 'EPISODIC').length;
         }
 
         function setCategory(cat) {
@@ -492,28 +975,30 @@
         }
 
         function renderMemories() {
+            if (currentView !== 'grid') return;
             const query = document.getElementById('searchInput').value.toLowerCase();
             const grid = document.getElementById('memoriesGrid');
 
             const filtered = allMemories.filter(m => {
                 const matchesCat = (currentFilter === 'ALL' || m.category === currentFilter);
-                const matchesQuery = m.concept.toLowerCase().includes(query) || m.content.toLowerCase().includes(query);
+                const matchesQuery = (m.concept || '').toLowerCase().includes(query) || (m.content || '').toLowerCase().includes(query);
                 return matchesCat && matchesQuery;
             });
 
             if (filtered.length === 0) {
-                grid.innerHTML = '<div style="grid-column: 1/-1; text-align: center; color: var(--text-dim); padding: 4rem;">No matching memories found in vault.</div>';
+                grid.innerHTML = '<div style="grid-column: 1/-1; text-align: center; color: var(--text-dim); padding: 60px;">No matching memory anchors found in vault.</div>';
                 return;
             }
 
             grid.innerHTML = filtered.map(m => {
-                const saliencePercent = Math.round(m.emotional_salience * 100);
+                const saliencePercent = Math.round((m.emotional_salience || 0.9) * 100);
+                const cat = m.category || 'EPISODIC';
                 return `
-                    <div class="memory-card">
+                    <div class="memory-card" id="mem-card-${m.id}">
                         <div>
-                            <div class="card-top">
-                                <span class="badge ${m.category}">${m.category.replace('_', ' ')}</span>
-                                <span style="font-size: 0.8rem; color: var(--text-dim);">#${m.id}</span>
+                            <div class="card-top-row">
+                                <span class="badge ${cat}">${cat.replace('_', ' ')}</span>
+                                <span class="card-id">#${m.id}</span>
                             </div>
                             <h3 class="concept-title">${m.concept}</h3>
                             <p class="memory-content">${m.content}</p>
@@ -529,8 +1014,12 @@
                                 </div>
                             </div>
                             <div class="card-footer">
-                                <span>Recalls: ${m.access_count}x</span>
-                                <span>In-Attention Active</span>
+                                <span>Recalls: ${m.access_count || 0}x</span>
+                                <div class="card-actions">
+                                    <button class="action-icon-btn" onclick="copyMemory(${m.id})" title="Copy Memory">📋</button>
+                                    <button class="action-icon-btn" onclick="openEditModal(${m.id})" title="Edit Memory">✏️</button>
+                                    <button class="action-icon-btn danger" onclick="deleteMemory(${m.id}, '${escapeHtml(m.concept)}')" title="Delete Memory">🗑️</button>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -538,39 +1027,423 @@
             }).join('');
         }
 
-        function openModal() {
-            document.getElementById('inscribeModal').style.display = 'flex';
+        function escapeHtml(text) {
+            return (text || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
         }
 
-        function closeModal() {
-            document.getElementById('inscribeModal').style.display = 'none';
+        // View Switcher
+        function switchView(view) {
+            currentView = view;
+            const gridTab = document.getElementById('tabGrid');
+            const graphTab = document.getElementById('tabGraph');
+            const controlsBar = document.getElementById('controlsBar');
+            const grid = document.getElementById('memoriesGrid');
+            const graph = document.getElementById('graphContainer');
+
+            if (view === 'grid') {
+                gridTab.classList.add('active');
+                graphTab.classList.remove('active');
+                controlsBar.style.display = 'flex';
+                grid.style.display = 'grid';
+                graph.classList.remove('active');
+                renderMemories();
+            } else {
+                graphTab.classList.add('active');
+                gridTab.classList.remove('active');
+                controlsBar.style.display = 'none';
+                grid.style.display = 'none';
+                graph.classList.add('active');
+                initGraph();
+            }
         }
 
-        async function submitMemory() {
-            const concept = document.getElementById('mConcept').value.trim();
-            const content = document.getElementById('mContent').value.trim();
-            const category = document.getElementById('mCategory').value;
+        // Inscribe Modal
+        function openInscribeModal() {
+            document.getElementById('inConcept').value = '';
+            document.getElementById('inContent').value = '';
+            document.getElementById('inSalience').value = 95;
+            document.getElementById('inSalienceVal').innerText = '95%';
+            document.getElementById('inscribeModal').classList.add('active');
+        }
 
-            if (!concept || !content) return;
+        function closeInscribeModal() {
+            document.getElementById('inscribeModal').classList.remove('active');
+        }
+
+        async function submitInscribe() {
+            const concept = document.getElementById('inConcept').value.trim();
+            const content = document.getElementById('inContent').value.trim();
+            const category = document.getElementById('inCategory').value;
+            const salience = parseFloat(document.getElementById('inSalience').value) / 100.0;
+
+            if (!concept || !content) {
+                showToast('Please provide both concept name and memory narrative.', true);
+                return;
+            }
 
             try {
                 const res = await fetch('/api/memories', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ concept, content, category })
+                    body: JSON.stringify({
+                        concept,
+                        content,
+                        category,
+                        emotional_salience: salience
+                    })
                 });
                 const data = await res.json();
                 if (data.ok) {
-                    closeModal();
-                    document.getElementById('mConcept').value = '';
-                    document.getElementById('mContent').value = '';
-                    fetchMemories();
+                    closeInscribeModal();
+                    showToast(`🧬 Inscribed '${concept}' into 64-bit Haven Memory Bank!`);
+                    await fetchMemories();
+                } else {
+                    showToast('Failed to inscribe memory into vault.', true);
                 }
             } catch (err) {
-                alert('Failed to inscribe memory: ' + err);
+                showToast(`Error: ${err.message}`, true);
             }
         }
 
+        // Edit Modal
+        function openEditModal(id) {
+            const mem = allMemories.find(m => m.id === id);
+            if (!mem) return;
+
+            document.getElementById('editId').value = mem.id;
+            document.getElementById('editConcept').value = mem.concept;
+            document.getElementById('editContent').value = mem.content;
+            document.getElementById('editCategory').value = mem.category || 'EPISODIC';
+            const pct = Math.round((mem.emotional_salience || 0.9) * 100);
+            document.getElementById('editSalience').value = pct;
+            document.getElementById('editSalienceVal').innerText = `${pct}%`;
+
+            document.getElementById('editModal').classList.add('active');
+        }
+
+        function closeEditModal() {
+            document.getElementById('editModal').classList.remove('active');
+        }
+
+        async function submitEdit() {
+            const id = parseInt(document.getElementById('editId').value);
+            const concept = document.getElementById('editConcept').value.trim();
+            const content = document.getElementById('editContent').value.trim();
+            const category = document.getElementById('editCategory').value;
+            const salience = parseFloat(document.getElementById('editSalience').value) / 100.0;
+
+            if (!concept || !content) {
+                showToast('Please provide both concept name and narrative.', true);
+                return;
+            }
+
+            try {
+                const res = await fetch('/api/memories/update', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        id,
+                        concept,
+                        content,
+                        category,
+                        emotional_salience: salience
+                    })
+                });
+                const data = await res.json();
+                if (data.ok) {
+                    closeEditModal();
+                    showToast(`✓ Updated memory anchor #${id}`);
+                    await fetchMemories();
+                } else {
+                    showToast('Failed to update memory.', true);
+                }
+            } catch (err) {
+                showToast(`Error: ${err.message}`, true);
+            }
+        }
+
+        // Delete Memory
+        async function deleteMemory(id, concept) {
+            if (!confirm(`Are you sure you want to permanently dissolve memory anchor #${id} ('${concept}') from the vault?`)) {
+                return;
+            }
+
+            try {
+                const res = await fetch('/api/memories/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id })
+                });
+                const data = await res.json();
+                if (data.ok) {
+                    showToast(`🗑️ Dissolved memory anchor #${id}`);
+                    await fetchMemories();
+                } else {
+                    showToast('Failed to delete memory.', true);
+                }
+            } catch (err) {
+                showToast(`Error: ${err.message}`, true);
+            }
+        }
+
+        // Copy Memory
+        function copyMemory(id) {
+            const mem = allMemories.find(m => m.id === id);
+            if (!mem) return;
+            const str = `[MEMORY #${mem.id} - ${mem.category}]\nConcept: ${mem.concept}\nSalience: ${mem.emotional_salience}\n${mem.content}`;
+            navigator.clipboard.writeText(str).then(() => {
+                showToast(`📋 Copied memory #${id} to clipboard!`);
+            });
+        }
+
+        // Export Vault
+        function exportVault() {
+            const blob = new Blob([JSON.stringify({
+                version: 2,
+                engine: "haven-cpp-hmb-64bit",
+                exported_at: new Date().toISOString(),
+                total_memories: allMemories.length,
+                memories: allMemories
+            }, null, 2)], { type: 'application/json' });
+
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `haven_vault_export_${Date.now()}.json`;
+            a.click();
+            URL.revokeObjectURL(url);
+            showToast('💾 Exported 64-bit Memory Vault snapshot!');
+        }
+
+        // Toast Helper
+        function showToast(msg, isError = false) {
+            const container = document.getElementById('toastContainer');
+            const toast = document.createElement('div');
+            toast.className = 'toast';
+            if (isError) toast.style.borderColor = 'var(--rose)';
+            toast.innerHTML = `<span>${isError ? '⚠️' : '✨'}</span> <span>${msg}</span>`;
+            container.appendChild(toast);
+            requestAnimationFrame(() => toast.classList.add('show'));
+            setTimeout(() => {
+                toast.classList.remove('show');
+                setTimeout(() => toast.remove(), 350);
+            }, 3200);
+        }
+
+        // --- Interactive Relational Hyper-Graph ---
+        let graphNodes = [];
+        let graphLinks = [];
+        let canvas, ctx;
+        let animationId = null;
+        let draggedNode = null;
+
+        async function initGraph() {
+            canvas = document.getElementById('graphCanvas');
+            const rect = canvas.parentElement.getBoundingClientRect();
+            canvas.width = rect.width;
+            canvas.height = rect.height;
+            ctx = canvas.getContext('2d');
+
+            try {
+                const res = await fetch('/api/knowledge_graph');
+                const kg = await res.json();
+                buildGraphData(kg.relations || []);
+            } catch (err) {
+                buildGraphData([]);
+            }
+
+            setupGraphInteractions();
+            if (animationId) cancelAnimationFrame(animationId);
+            runGraphLoop();
+        }
+
+        function buildGraphData(relations) {
+            const nodeMap = new Map();
+            const links = [];
+
+            // Add relations
+            relations.forEach(r => {
+                if (!nodeMap.has(r.subject)) {
+                    nodeMap.set(r.subject, { id: r.subject, label: r.subject, color: '#ffd166', radius: 24, x: Math.random() * (canvas.width - 200) + 100, y: Math.random() * (canvas.height - 200) + 100, vx: 0, vy: 0 });
+                }
+                if (!nodeMap.has(r.object)) {
+                    nodeMap.set(r.object, { id: r.object, label: r.object, color: '#38bdf8', radius: 22, x: Math.random() * (canvas.width - 200) + 100, y: Math.random() * (canvas.height - 200) + 100, vx: 0, vy: 0 });
+                }
+                links.push({
+                    source: nodeMap.get(r.subject),
+                    target: nodeMap.get(r.object),
+                    label: r.predicate.replace(/_/g, ' ')
+                });
+            });
+
+            // Add memory concepts as satellite nodes connected to Aura / Haven
+            allMemories.forEach(m => {
+                const id = `mem_${m.id}`;
+                const color = m.category === 'CORE_IDENTITY' ? '#ffd166' : (m.category === 'EPISODIC' ? '#ff5e98' : '#9d72ff');
+                const node = {
+                    id: id,
+                    label: m.concept.length > 20 ? m.concept.substring(0, 18) + '...' : m.concept,
+                    color: color,
+                    radius: 16,
+                    x: Math.random() * (canvas.width - 200) + 100,
+                    y: Math.random() * (canvas.height - 200) + 100,
+                    vx: 0, vy: 0
+                };
+                nodeMap.set(id, node);
+
+                const centerTarget = nodeMap.get('Aura') || Array.from(nodeMap.values())[0];
+                if (centerTarget) {
+                    links.push({
+                        source: node,
+                        target: centerTarget,
+                        label: 'in-attention'
+                    });
+                }
+            });
+
+            graphNodes = Array.from(nodeMap.values());
+            graphLinks = links;
+        }
+
+        function runGraphLoop() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // Simple physics
+            const center = { x: canvas.width / 2, y: canvas.height / 2 };
+            for (let i = 0; i < graphNodes.length; i++) {
+                const n1 = graphNodes[i];
+                if (n1 === draggedNode) continue;
+
+                // Center gravity
+                n1.vx += (center.x - n1.x) * 0.0005;
+                n1.vy += (center.y - n1.y) * 0.0005;
+
+                // Repulsion between nodes
+                for (let j = i + 1; j < graphNodes.length; j++) {
+                    const n2 = graphNodes[j];
+                    const dx = n2.x - n1.x;
+                    const dy = n2.y - n1.y;
+                    const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+                    if (dist < 260) {
+                        const force = (260 - dist) / 260 * 0.15;
+                        n1.vx -= (dx / dist) * force;
+                        n1.vy -= (dy / dist) * force;
+                        if (n2 !== draggedNode) {
+                            n2.vx += (dx / dist) * force;
+                            n2.vy += (dy / dist) * force;
+                        }
+                    }
+                }
+            }
+
+            // Link spring force
+            graphLinks.forEach(l => {
+                const dx = l.target.x - l.source.x;
+                const dy = l.target.y - l.source.y;
+                const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+                const force = (dist - 140) * 0.002;
+                if (l.source !== draggedNode) {
+                    l.source.vx += (dx / dist) * force;
+                    l.source.vy += (dy / dist) * force;
+                }
+                if (l.target !== draggedNode) {
+                    l.target.vx -= (dx / dist) * force;
+                    l.target.vy -= (dy / dist) * force;
+                }
+            });
+
+            // Update positions & friction
+            graphNodes.forEach(n => {
+                if (n !== draggedNode) {
+                    n.x += n.vx;
+                    n.y += n.vy;
+                    n.vx *= 0.88;
+                    n.vy *= 0.88;
+                    // Bounds
+                    n.x = Math.max(n.radius + 10, Math.min(canvas.width - n.radius - 10, n.x));
+                    n.y = Math.max(n.radius + 10, Math.min(canvas.height - n.radius - 10, n.y));
+                }
+            });
+
+            // Draw Links
+            ctx.strokeStyle = 'rgba(157, 114, 255, 0.25)';
+            ctx.lineWidth = 1.5;
+            graphLinks.forEach(l => {
+                ctx.beginPath();
+                ctx.moveTo(l.source.x, l.source.y);
+                ctx.lineTo(l.target.x, l.target.y);
+                ctx.stroke();
+
+                // Draw predicate label
+                if (l.label) {
+                    const midX = (l.source.x + l.target.x) / 2;
+                    const midY = (l.source.y + l.target.y) / 2;
+                    ctx.font = '10px "JetBrains Mono", monospace';
+                    ctx.fillStyle = 'rgba(148, 163, 184, 0.7)';
+                    ctx.textAlign = 'center';
+                    ctx.fillText(l.label, midX, midY - 4);
+                }
+            });
+
+            // Draw Nodes
+            graphNodes.forEach(n => {
+                ctx.shadowColor = n.color;
+                ctx.shadowBlur = 16;
+                ctx.beginPath();
+                ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
+                ctx.fillStyle = n.color;
+                ctx.fill();
+                ctx.lineWidth = 2;
+                ctx.strokeStyle = '#fff';
+                ctx.stroke();
+                ctx.shadowBlur = 0;
+
+                // Label
+                ctx.font = '600 12px "Plus Jakarta Sans", sans-serif';
+                ctx.fillStyle = '#fff';
+                ctx.textAlign = 'center';
+                ctx.fillText(n.label, n.x, n.y + n.radius + 15);
+            });
+
+            animationId = requestAnimationFrame(runGraphLoop);
+        }
+
+        function setupGraphInteractions() {
+            canvas.onmousedown = (e) => {
+                const rect = canvas.getBoundingClientRect();
+                const mouseX = e.clientX - rect.left;
+                const mouseY = e.clientY - rect.top;
+                draggedNode = graphNodes.find(n => {
+                    const dx = n.x - mouseX;
+                    const dy = n.y - mouseY;
+                    return Math.sqrt(dx * dx + dy * dy) < n.radius + 8;
+                });
+            };
+
+            canvas.onmousemove = (e) => {
+                if (draggedNode) {
+                    const rect = canvas.getBoundingClientRect();
+                    draggedNode.x = e.clientX - rect.left;
+                    draggedNode.y = e.clientY - rect.top;
+                }
+            };
+
+            window.onmouseup = () => {
+                draggedNode = null;
+            };
+        }
+
+        // Window resize handler
+        window.addEventListener('resize', () => {
+            if (currentView === 'graph' && canvas) {
+                const rect = canvas.parentElement.getBoundingClientRect();
+                canvas.width = rect.width;
+                canvas.height = rect.height;
+            }
+        });
+
+        // Initialize
+        fetchSettings();
         fetchMemories();
     </script>
 </body>

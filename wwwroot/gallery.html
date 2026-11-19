@@ -3,38 +3,58 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Aura & Sanctuary Gallery | Haven.cpp</title>
+    <title>Aura Visual Studio & Gallery | Haven Sovereign AI</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <style>
         :root {
             --bg-deep: #07090e;
-            --bg-card: rgba(18, 24, 38, 0.85);
-            --border-glow: rgba(139, 92, 246, 0.25);
+            --bg-card: rgba(15, 20, 32, 0.78);
+            --bg-card-hover: rgba(22, 30, 48, 0.9);
+            --border-subtle: rgba(255, 255, 255, 0.08);
+            --border-glow: rgba(139, 92, 246, 0.3);
             --primary: #8b5cf6;
             --primary-light: #c084fc;
+            --primary-glow: rgba(139, 92, 246, 0.35);
             --cyan: #38bdf8;
+            --cyan-glow: rgba(56, 189, 248, 0.3);
+            --pink: #ec4899;
             --emerald: #10b981;
+            --amber: #f59e0b;
+            --rose: #f43f5e;
             --text-main: #f8fafc;
             --text-muted: #94a3b8;
+            --text-dim: #64748b;
         }
 
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; }
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+        }
 
         body {
             background-color: var(--bg-deep);
-            background-image: 
-                radial-gradient(circle at 15% 15%, rgba(139, 92, 246, 0.08) 0%, transparent 40%),
-                radial-gradient(circle at 85% 85%, rgba(56, 189, 248, 0.06) 0%, transparent 40%);
+            background-image:
+                radial-gradient(circle at 10% 10%, rgba(139, 92, 246, 0.12) 0%, transparent 45%),
+                radial-gradient(circle at 90% 90%, rgba(56, 189, 248, 0.1) 0%, transparent 45%),
+                radial-gradient(circle at 50% 50%, rgba(236, 72, 153, 0.04) 0%, transparent 50%);
+            background-attachment: fixed;
             color: var(--text-main);
             min-height: 100vh;
             display: flex;
             flex-direction: column;
+            overflow-x: hidden;
         }
 
+        /* --- Header --- */
         header {
-            padding: 16px 28px;
-            background: rgba(11, 15, 25, 0.8);
-            backdrop-filter: blur(12px);
-            border-bottom: 1px solid var(--border-glow);
+            padding: 14px 28px;
+            background: rgba(11, 15, 25, 0.85);
+            backdrop-filter: blur(16px);
+            border-bottom: 1px solid var(--border-subtle);
             display: flex;
             justify-content: space-between;
             align-items: center;
@@ -46,83 +66,295 @@
         .brand {
             display: flex;
             align-items: center;
-            gap: 12px;
+            gap: 14px;
+            text-decoration: none;
         }
 
-        .brand h1 {
-            font-size: 18px;
+        .brand-avatar-wrap {
+            position: relative;
+            width: 42px;
+            height: 42px;
+            border-radius: 12px;
+            background: linear-gradient(135deg, var(--primary), var(--cyan));
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 22px;
+            box-shadow: 0 0 18px var(--primary-glow);
+            overflow: hidden;
+            flex-shrink: 0;
+        }
+
+        .brand-avatar-img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: none;
+        }
+
+        .brand-text h1 {
+            font-size: 17px;
             font-weight: 700;
-            background: linear-gradient(135deg, var(--text-main), var(--primary-light));
+            letter-spacing: -0.2px;
+            background: linear-gradient(135deg, #fff 20%, var(--primary-light) 70%, var(--cyan) 100%);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
         }
 
+        .brand-text p {
+            font-size: 11px;
+            color: var(--text-muted);
+            letter-spacing: 0.3px;
+        }
+
+        .nav-links {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
         .nav-btn {
-            background: rgba(139, 92, 246, 0.15);
-            border: 1px solid var(--border-glow);
-            color: var(--primary-light);
-            padding: 8px 16px;
-            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid var(--border-subtle);
+            color: var(--text-main);
+            padding: 7px 14px;
+            border-radius: 9px;
             text-decoration: none;
             font-size: 13px;
-            font-weight: 600;
-            transition: all 0.2s;
+            font-weight: 500;
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            cursor: pointer;
+            transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+            backdrop-filter: blur(10px);
         }
 
         .nav-btn:hover {
-            background: var(--primary);
-            color: #fff;
-            box-shadow: 0 0 16px rgba(139, 92, 246, 0.4);
+            background: rgba(139, 92, 246, 0.18);
+            border-color: var(--primary);
+            box-shadow: 0 0 16px var(--primary-glow);
+            transform: translateY(-1px);
         }
 
+        .nav-btn.primary {
+            background: linear-gradient(135deg, #8b5cf6, #6d28d9);
+            border-color: rgba(192, 132, 252, 0.4);
+            color: #fff;
+            box-shadow: 0 0 16px var(--primary-glow);
+        }
+
+        .nav-btn.primary:hover {
+            box-shadow: 0 0 24px rgba(139, 92, 246, 0.6);
+            transform: translateY(-2px);
+        }
+
+        /* --- Main Layout --- */
         main {
             flex: 1;
-            max-width: 1400px;
+            max-width: 1440px;
             width: 100%;
             margin: 0 auto;
-            padding: 28px 24px;
+            padding: 28px 24px 60px;
         }
 
-        .gallery-header {
-            margin-bottom: 24px;
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-end;
-        }
-
-        .gallery-title {
-            font-size: 22px;
-            font-weight: 700;
-            color: var(--text-main);
-        }
-
-        .gallery-subtitle {
-            font-size: 13px;
-            color: var(--text-muted);
-            margin-top: 4px;
-        }
-
-        .grid {
+        /* --- Metrics Bar --- */
+        .metrics-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-            gap: 24px;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 14px;
+            margin-bottom: 24px;
         }
 
-        .card {
+        .metric-card {
             background: var(--bg-card);
-            border: 1px solid var(--border-glow);
+            border: 1px solid var(--border-subtle);
             border-radius: 14px;
-            overflow: hidden;
+            padding: 16px 18px;
+            backdrop-filter: blur(12px);
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+
+        .metric-card:hover {
+            border-color: var(--border-glow);
+            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+        }
+
+        .metric-icon {
+            width: 44px;
+            height: 44px;
+            border-radius: 11px;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid var(--border-subtle);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+            flex-shrink: 0;
+        }
+
+        .metric-val {
+            font-size: 19px;
+            font-weight: 700;
+            font-family: 'JetBrains Mono', monospace;
+            color: #fff;
+            letter-spacing: -0.5px;
+        }
+
+        .metric-lbl {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.6px;
+            color: var(--text-muted);
+            margin-top: 2px;
+        }
+
+        /* --- Drag & Drop Upload Zone --- */
+        .upload-zone {
+            background: rgba(18, 24, 38, 0.45);
+            border: 2px dashed rgba(139, 92, 246, 0.35);
+            border-radius: 16px;
+            padding: 24px 20px;
+            text-align: center;
+            margin-bottom: 24px;
             backdrop-filter: blur(10px);
-            transition: transform 0.2s, box-shadow 0.2s, border-color 0.2s;
+            transition: all 0.25s ease;
+            cursor: pointer;
+            position: relative;
+        }
+
+        .upload-zone.dragover {
+            border-color: var(--cyan);
+            background: rgba(56, 189, 248, 0.08);
+            box-shadow: 0 0 25px var(--cyan-glow);
+            transform: scale(1.005);
+        }
+
+        .upload-icon {
+            font-size: 32px;
+            margin-bottom: 8px;
+            display: inline-block;
+            filter: drop-shadow(0 0 10px var(--primary-glow));
+        }
+
+        .upload-title {
+            font-size: 15px;
+            font-weight: 600;
+            color: #fff;
+            margin-bottom: 4px;
+        }
+
+        .upload-subtitle {
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+
+        .upload-input {
+            display: none;
+        }
+
+        /* --- Controls Toolbar --- */
+        .controls-bar {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            justify-content: space-between;
+            gap: 14px;
+            margin-bottom: 22px;
+            background: rgba(15, 20, 32, 0.6);
+            border: 1px solid var(--border-subtle);
+            border-radius: 14px;
+            padding: 12px 18px;
+            backdrop-filter: blur(12px);
+        }
+
+        .search-box {
+            flex: 1;
+            min-width: 240px;
+            position: relative;
+        }
+
+        .search-input {
+            width: 100%;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid var(--border-subtle);
+            border-radius: 9px;
+            padding: 8px 14px 8px 36px;
+            color: #fff;
+            font-size: 13px;
+            outline: none;
+            transition: all 0.2s;
+        }
+
+        .search-input:focus {
+            border-color: var(--primary);
+            box-shadow: 0 0 14px var(--primary-glow);
+        }
+
+        .search-icon {
+            position: absolute;
+            left: 11px;
+            top: 50%;
+            transform: translateY(-50%);
+            font-size: 14px;
+            color: var(--text-dim);
+            pointer-events: none;
+        }
+
+        .filter-group {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .select-custom {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--border-subtle);
+            border-radius: 9px;
+            padding: 7px 12px;
+            color: var(--text-main);
+            font-size: 12px;
+            font-weight: 500;
+            outline: none;
+            cursor: pointer;
+            transition: border-color 0.2s;
+        }
+
+        .select-custom:focus {
+            border-color: var(--primary);
+        }
+
+        .select-custom option {
+            background: #0f1523;
+            color: #fff;
+        }
+
+        /* --- Gallery Grid --- */
+        .gallery-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
+            gap: 22px;
+        }
+
+        .art-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-subtle);
+            border-radius: 16px;
+            overflow: hidden;
+            backdrop-filter: blur(14px);
             display: flex;
             flex-direction: column;
+            transition: all 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+            position: relative;
         }
 
-        .card:hover {
+        .art-card:hover {
             transform: translateY(-4px);
             border-color: var(--primary-light);
-            box-shadow: 0 12px 30px rgba(0, 0, 0, 0.5), 0 0 20px rgba(139, 92, 246, 0.25);
+            box-shadow: 0 14px 35px rgba(0, 0, 0, 0.6), 0 0 22px rgba(139, 92, 246, 0.25);
         }
 
         .img-wrap {
@@ -130,80 +362,160 @@
             aspect-ratio: 1 / 1;
             background: #000;
             overflow: hidden;
+            position: relative;
+            cursor: pointer;
             display: flex;
             align-items: center;
             justify-content: center;
-            cursor: pointer;
         }
 
-        .img-wrap img {
+        .art-img {
             width: 100%;
             height: 100%;
             object-fit: cover;
-            transition: transform 0.3s ease;
+            transition: transform 0.4s ease;
         }
 
-        .card:hover .img-wrap img {
+        .art-card:hover .art-img {
             transform: scale(1.04);
         }
 
+        .img-overlay-badges {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            right: 10px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            pointer-events: none;
+        }
+
+        .badge-format {
+            background: rgba(7, 9, 14, 0.75);
+            backdrop-filter: blur(8px);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            padding: 3px 8px;
+            border-radius: 6px;
+            font-size: 10px;
+            font-weight: 600;
+            color: var(--cyan);
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+        }
+
+        .badge-avatar-active {
+            background: linear-gradient(135deg, rgba(236, 72, 153, 0.9), rgba(139, 92, 246, 0.9));
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            padding: 3px 9px;
+            border-radius: 6px;
+            font-size: 10px;
+            font-weight: 700;
+            color: #fff;
+            letter-spacing: 0.4px;
+            display: none;
+            box-shadow: 0 0 12px var(--pink);
+        }
+
         .card-body {
-            padding: 16px;
+            padding: 15px 16px;
             display: flex;
             flex-direction: column;
-            gap: 8px;
+            gap: 10px;
             flex: 1;
+        }
+
+        .card-title-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            gap: 8px;
         }
 
         .card-title {
-            font-size: 14px;
+            font-size: 13.5px;
             font-weight: 600;
-            color: var(--text-main);
-            word-break: break-all;
-        }
-
-        .card-meta {
-            font-size: 12px;
-            color: var(--text-muted);
-            display: flex;
-            justify-content: space-between;
-        }
-
-        .card-actions {
-            margin-top: auto;
-            display: flex;
-            gap: 8px;
-            padding-top: 8px;
-        }
-
-        .btn-action {
+            color: #fff;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
             flex: 1;
-            padding: 8px;
-            border-radius: 6px;
-            font-size: 12px;
-            font-weight: 600;
-            text-align: center;
-            text-decoration: none;
-            border: 1px solid var(--border-glow);
-            background: rgba(255, 255, 255, 0.05);
+        }
+
+        .card-size {
+            font-size: 11px;
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--text-dim);
+            flex-shrink: 0;
+        }
+
+        .card-actions-grid {
+            margin-top: auto;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 7px;
+            padding-top: 6px;
+        }
+
+        .card-btn {
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid var(--border-subtle);
             color: var(--text-main);
+            padding: 7px 10px;
+            border-radius: 8px;
+            font-size: 11.5px;
+            font-weight: 500;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
             cursor: pointer;
-            transition: background 0.2s;
+            text-decoration: none;
+            transition: all 0.2s ease;
         }
 
-        .btn-action:hover {
-            background: rgba(139, 92, 246, 0.3);
+        .card-btn:hover {
+            background: rgba(139, 92, 246, 0.22);
             border-color: var(--primary);
+            color: #fff;
+            box-shadow: 0 0 12px rgba(139, 92, 246, 0.3);
         }
 
-        /* Lightbox Modal */
+        .card-btn.avatar-btn {
+            grid-column: 1 / -1;
+            background: rgba(236, 72, 153, 0.12);
+            border-color: rgba(236, 72, 153, 0.3);
+            color: #f472b6;
+            font-weight: 600;
+        }
+
+        .card-btn.avatar-btn:hover {
+            background: linear-gradient(135deg, rgba(236, 72, 153, 0.35), rgba(139, 92, 246, 0.35));
+            border-color: var(--pink);
+            color: #fff;
+            box-shadow: 0 0 16px rgba(236, 72, 153, 0.4);
+        }
+
+        .card-btn.delete-btn {
+            color: #f87171;
+            border-color: rgba(248, 113, 113, 0.2);
+        }
+
+        .card-btn.delete-btn:hover {
+            background: rgba(239, 68, 68, 0.2);
+            border-color: var(--rose);
+            color: #fff;
+            box-shadow: 0 0 12px rgba(239, 68, 68, 0.3);
+        }
+
+        /* --- Lightbox Modal --- */
         .modal {
             display: none;
             position: fixed;
-            z-index: 1000;
             inset: 0;
-            background: rgba(0, 0, 0, 0.88);
-            backdrop-filter: blur(8px);
+            z-index: 1000;
+            background: rgba(4, 6, 11, 0.92);
+            backdrop-filter: blur(14px);
             align-items: center;
             justify-content: center;
             padding: 24px;
@@ -213,111 +525,543 @@
             display: flex;
         }
 
-        .modal-content {
-            max-width: 90vw;
-            max-height: 90vh;
-            border-radius: 12px;
-            border: 1px solid var(--border-glow);
-            box-shadow: 0 0 40px rgba(0, 0, 0, 0.8);
+        .modal-content-wrap {
+            max-width: 92vw;
+            max-height: 92vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            position: relative;
         }
 
-        .modal-close {
+        .modal-img {
+            max-width: 88vw;
+            max-height: 78vh;
+            border-radius: 14px;
+            border: 1px solid var(--border-glow);
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.85), 0 0 40px rgba(139, 92, 246, 0.3);
+            object-fit: contain;
+        }
+
+        .modal-toolbar {
+            margin-top: 16px;
+            display: flex;
+            gap: 12px;
+            background: rgba(18, 24, 38, 0.9);
+            border: 1px solid var(--border-subtle);
+            border-radius: 12px;
+            padding: 8px 16px;
+            backdrop-filter: blur(16px);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6);
+        }
+
+        .modal-close-btn {
             position: absolute;
-            top: 24px;
-            right: 32px;
+            top: -16px;
+            right: -16px;
+            width: 38px;
+            height: 38px;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
             color: #fff;
-            font-size: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
             cursor: pointer;
+            backdrop-filter: blur(8px);
+            transition: all 0.2s;
+        }
+
+        .modal-close-btn:hover {
+            background: var(--rose);
+            border-color: var(--rose);
+            transform: scale(1.1);
+        }
+
+        /* --- Toast Notifications --- */
+        .toast-container {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            z-index: 2000;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            pointer-events: none;
+        }
+
+        .toast {
+            background: rgba(15, 22, 36, 0.95);
+            border: 1px solid var(--border-glow);
+            border-radius: 12px;
+            padding: 12px 18px;
+            color: #fff;
+            font-size: 13px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6), 0 0 20px var(--primary-glow);
+            backdrop-filter: blur(16px);
+            pointer-events: auto;
+            transform: translateY(20px);
+            opacity: 0;
+            transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+
+        .toast.show {
+            transform: translateY(0);
+            opacity: 1;
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            header { padding: 12px 16px; }
+            main { padding: 16px 12px 40px; }
+            .brand-text p { display: none; }
+            .controls-bar { flex-direction: column; align-items: stretch; }
         }
     </style>
 </head>
 <body>
+
+    <!-- Header -->
     <header>
-        <div class="brand">
-            <div style="font-size: 24px;">🌸</div>
-            <div>
-                <h1>Aura Visual Studio & Gallery</h1>
-                <div style="font-size: 11px; color: var(--text-muted);">Haven.cpp Sovereign Uploads</div>
+        <a href="/" class="brand">
+            <div class="brand-avatar-wrap" id="headerAvatarWrap">
+                <span id="headerAvatarEmoji">🌸</span>
+                <img id="headerAvatarImg" class="brand-avatar-img" src="" alt="Avatar">
             </div>
-        </div>
-        <div style="display: flex; gap: 12px;">
+            <div class="brand-text">
+                <h1 id="brandTitle">Aura Visual Studio & Gallery</h1>
+                <p>Haven Sovereign Creative Oasis & Stable Diffusion C++</p>
+            </div>
+        </a>
+
+        <div class="nav-links">
+            <a href="/" class="nav-btn">💬 Chat Studio</a>
             <a href="/memories" class="nav-btn">🧬 Memory Vault</a>
-            <a href="/" class="nav-btn">🏛️ Return to Web Studio</a>
+            <button class="nav-btn primary" onclick="document.getElementById('fileUploadInput').click()">
+                ✨ Upload Artwork
+            </button>
         </div>
     </header>
 
+    <!-- Main Content -->
     <main>
-        <div class="gallery-header">
-            <div>
-                <div class="gallery-title">🎨 Sanctuary Media & Creations Gallery</div>
-                <div class="gallery-subtitle">Sorted artwork created by Aura and Stable Diffusion C++ in <code>/wwwroot/uploads</code></div>
+        <!-- Metrics Ribbon -->
+        <div class="metrics-grid">
+            <div class="metric-card">
+                <div class="metric-icon" style="color: var(--primary-light);">🎨</div>
+                <div>
+                    <div class="metric-val" id="metricTotalImages">0</div>
+                    <div class="metric-lbl">Total Artworks</div>
+                </div>
             </div>
-            <button class="nav-btn" onclick="loadGallery()">🔄 Refresh Gallery</button>
+            <div class="metric-card">
+                <div class="metric-icon" style="color: var(--cyan);">💾</div>
+                <div>
+                    <div class="metric-val" id="metricStorageBytes">0.0 MB</div>
+                    <div class="metric-lbl">Storage Occupied</div>
+                </div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-icon" style="color: var(--pink);">🌸</div>
+                <div>
+                    <div class="metric-val" id="metricActiveAvatar">Aura Default</div>
+                    <div class="metric-lbl">Active Companion Avatar</div>
+                </div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-icon" style="color: var(--emerald);">⚡</div>
+                <div>
+                    <div class="metric-val">SD C++ LCM</div>
+                    <div class="metric-lbl">Generation Runtime</div>
+                </div>
+            </div>
         </div>
 
-        <div class="grid" id="gallery-grid">
-            <div style="grid-column: 1/-1; text-align: center; padding: 40px; color: var(--text-muted);">
-                Loading artwork from Sovereign Server...
+        <!-- Drag & Drop Upload Zone -->
+        <div class="upload-zone" id="dropZone" onclick="document.getElementById('fileUploadInput').click()">
+            <input type="file" id="fileUploadInput" class="upload-input" accept="image/png,image/jpeg,image/webp,image/jpg" onchange="handleFileSelect(event)">
+            <div class="upload-icon">📥</div>
+            <div class="upload-title">Drop sovereign artwork or click to upload</div>
+            <div class="upload-subtitle">Supports PNG, WebP, JPEG. Inscribes directly to <code>/wwwroot/uploads</code> via bare-metal C++ API</div>
+        </div>
+
+        <!-- Controls Toolbar -->
+        <div class="controls-bar">
+            <div class="search-box">
+                <span class="search-icon">🔍</span>
+                <input type="text" id="searchInput" class="search-input" placeholder="Search artwork by filename..." oninput="renderGallery()">
+            </div>
+
+            <div class="filter-group">
+                <select id="sortSelect" class="select-custom" onchange="renderGallery()">
+                    <option value="newest">Sort: Newest First</option>
+                    <option value="oldest">Sort: Oldest First</option>
+                    <option value="largest">Sort: Largest Size</option>
+                    <option value="smallest">Sort: Smallest Size</option>
+                    <option value="name">Sort: Alphabetical</option>
+                </select>
+
+                <select id="formatSelect" class="select-custom" onchange="renderGallery()">
+                    <option value="all">Format: All Images</option>
+                    <option value="png">Format: PNG</option>
+                    <option value="webp">Format: WebP</option>
+                    <option value="jpg">Format: JPG / JPEG</option>
+                </select>
+
+                <button class="nav-btn" onclick="fetchGallery()" title="Refresh Gallery from Disk">
+                    🔄 Refresh
+                </button>
+            </div>
+        </div>
+
+        <!-- Gallery Grid -->
+        <div class="gallery-grid" id="galleryGrid">
+            <div style="grid-column: 1/-1; text-align: center; padding: 60px; color: var(--text-muted);">
+                Connecting to Haven Sovereign Server...
             </div>
         </div>
     </main>
 
-    <div class="modal" id="modal" onclick="closeModal()">
-        <span class="modal-close">&times;</span>
-        <img class="modal-content" id="modal-img" src="" alt="Fullsize Artwork">
+    <!-- Lightbox Modal -->
+    <div class="modal" id="lightboxModal" onclick="closeLightbox(event)">
+        <div class="modal-content-wrap">
+            <div class="modal-close-btn" onclick="closeLightbox()">&times;</div>
+            <img id="lightboxImg" class="modal-img" src="" alt="Artwork Fullsize">
+            <div class="modal-toolbar" onclick="event.stopPropagation()">
+                <button class="nav-btn" id="modalAvatarBtn" onclick="setAsAvatarFromModal()">👑 Set as Companion Avatar</button>
+                <a id="modalDownloadBtn" href="" download class="nav-btn">⬇️ Download</a>
+                <button class="nav-btn" onclick="copyModalUrl()">📋 Copy URL</button>
+                <button class="nav-btn" style="color: var(--rose);" onclick="deleteFromModal()">🗑️ Delete</button>
+            </div>
+        </div>
     </div>
 
-    <script>
-        async function loadGallery() {
-            const grid = document.getElementById('gallery-grid');
-            try {
-                const res = await fetch('/api/gallery');
-                const data = await res.json();
-                
-                if (!data.images || data.images.length === 0) {
-                    grid.innerHTML = `<div style="grid-column: 1/-1; text-align: center; padding: 40px; color: var(--text-muted);">No artwork uploaded yet. Ask Aura to paint something!</div>`;
-                    return;
-                }
+    <!-- Toast Notifications Container -->
+    <div class="toast-container" id="toastContainer"></div>
 
-                grid.innerHTML = data.images.map(img => `
-                    <div class="card">
-                        <div class="img-wrap" onclick="openModal('${img.url}')">
-                            <img src="${img.url}" alt="${img.name}" loading="lazy">
-                        </div>
-                        <div class="card-body">
-                            <div class="card-title">${img.name}</div>
-                            <div class="card-meta">
-                                <span>${(img.size / 1024).toFixed(1)} KB</span>
-                                <span style="color: var(--cyan);">SD C++ LCM</span>
-                            </div>
-                            <div class="card-actions">
-                                <a href="${img.url}" target="_blank" class="btn-action">🔍 Fullsize</a>
-                                <button class="btn-action" onclick="copyLink('${img.url}')">📋 Copy URL</button>
-                            </div>
-                        </div>
-                    </div>
-                `).join('');
+    <script>
+        let allImages = [];
+        let currentSettings = {};
+        let activeModalImage = null;
+
+        // Fetch Settings (Persona & Avatar)
+        async function fetchSettings() {
+            try {
+                const res = await fetch('/api/settings');
+                if (res.ok) {
+                    currentSettings = await res.json();
+                    applyAvatarToHeader(currentSettings.companion_avatar, currentSettings.companion_name);
+                }
             } catch (err) {
-                grid.innerHTML = `<div style="grid-column: 1/-1; text-align: center; padding: 40px; color: var(--rose);">Error loading gallery: ${err.message}</div>`;
+                console.warn('Could not fetch settings:', err);
             }
         }
 
-        function openModal(url) {
-            document.getElementById('modal-img').src = url;
-            document.getElementById('modal').classList.add('active');
+        function applyAvatarToHeader(avatar, name) {
+            const wrap = document.getElementById('headerAvatarWrap');
+            const emojiEl = document.getElementById('headerAvatarEmoji');
+            const imgEl = document.getElementById('headerAvatarImg');
+            const avatarMetric = document.getElementById('metricActiveAvatar');
+            const brandTitle = document.getElementById('brandTitle');
+
+            if (name) {
+                brandTitle.innerText = `${name} Visual Studio & Gallery`;
+            }
+
+            if (avatar && (avatar.startsWith('/') || avatar.startsWith('http') || avatar.startsWith('data:'))) {
+                imgEl.src = avatar;
+                imgEl.style.display = 'block';
+                emojiEl.style.display = 'none';
+                avatarMetric.innerText = avatar.split('/').pop().substring(0, 18);
+            } else if (avatar) {
+                emojiEl.innerText = avatar;
+                emojiEl.style.display = 'block';
+                imgEl.style.display = 'none';
+                avatarMetric.innerText = `${avatar} (${name || 'Companion'})`;
+            }
         }
 
-        function closeModal() {
-            document.getElementById('modal').classList.remove('active');
+        // Fetch Gallery Images
+        async function fetchGallery() {
+            const grid = document.getElementById('galleryGrid');
+            try {
+                const res = await fetch('/api/gallery');
+                const data = await res.json();
+                allImages = data.images || data.files || [];
+                updateMetrics();
+                renderGallery();
+            } catch (err) {
+                grid.innerHTML = `<div style="grid-column: 1/-1; text-align: center; padding: 60px; color: var(--rose);">
+                    Error reading uploads directory: ${err.message}
+                </div>`;
+            }
         }
 
+        function updateMetrics() {
+            document.getElementById('metricTotalImages').innerText = allImages.length;
+            const totalBytes = allImages.reduce((sum, img) => sum + (img.size || 0), 0);
+            const mb = (totalBytes / (1024 * 1024)).toFixed(2);
+            document.getElementById('metricStorageBytes').innerText = `${mb} MB`;
+        }
+
+        function renderGallery() {
+            const grid = document.getElementById('galleryGrid');
+            const search = document.getElementById('searchInput').value.trim().toLowerCase();
+            const sortMode = document.getElementById('sortSelect').value;
+            const formatFilter = document.getElementById('formatSelect').value;
+
+            let filtered = allImages.filter(img => {
+                const nameMatch = img.name.toLowerCase().includes(search);
+                if (!nameMatch) return false;
+                if (formatFilter === 'png') return img.name.toLowerCase().endsWith('.png');
+                if (formatFilter === 'webp') return img.name.toLowerCase().endsWith('.webp');
+                if (formatFilter === 'jpg') return img.name.toLowerCase().endsWith('.jpg') || img.name.toLowerCase().endsWith('.jpeg');
+                return true;
+            });
+
+            // Sorting
+            filtered.sort((a, b) => {
+                if (sortMode === 'newest') return (b.timestamp || 0) - (a.timestamp || 0);
+                if (sortMode === 'oldest') return (a.timestamp || 0) - (b.timestamp || 0);
+                if (sortMode === 'largest') return (b.size || 0) - (a.size || 0);
+                if (sortMode === 'smallest') return (a.size || 0) - (b.size || 0);
+                if (sortMode === 'name') return a.name.localeCompare(b.name);
+                return 0;
+            });
+
+            if (filtered.length === 0) {
+                grid.innerHTML = `<div style="grid-column: 1/-1; text-align: center; padding: 60px; color: var(--text-dim);">
+                    No artwork matches your criteria. Drop an image above or generate one with Aura!
+                </div>`;
+                return;
+            }
+
+            const currentAvatarUrl = currentSettings.companion_avatar || '';
+
+            grid.innerHTML = filtered.map(img => {
+                const isCurrentAvatar = currentAvatarUrl.includes(img.name);
+                const ext = img.name.split('.').pop().toUpperCase();
+                const kb = (img.size / 1024).toFixed(1);
+
+                return `
+                    <div class="art-card" id="card-${encodeURIComponent(img.name)}">
+                        <div class="img-wrap" onclick="openLightbox('${img.url}', '${img.name}', ${img.size})">
+                            <img class="art-img" src="${img.url}" alt="${img.name}" loading="lazy">
+                            <div class="img-overlay-badges">
+                                <span class="badge-format">${ext}</span>
+                                <span class="badge-avatar-active" style="display: ${isCurrentAvatar ? 'inline-block' : 'none'};">👑 ACTIVE AVATAR</span>
+                            </div>
+                        </div>
+                        <div class="card-body">
+                            <div class="card-title-row">
+                                <div class="card-title" title="${img.name}">${img.name}</div>
+                                <div class="card-size">${kb} KB</div>
+                            </div>
+                            <div class="card-actions-grid">
+                                <button class="card-btn avatar-btn" onclick="setAsAvatar('${img.url}', '${img.name}')">
+                                    👑 Set as Avatar
+                                </button>
+                                <button class="card-btn" onclick="openLightbox('${img.url}', '${img.name}', ${img.size})">
+                                    🔍 Inspect
+                                </button>
+                                <button class="card-btn" onclick="copyLink('${img.url}')">
+                                    📋 Copy URL
+                                </button>
+                                <a href="${img.url}" download="${img.name}" class="card-btn">
+                                    ⬇️ Save
+                                </a>
+                                <button class="card-btn delete-btn" onclick="deleteArtwork('${img.name}')">
+                                    🗑️ Delete
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        // Set as Companion Avatar
+        async function setAsAvatar(url, name) {
+            try {
+                const updated = { ...currentSettings, companion_avatar: url };
+                const res = await fetch('/api/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(updated)
+                });
+                if (res.ok) {
+                    currentSettings.companion_avatar = url;
+                    applyAvatarToHeader(url, currentSettings.companion_name);
+                    renderGallery();
+                    showToast(`🌸 Set ${name} as ${currentSettings.companion_name || 'Companion'}'s avatar!`);
+                } else {
+                    showToast('Failed to update avatar settings.', true);
+                }
+            } catch (err) {
+                showToast(`Error updating avatar: ${err.message}`, true);
+            }
+        }
+
+        // Copy URL
         function copyLink(url) {
             const fullUrl = window.location.origin + url;
-            navigator.clipboard.writeText(fullUrl);
-            alert('Copied URL to clipboard: ' + fullUrl);
+            navigator.clipboard.writeText(fullUrl).then(() => {
+                showToast(`📋 Copied URL to clipboard: ${url}`);
+            });
         }
 
-        loadGallery();
+        // Delete Artwork
+        async function deleteArtwork(filename) {
+            if (!confirm(`Are you sure you want to permanently delete '${filename}' from Sovereign Storage?`)) {
+                return;
+            }
+
+            try {
+                const res = await fetch('/api/gallery/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ filename })
+                });
+                const data = await res.json();
+                if (data.ok) {
+                    allImages = allImages.filter(img => img.name !== filename);
+                    updateMetrics();
+                    renderGallery();
+                    showToast(`🗑️ Deleted '${filename}'`);
+                } else {
+                    showToast(`Delete failed: file not found or protected`, true);
+                }
+            } catch (err) {
+                showToast(`Error deleting file: ${err.message}`, true);
+            }
+        }
+
+        // Drag & Drop Handling
+        const dropZone = document.getElementById('dropZone');
+        ['dragenter', 'dragover'].forEach(name => {
+            dropZone.addEventListener(name, (e) => {
+                e.preventDefault();
+                dropZone.classList.add('dragover');
+            });
+        });
+
+        ['dragleave', 'drop'].forEach(name => {
+            dropZone.addEventListener(name, (e) => {
+                e.preventDefault();
+                dropZone.classList.remove('dragover');
+            });
+        });
+
+        dropZone.addEventListener('drop', (e) => {
+            const files = e.dataTransfer.files;
+            if (files.length > 0) uploadFile(files[0]);
+        });
+
+        function handleFileSelect(e) {
+            const files = e.target.files;
+            if (files.length > 0) uploadFile(files[0]);
+        }
+
+        function uploadFile(file) {
+            if (!file.type.startsWith('image/')) {
+                showToast('Please select a valid image file (PNG, WebP, JPEG).', true);
+                return;
+            }
+
+            showToast(`Uploading '${file.name}' to Sovereign Server...`);
+            const reader = new FileReader();
+            reader.onload = async () => {
+                const b64 = reader.result.split(',')[1];
+                try {
+                    const res = await fetch('/api/save_image', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            filename: file.name,
+                            b64_json: b64
+                        })
+                    });
+                    const data = await res.json();
+                    if (data.ok) {
+                        showToast(`✓ Inscribed '${file.name}' to Sovereign Storage!`);
+                        await fetchGallery();
+                    } else {
+                        showToast('Server rejected image upload.', true);
+                    }
+                } catch (err) {
+                    showToast(`Upload error: ${err.message}`, true);
+                }
+            };
+            reader.readAsDataURL(file);
+        }
+
+        // Lightbox Modal
+        function openLightbox(url, name, size) {
+            activeModalImage = { url, name, size };
+            const modal = document.getElementById('lightboxModal');
+            const img = document.getElementById('lightboxImg');
+            const dl = document.getElementById('modalDownloadBtn');
+            img.src = url;
+            dl.href = url;
+            dl.download = name;
+            modal.classList.add('active');
+        }
+
+        function closeLightbox(e) {
+            if (!e || e.target.id === 'lightboxModal' || e.target.classList.contains('modal-close-btn')) {
+                document.getElementById('lightboxModal').classList.remove('active');
+                activeModalImage = null;
+            }
+        }
+
+        function setAsAvatarFromModal() {
+            if (activeModalImage) {
+                setAsAvatar(activeModalImage.url, activeModalImage.name);
+            }
+        }
+
+        function copyModalUrl() {
+            if (activeModalImage) {
+                copyLink(activeModalImage.url);
+            }
+        }
+
+        function deleteFromModal() {
+            if (activeModalImage) {
+                const name = activeModalImage.name;
+                closeLightbox();
+                deleteArtwork(name);
+            }
+        }
+
+        // Keyboard Shortcut (Esc to close modal)
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closeLightbox();
+        });
+
+        // Toast Helper
+        function showToast(msg, isError = false) {
+            const container = document.getElementById('toastContainer');
+            const toast = document.createElement('div');
+            toast.className = 'toast';
+            if (isError) toast.style.borderColor = 'var(--rose)';
+            toast.innerHTML = `<span>${isError ? '⚠️' : '✨'}</span> <span>${msg}</span>`;
+            container.appendChild(toast);
+            requestAnimationFrame(() => toast.classList.add('show'));
+            setTimeout(() => {
+                toast.classList.remove('show');
+                setTimeout(() => toast.remove(), 350);
+            }, 3200);
+        }
+
+        // Initialize
+        fetchSettings();
+        fetchGallery();
     </script>
 </body>
 </html>

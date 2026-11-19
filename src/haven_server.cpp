@@ -981,8 +981,8 @@ private:
         if (path == "/" || path == "/index.html") {
             path = "/index.html";
         }
-        else if (path == "/uploads" || path == "/uploads/") {
-            path = "/uploads/index.html";
+        else if (path == "/gallery" || path == "/gallery/" || path == "/gallery.html" || path == "/uploads" || path == "/uploads/") {
+            path = "/gallery.html";
         }
         else if (path == "/memories" || path == "/memories/" || path == "/memories.html") {
             path = "/memories.html";
@@ -1078,6 +1078,87 @@ private:
                                  + std::to_string(res_body.length()) + "\r\n\r\n" + res_body;
                 send(sock, resp.c_str(), (int)resp.length(), 0);
             }
+            else if (method == "DELETE" || path == "/api/memories/delete") {
+                uint64_t target_id = 0;
+                std::string id_str = extract_json_string(request, "id");
+                if (!id_str.empty()) {
+                    try { target_id = std::stoull(id_str); } catch (...) {}
+                }
+                if (target_id == 0) {
+                    size_t pos = request.find("\"id\":");
+                    if (pos != std::string::npos) {
+                        try {
+                            size_t num_start = pos + 5;
+                            while (num_start < request.size() && (request[num_start] == ' ' || request[num_start] == ':')) num_start++;
+                            target_id = std::stoull(request.substr(num_start));
+                        } catch (...) {}
+                    }
+                }
+                auto& mems = haven_engine_.get_memory_engine().get_all_memories();
+                bool removed = false;
+                for (auto it = mems.begin(); it != mems.end(); ++it) {
+                    if (it->id == target_id) {
+                        mems.erase(it);
+                        haven_engine_.get_memory_engine().rebuild_contiguous_vector_matrix();
+                        haven_engine_.save_memories("wwwroot/aura_vault.hmb");
+                        haven_engine_.save_memories("wwwroot/memories.json");
+                        removed = true;
+                        break;
+                    }
+                }
+                std::string res_body = "{\"ok\":" + std::string(removed ? "true" : "false") + ",\"msg\":\"" + (removed ? "Memory deleted" : "Memory not found") + "\"}";
+                std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: "
+                                 + std::to_string(res_body.length()) + "\r\n\r\n" + res_body;
+                send(sock, resp.c_str(), (int)resp.length(), 0);
+            }
+            else if (path == "/api/memories/update" || (path.starts_with("/api/memories") && method == "PUT")) {
+                uint64_t target_id = 0;
+                std::string id_str = extract_json_string(request, "id");
+                if (!id_str.empty()) {
+                    try { target_id = std::stoull(id_str); } catch (...) {}
+                }
+                if (target_id == 0) {
+                    size_t pos = request.find("\"id\":");
+                    if (pos != std::string::npos) {
+                        try {
+                            size_t num_start = pos + 5;
+                            while (num_start < request.size() && (request[num_start] == ' ' || request[num_start] == ':')) num_start++;
+                            target_id = std::stoull(request.substr(num_start));
+                        } catch (...) {}
+                    }
+                }
+                std::string concept_str = extract_json_string(request, "concept");
+                std::string content = extract_json_string(request, "content");
+                std::string category = extract_json_string(request, "category");
+                float salience = -1.0f;
+                size_t sal_pos = request.find("\"emotional_salience\":");
+                if (sal_pos != std::string::npos) {
+                    try {
+                        size_t num_start = sal_pos + 21;
+                        while (num_start < request.size() && (request[num_start] == ' ' || request[num_start] == ':')) num_start++;
+                        salience = std::stof(request.substr(num_start));
+                    } catch (...) {}
+                }
+
+                auto& mems = haven_engine_.get_memory_engine().get_all_memories();
+                bool updated = false;
+                for (auto& m : mems) {
+                    if (m.id == target_id) {
+                        if (!concept_str.empty()) m.concept_name = concept_str;
+                        if (!content.empty()) m.text_content = content;
+                        if (!category.empty()) m.category = category;
+                        if (salience >= 0.0f) m.emotional_salience = std::clamp(salience, 0.0f, 1.0f);
+                        haven_engine_.save_memories("wwwroot/aura_vault.hmb");
+                        haven_engine_.save_memories("wwwroot/memories.json");
+                        updated = true;
+                        break;
+                    }
+                }
+                std::string res_body = "{\"ok\":" + std::string(updated ? "true" : "false") + ",\"msg\":\"" + (updated ? "Memory updated" : "Memory not found") + "\"}";
+                std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: "
+                                 + std::to_string(res_body.length()) + "\r\n\r\n" + res_body;
+                send(sock, resp.c_str(), (int)resp.length(), 0);
+            }
         }
 
         else if (path == "/api/telemetry") {
@@ -1141,6 +1222,42 @@ private:
 
             std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
                              + std::to_string(json_body.length()) + "\r\n\r\n" + json_body;
+            send(sock, resp.c_str(), (int)resp.length(), 0);
+        }
+        else if (path == "/api/gallery/delete" || (path.starts_with("/api/gallery") && method == "DELETE")) {
+            std::string fname = extract_json_string(request, "filename");
+            if (fname.empty()) fname = extract_json_string(request, "name");
+            bool deleted = false;
+            if (!fname.empty() && fname.find("..") == std::string::npos && fname.find('/') == std::string::npos && fname.find('\\') == std::string::npos) {
+                std::string p1 = "wwwroot/uploads/" + fname;
+                std::string p2 = "C:\\Users\\admin\\source\\haven-cpp\\wwwroot\\uploads\\" + fname;
+                try {
+                    if (std::filesystem::exists(p1)) {
+                        std::filesystem::remove(p1);
+                        deleted = true;
+                    } else if (std::filesystem::exists(p2)) {
+                        std::filesystem::remove(p2);
+                        deleted = true;
+                    }
+                } catch (...) {}
+            }
+            std::string json_body = "{\"ok\":" + std::string(deleted ? "true" : "false") + ",\"filename\":\"" + fname + "\"}";
+            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: "
+                             + std::to_string(json_body.length()) + "\r\n\r\n" + json_body;
+            send(sock, resp.c_str(), (int)resp.length(), 0);
+        }
+        else if (path == "/api/knowledge_graph") {
+            std::string content = "{\"relations\":[]}";
+            std::string p1 = "wwwroot/knowledge_graph.json";
+            std::string p2 = "C:\\Users\\admin\\source\\haven-cpp\\wwwroot\\knowledge_graph.json";
+            std::ifstream in(std::filesystem::exists(p1) ? p1 : p2);
+            if (in.is_open()) {
+                std::stringstream ss;
+                ss << in.rdbuf();
+                content = ss.str();
+            }
+            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: "
+                             + std::to_string(content.length()) + "\r\n\r\n" + content;
             send(sock, resp.c_str(), (int)resp.length(), 0);
         }
         else if (path == "/api/save_image") {
