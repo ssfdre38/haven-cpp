@@ -448,6 +448,164 @@
             color: var(--accent-cyan);
         }
 
+        /* Top Navigation Refinements & Dropdown Menu */
+        .dropdown-wrapper {
+            position: relative;
+            display: inline-block;
+        }
+
+        .icon-btn-pill {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            color: var(--text-muted);
+            width: 32px;
+            height: 32px;
+            border-radius: var(--radius-sm);
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: var(--transition);
+        }
+
+        .icon-btn-pill:hover, .icon-btn-pill.active {
+            background: var(--bg-sidebar-hover);
+            color: #fff;
+            border-color: var(--border-hover);
+            box-shadow: 0 0 10px rgba(139, 92, 246, 0.2);
+        }
+
+        .nav-icon-link {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            color: var(--text-muted);
+            padding: 5px 10px;
+            border-radius: var(--radius-sm);
+            font-size: 12px;
+            font-weight: 500;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            text-decoration: none;
+            transition: var(--transition);
+        }
+
+        .nav-icon-link:hover {
+            color: #fff;
+            background: var(--bg-sidebar-hover);
+            border-color: var(--border-hover);
+        }
+
+        .nav-icon-link.glow-cyan:hover {
+            box-shadow: 0 0 12px rgba(56, 189, 248, 0.25);
+            border-color: var(--accent-cyan);
+            color: var(--accent-cyan);
+        }
+
+        .vitals-pill {
+            font-family: var(--font-mono);
+            font-size: 11px;
+            letter-spacing: -0.2px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .vitals-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: #10b981;
+            box-shadow: 0 0 6px #10b981;
+            display: inline-block;
+        }
+
+        .glass-dropdown {
+            display: none;
+            position: absolute;
+            top: calc(100% + 8px);
+            right: 0;
+            min-width: 230px;
+            background: rgba(13, 17, 26, 0.94);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-md);
+            box-shadow: 0 16px 40px rgba(0, 0, 0, 0.75), 0 0 24px rgba(139, 92, 246, 0.2);
+            backdrop-filter: blur(18px);
+            padding: 6px;
+            z-index: 200;
+            animation: dropdownFadeIn 0.15s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+
+        .glass-dropdown.show {
+            display: block;
+        }
+
+        @keyframes dropdownFadeIn {
+            from { opacity: 0; transform: translateY(-6px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .dropdown-section-title {
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.6px;
+            color: var(--text-dim);
+            padding: 6px 10px 4px;
+        }
+
+        .dropdown-menu-item {
+            width: 100%;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 10px;
+            border-radius: var(--radius-sm);
+            background: transparent;
+            border: none;
+            color: var(--text-main);
+            font-size: 12.5px;
+            font-weight: 500;
+            cursor: pointer;
+            text-decoration: none;
+            text-align: left;
+            transition: all 0.15s ease;
+        }
+
+        .dropdown-menu-item:hover {
+            background: rgba(139, 92, 246, 0.16);
+            color: #fff;
+        }
+
+        .dropdown-menu-item.danger {
+            color: #f87171;
+        }
+
+        .dropdown-menu-item.danger:hover {
+            background: rgba(239, 68, 68, 0.18);
+            color: #fca5a5;
+        }
+
+        .dropdown-divider {
+            height: 1px;
+            background: rgba(255, 255, 255, 0.07);
+            margin: 5px 0;
+        }
+
+        @media (max-width: 1100px) {
+            .nav-link-text { display: none; }
+        }
+
+        @media (max-width: 850px) {
+            .ctx-meter-pill { display: none; }
+            .vitals-pill { display: none; }
+        }
+
+        @media (max-width: 600px) {
+            #nav-persona-name { display: none; }
+            #nav-model-name { max-width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        }
+
         /* Chat Scroll Area */
         .chat-scroll-area {
             flex: 1;
@@ -1190,9 +1348,8 @@
                     </div>
 
                     <!-- Context Usage Meter -->
-                    <div class="ctx-meter-pill" id="ctx-meter-pill" title="Active Context Window Usage">
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="4"/><line x1="6" y1="12" x2="18" y2="12"/><line x1="12" y1="6" x2="12" y2="18"/></svg>
-                        <span id="ctx-tokens-lbl" style="font-family: var(--font-mono); font-size: 11px;">0 / 8,192 (0%)</span>
+                    <div class="ctx-meter-pill" id="ctx-meter-pill" title="Active Context Window Usage: 0 / 8,192 tokens">
+                        <span id="ctx-tokens-lbl" style="font-family: var(--font-mono); font-size: 11px;">0%</span>
                         <div class="ctx-bar-track">
                             <div class="ctx-bar-fill" id="ctx-bar-fill"></div>
                         </div>
@@ -1200,48 +1357,76 @@
                 </div>
 
                 <div class="nav-right">
-                    <!-- Telemetry HUD Pill -->
-                    <button class="nav-pill-btn" onclick="openTelemetryModal()" title="Hardware Telemetry & Vitals">
-                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>
+                    <!-- Sensory Gallery Link -->
+                    <a href="/gallery.html" target="_blank" class="nav-icon-link glow-cyan" title="Sensory Vision & Media Gallery">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                        <span class="nav-link-text">Gallery</span>
+                    </a>
+
+                    <!-- Sovereign Memories Link -->
+                    <a href="/memories.html" target="_blank" class="nav-icon-link" title="64-bit Sovereign Memory Vault">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>
+                        <span class="nav-link-text">Memories</span>
+                    </a>
+
+                    <!-- Hardware Telemetry & Vitals -->
+                    <button class="nav-pill-btn vitals-pill" onclick="openTelemetryModal()" title="Hardware Telemetry, SIMD & Threads">
+                        <span class="vitals-dot"></span>
                         <span id="nav-telemetry-pill">AVX2 • 12T</span>
                     </button>
 
-                    <!-- Sovereign Tools / Plugins -->
-                    <button class="nav-pill-btn" onclick="openPluginsModal()" title="Sovereign Tools & Loaded Plugins">
-                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-                        <span id="nav-plugins-count">17 Tools</span>
+                    <!-- Sampler Hyperparameters (Quick 1-Click Icon) -->
+                    <button class="icon-btn-pill" onclick="openSettingsModal()" title="Sampler Parameters (Temperature, Top-P, Min-P)">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
                     </button>
 
-                    <!-- Sovereign Memories Link -->
-                    <a href="/memories.html" target="_blank" class="nav-pill-btn" title="View 64-bit Haven Memory Bank (.hmb)">
-                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>
-                        <span>Memories</span>
-                    </a>
+                    <!-- Session Options & Sovereign Hub Dropdown (···) -->
+                    <div class="dropdown-wrapper" id="more-menu-wrapper">
+                        <button class="icon-btn-pill" id="more-menu-btn" onclick="toggleMoreMenu(event)" title="Session Options & Sovereign Tools">
+                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/><circle cx="5" cy="12" r="1.5"/></svg>
+                        </button>
+                        <div class="glass-dropdown" id="more-dropdown-menu">
+                            <div class="dropdown-section-title">Session Management</div>
+                            <button class="dropdown-menu-item" onclick="triggerImportSession(); closeMoreMenu();">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                                <span>Import Session (.json)</span>
+                            </button>
+                            <button class="dropdown-menu-item" onclick="exportCurrentSession(); closeMoreMenu();">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                                <span>Export Session (.json)</span>
+                            </button>
+                            <button class="dropdown-menu-item" onclick="exportCurrentSessionMarkdown(); closeMoreMenu();">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+                                <span>Export Markdown (.md)</span>
+                            </button>
 
-                    <!-- Sensory Gallery Link -->
-                    <a href="/gallery.html" target="_blank" class="nav-pill-btn glow-cyan" title="View Sensory Vision & Audio Gallery">
-                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
-                        <span>Gallery</span>
-                    </a>
+                            <div class="dropdown-divider"></div>
+                            <div class="dropdown-section-title">Sovereign Ecosystem</div>
+                            <button class="dropdown-menu-item" onclick="openPluginsModal(); closeMoreMenu();">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                                <span>Sovereign Plugins (<span id="nav-plugins-count">17 Tools</span>)</span>
+                            </button>
+                            <button class="dropdown-menu-item" onclick="openTelemetryModal(); closeMoreMenu();">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/></svg>
+                                <span>Hardware Telemetry HUD</span>
+                            </button>
+                            <a href="/gallery.html" target="_blank" class="dropdown-menu-item" onclick="closeMoreMenu()">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                                <span>Sensory Creations Gallery</span>
+                            </a>
+                            <a href="/memories.html" target="_blank" class="dropdown-menu-item" onclick="closeMoreMenu()">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>
+                                <span>Sovereign Memory Vault</span>
+                            </a>
 
-                    <!-- Export Session -->
-                    <button class="nav-pill-btn" onclick="exportCurrentSession()" title="Export current session (JSON)">
-                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-                        <span>Export</span>
-                    </button>
-
-                    <!-- Import Session -->
-                    <button class="nav-pill-btn" onclick="triggerImportSession()" title="Import session (JSON)">
-                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-                        <span>Import</span>
-                    </button>
+                            <div class="dropdown-divider"></div>
+                            <button class="dropdown-menu-item danger" onclick="clearCurrentChat(); closeMoreMenu();">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                                <span>Clear Current Chat</span>
+                            </button>
+                        </div>
+                    </div>
                     <input type="file" id="import-session-file" style="display:none;" accept=".json" onchange="handleSessionFileImport(event)">
-
-                    <!-- Sampler Hyperparameters -->
-                    <button class="nav-pill-btn" onclick="openSettingsModal()" title="Sampler Hyperparameters">
-                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-                        <span>Sampler</span>
-                    </button>
                 </div>
             </div>
 
@@ -2328,13 +2513,77 @@
             const pct = Math.min(100, Math.round((estTokens / maxContext) * 100));
             const lbl = document.getElementById('ctx-tokens-lbl');
             const fill = document.getElementById('ctx-bar-fill');
-            if (lbl) lbl.innerText = `${estTokens.toLocaleString()} / ${maxContext.toLocaleString()} (${pct}%)`;
+            const pill = document.getElementById('ctx-meter-pill');
+            if (lbl) lbl.innerText = `${pct}%`;
+            if (pill) pill.title = `Active Context Window Usage: ${estTokens.toLocaleString()} / ${maxContext.toLocaleString()} tokens (${pct}%)`;
             if (fill) {
                 fill.style.width = `${pct}%`;
                 if (pct > 85) fill.style.background = '#ef4444';
                 else if (pct > 60) fill.style.background = '#f59e0b';
                 else fill.style.background = '#10b981';
             }
+        }
+
+        // Dropdown Menu & Session Options
+        function toggleMoreMenu(event) {
+            if (event) event.stopPropagation();
+            const dropdown = document.getElementById('more-dropdown-menu');
+            const btn = document.getElementById('more-menu-btn');
+            if (!dropdown) return;
+            const isShow = dropdown.classList.toggle('show');
+            if (btn) btn.classList.toggle('active', isShow);
+        }
+
+        function closeMoreMenu() {
+            const dropdown = document.getElementById('more-dropdown-menu');
+            const btn = document.getElementById('more-menu-btn');
+            if (dropdown) dropdown.classList.remove('show');
+            if (btn) btn.classList.remove('active');
+        }
+
+        document.addEventListener('click', (e) => {
+            const wrapper = document.getElementById('more-menu-wrapper');
+            if (wrapper && !wrapper.contains(e.target)) {
+                closeMoreMenu();
+            }
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closeMoreMenu();
+        });
+
+        function clearCurrentChat() {
+            const conv = getActiveConversation();
+            if (!conv || !conv.messages || conv.messages.length === 0) return;
+            if (!confirm("Are you sure you want to clear all messages from this conversation?")) return;
+            conv.messages = [];
+            renderActiveMessages();
+            saveConversationsToStorage();
+            updateContextMeter();
+        }
+
+        function exportCurrentSessionMarkdown() {
+            const conv = getActiveConversation();
+            if (!conv || !conv.messages || conv.messages.length === 0) {
+                alert("Current conversation is empty.");
+                return;
+            }
+            let md = `# ${conv.title || 'Haven Chat Session'}\n`;
+            md += `**Date:** ${new Date().toLocaleString()}\n`;
+            md += `**Model:** ${conv.model || currentModelName}\n`;
+            md += `**Companion:** ${persona.companion_name || 'Aura'}\n\n---\n\n`;
+            for (const msg of conv.messages) {
+                const role = msg.role === 'user' ? (persona.user_name || 'User') : (persona.companion_name || 'Aura');
+                md += `### ${role}\n\n${msg.content}\n\n`;
+            }
+            const blob = new Blob([md], { type: 'text/markdown;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            const safeTitle = (conv.title || 'haven-session').replace(/[^a-z0-9_-]/gi, '_').toLowerCase();
+            a.download = `${safeTitle}-${Date.now()}.md`;
+            a.click();
+            URL.revokeObjectURL(url);
         }
 
         function exportCurrentSession() {
