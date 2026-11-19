@@ -290,71 +290,6 @@ private:
 #endif
     }
 
-    void forward_to_backend(int client_sock, std::string request_payload, int target_port) {
-        // Connect to target backend (11436 for LLM, 8085 for Stable Diffusion)
-        int backend_sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (backend_sock < 0) return;
-
-        sockaddr_in backend_addr{};
-        backend_addr.sin_family = AF_INET;
-        backend_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-        backend_addr.sin_port = htons(target_port);
-
-        if (connect(backend_sock, (struct sockaddr*)&backend_addr, sizeof(backend_addr)) < 0) {
-#ifdef _WIN32
-            closesocket(backend_sock);
-#else
-            close(backend_sock);
-#endif
-            std::string err = "HTTP/1.1 502 Bad Gateway\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\n\r\n";
-            send(client_sock, err.c_str(), (int)err.length(), 0);
-            return;
-        }
-
-        // Rewrite Host header
-        size_t host_pos = request_payload.find("Host: ");
-        if (host_pos != std::string::npos) {
-            size_t host_end = request_payload.find("\r\n", host_pos);
-            request_payload.replace(host_pos, host_end - host_pos, "Host: 127.0.0.1:" + std::to_string(target_port));
-        }
-
-        // Ensure backend closes connection when response is sent
-        size_t conn_pos = request_payload.find("Connection: keep-alive");
-        if (conn_pos != std::string::npos) {
-            request_payload.replace(conn_pos, 22, "Connection: close     ");
-        }
-
-        // Send payload to backend
-        send(backend_sock, request_payload.c_str(), (int)request_payload.length(), 0);
-
-        // Stream backend response directly back to client
-        char buffer[32768];
-        std::string accumulated_stream;
-
-        while (true) {
-#ifdef _WIN32
-            int bytes = recv(backend_sock, buffer, sizeof(buffer), 0);
-#else
-            int bytes = read(backend_sock, buffer, sizeof(buffer));
-#endif
-            if (bytes <= 0) break;
-            send(client_sock, buffer, bytes, 0);
-            if (target_port == 11436) {
-                accumulated_stream.append(buffer, bytes);
-            }
-        }
-
-#ifdef _WIN32
-        closesocket(backend_sock);
-#else
-        close(backend_sock);
-#endif
-
-        if (target_port == 11436 && !accumulated_stream.empty()) {
-            process_server_side_tools(accumulated_stream);
-        }
-    }
-
     void process_server_side_tools(const std::string& raw_stream) {
         // Extract raw text or chunks from SSE or JSON
         std::string full_text;
@@ -927,7 +862,10 @@ private:
             if (model_loaded_) {
                 handle_native_chat_completions(sock, request);
             } else {
-                forward_to_backend(sock, request, 11436);
+                std::string err_body = "{\"error\":{\"message\":\"No model loaded in Haven Sovereign Engine. Pass a model path on startup.\",\"type\":\"sovereign_engine_error\"}}";
+                std::string resp = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
+                                 + std::to_string(err_body.length()) + "\r\n\r\n" + err_body;
+                send_all(sock, resp.c_str(), (int)resp.length());
             }
         }
         else if (path == "/api/plugins") {
