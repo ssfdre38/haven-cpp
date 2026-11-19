@@ -78,6 +78,11 @@ struct TensorDesc {
     const void* data = nullptr;  // Direct mmap pointer
 };
 
+enum class FfnActivation : uint32_t {
+    SILU = 0,
+    GELU = 1
+};
+
 struct ModelConfig {
     std::string architecture = "llama";
     uint32_t vocab_size = 32000;
@@ -85,8 +90,8 @@ struct ModelConfig {
     uint32_t hidden_dim = 11008;
     uint32_t num_layers = 32;
     uint32_t num_heads = 32;
-    uint32_t num_kv_heads = 8;
-    uint32_t head_dim = 128;
+    uint32_t num_kv_heads = 0;
+    uint32_t head_dim = 0;
     uint32_t max_context_length = 131072;
     float rope_freq_base = 1000000.0f;
     float rope_freq_base_swa = 10000.0f;
@@ -94,9 +99,12 @@ struct ModelConfig {
     uint32_t rope_dimension_count = 512;
     uint32_t rope_dimension_count_swa = 256;
     float rms_norm_eps = 1e-5f;
-    uint32_t sliding_window = 512;
+    uint32_t sliding_window = 0;
     uint32_t shared_kv_layers = 18;
-    float final_logit_softcapping = 30.0f;
+    float final_logit_softcapping = 0.0f;
+    float attn_logit_softcapping = 0.0f;
+    bool is_gemma = false;
+    FfnActivation ffn_activation = FfnActivation::SILU;
 };
 
 } // namespace haven

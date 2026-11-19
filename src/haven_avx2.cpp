@@ -621,6 +621,36 @@ void Avx2Math::gemv(float* y, const TensorDesc& weight, const float* x, int rows
     }
 }
 
+// Fast AVX2 In-Place Bias Addition: out[i] += bias[i] (supports F32 and F16)
+void Avx2Math::add_bias(float* out, const TensorDesc& bias_tensor, int size) {
+    if (!out || !bias_tensor.data || size <= 0) return;
+
+    if (bias_tensor.type == QuantType::F32) {
+        const float* b = reinterpret_cast<const float*>(bias_tensor.data);
+        int i = 0;
+        for (; i <= size - 8; i += 8) {
+            __m256 vo = _mm256_loadu_ps(out + i);
+            __m256 vb = _mm256_loadu_ps(b + i);
+            _mm256_storeu_ps(out + i, _mm256_add_ps(vo, vb));
+        }
+        for (; i < size; ++i) {
+            out[i] += b[i];
+        }
+    } else if (bias_tensor.type == QuantType::F16) {
+        const uint16_t* b = reinterpret_cast<const uint16_t*>(bias_tensor.data);
+        int i = 0;
+        for (; i <= size - 8; i += 8) {
+            __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i));
+            __m256 vb = _mm256_cvtph_ps(h);
+            __m256 vo = _mm256_loadu_ps(out + i);
+            _mm256_storeu_ps(out + i, _mm256_add_ps(vo, vb));
+        }
+        for (; i < size; ++i) {
+            out[i] += fp16_to_fp32(b[i]);
+        }
+    }
+}
+
 // Bare-metal AVX2 Vector Norm: sqrt(sum(x^2))
 float Avx2Math::vector_norm(const float* x, int size) {
     if (!x || size <= 0) return 0.0f;

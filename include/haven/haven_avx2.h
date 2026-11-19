@@ -68,6 +68,9 @@ public:
     // Gemma 4 Logits Softcapping: logits = cap * tanh(logits / cap)
     static void softcap_logits(float* logits, int size, float cap = 30.0f);
 
+    // Fast AVX2 In-Place Bias Addition: out[i] += bias[i] (supports F32 and F16)
+    static void add_bias(float* out, const TensorDesc& bias_tensor, int size);
+
     // Dequantizes a single row of a tensor into float buffer (e.g. token embedding lookup)
     static void dequantize_row(float* out, const TensorDesc& weight, int row, int cols);
 

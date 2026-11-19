@@ -12,6 +12,7 @@ void HavenTokenizer::initialize(const std::vector<std::string>& vocab) {
     vocab_ = vocab;
     token_to_id_.clear();
     token_to_id_.reserve(vocab.size());
+    stop_tokens_.clear();
 
     bos_token_ = 2;
     eos_token_ = 1;
@@ -22,11 +23,20 @@ void HavenTokenizer::initialize(const std::vector<std::string>& vocab) {
         if (token_to_id_.find(vocab[i]) == token_to_id_.end()) {
             token_to_id_[vocab[i]] = i;
         }
-        if (vocab[i] == "<bos>") bos_token_ = i;
-        else if (vocab[i] == "<eos>") eos_token_ = i;
+        if (vocab[i] == "<bos>" || vocab[i] == "<s>" || vocab[i] == "<|begin_of_text|>") bos_token_ = i;
+        else if (vocab[i] == "<eos>" || vocab[i] == "</s>" || vocab[i] == "<|end_of_text|>" || vocab[i] == "<|endoftext|>") eos_token_ = i;
         else if (vocab[i] == "<pad>") pad_token_ = i;
         else if (vocab[i] == "<unk>") unk_token_ = i;
+
+        // Register universal stop tokens
+        if (vocab[i] == "<eos>" || vocab[i] == "</s>" || vocab[i] == "<turn|>" || vocab[i] == "<|turn|>" ||
+            vocab[i] == "<end_of_turn>" || vocab[i] == "</end_of_turn>" ||
+            vocab[i] == "<|eot_id|>" || vocab[i] == "<|end_of_text|>" ||
+            vocab[i] == "<|im_end|>" || vocab[i] == "<|endoftext|>") {
+            stop_tokens_.insert(i);
+        }
     }
+    stop_tokens_.insert(eos_token_);
 }
 
 std::vector<uint32_t> HavenTokenizer::encode(const std::string& text, bool add_bos) const {
@@ -37,12 +47,14 @@ std::vector<uint32_t> HavenTokenizer::encode(const std::string& text, bool add_b
         tokens.push_back(bos_token_);
     }
 
-    // List of priority control tokens in Gemma 4
+    // List of priority control tokens across architectures (Gemma, LLaMA 3, Qwen 2.5, Mistral)
     static const std::vector<std::string> control_tokens = {
         "<|turn>", "<turn|>", "<bos>", "<eos>", "<pad>",
         "<|think|>", "<|channel>", "<channel|>",
         "<|tool_call>", "<tool_call|>", "<|tool_response>", "<tool_response|>",
-        "<start_of_turn>", "<end_of_turn>", "</end_of_turn>"
+        "<start_of_turn>", "<end_of_turn>", "</end_of_turn>",
+        "<|begin_of_text|>", "<|end_of_text|>", "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>",
+        "<|im_start|>", "<|im_end|>", "<|endoftext|>", "<s>", "</s>"
     };
 
     size_t pos = 0;
@@ -146,7 +158,10 @@ std::string HavenTokenizer::decode_token(uint32_t token_id) const {
     // Filter control tokens
     if (raw == "<bos>" || raw == "<eos>" || raw == "<|turn>" || raw == "<turn|>" ||
         raw == "<start_of_turn>" || raw == "<end_of_turn>" || raw == "</end_of_turn>" || 
-        raw == "<pad>" || raw == "</s>") {
+        raw == "<pad>" || raw == "</s>" || raw == "<s>" ||
+        raw == "<|begin_of_text|>" || raw == "<|end_of_text|>" ||
+        raw == "<|start_header_id|>" || raw == "<|end_header_id|>" || raw == "<|eot_id|>" ||
+        raw == "<|im_start|>" || raw == "<|im_end|>" || raw == "<|endoftext|>") {
         return "";
     }
 

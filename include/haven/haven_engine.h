@@ -33,6 +33,9 @@ public:
         const TensorDesc* attn_q = nullptr;
         const TensorDesc* attn_k = nullptr;
         const TensorDesc* attn_v = nullptr;
+        const TensorDesc* attn_q_bias = nullptr; // Qwen 2 / 2.5 bias
+        const TensorDesc* attn_k_bias = nullptr; // Qwen 2 / 2.5 bias
+        const TensorDesc* attn_v_bias = nullptr; // Qwen 2 / 2.5 bias
         const TensorDesc* attn_q_norm = nullptr;
         const TensorDesc* attn_k_norm = nullptr;
         const TensorDesc* attn_output = nullptr;

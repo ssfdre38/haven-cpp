@@ -154,6 +154,28 @@ bool GgufLoader::parse_header() {
     uint32_t alignment = 32;
 
     // Parse Metadata Key-Value pairs
+    auto ends_with = [](const std::string& str, const std::string& suffix) -> bool {
+        if (str.length() < suffix.length()) return false;
+        return str.compare(str.length() - suffix.length(), suffix.length(), suffix) == 0;
+    };
+
+    auto read_float_val = [](uint32_t val_type, const uint8_t*& p, const uint8_t* e) -> float {
+        if (val_type == 6 && p + 4 <= e) {
+            float v = *reinterpret_cast<const float*>(p);
+            p += 4;
+            return v;
+        } else if (val_type == 12 && p + 8 <= e) {
+            double v = *reinterpret_cast<const double*>(p);
+            p += 8;
+            return static_cast<float>(v);
+        } else if (val_type == 4 && p + 4 <= e) {
+            uint32_t v = *reinterpret_cast<const uint32_t*>(p);
+            p += 4;
+            return static_cast<float>(v);
+        }
+        return 0.0f;
+    };
+
     for (uint64_t i = 0; i < kv_count && ptr < end; ++i) {
         std::string key = read_gguf_string(ptr, end);
         if (ptr + 4 > end) break;
@@ -167,61 +189,60 @@ bool GgufLoader::parse_header() {
             alignment = *reinterpret_cast<const uint32_t*>(ptr);
             ptr += 4;
         }
-        else if ((key == "gemma4.context_length" || key == "llama.context_length") && val_type == 4) {
-            config_.max_context_length = *reinterpret_cast<const uint32_t*>(ptr);
-            ptr += 4;
+        else if (ends_with(key, ".context_length") && (val_type == 4 || val_type == 10)) {
+            config_.max_context_length = (val_type == 4) ? *reinterpret_cast<const uint32_t*>(ptr) : (uint32_t)(*reinterpret_cast<const uint64_t*>(ptr));
+            ptr += (val_type == 4 ? 4 : 8);
         }
-        else if ((key == "gemma4.embedding_length" || key == "llama.embedding_length") && val_type == 4) {
-            config_.embedding_dim = *reinterpret_cast<const uint32_t*>(ptr);
-            ptr += 4;
+        else if (ends_with(key, ".embedding_length") && (val_type == 4 || val_type == 10)) {
+            config_.embedding_dim = (val_type == 4) ? *reinterpret_cast<const uint32_t*>(ptr) : (uint32_t)(*reinterpret_cast<const uint64_t*>(ptr));
+            ptr += (val_type == 4 ? 4 : 8);
         }
-        else if ((key == "gemma4.feed_forward_length" || key == "llama.feed_forward_length") && val_type == 4) {
-            config_.hidden_dim = *reinterpret_cast<const uint32_t*>(ptr);
-            ptr += 4;
+        else if (ends_with(key, ".feed_forward_length") && (val_type == 4 || val_type == 10)) {
+            config_.hidden_dim = (val_type == 4) ? *reinterpret_cast<const uint32_t*>(ptr) : (uint32_t)(*reinterpret_cast<const uint64_t*>(ptr));
+            ptr += (val_type == 4 ? 4 : 8);
         }
-        else if ((key == "gemma4.block_count" || key == "llama.block_count") && val_type == 4) {
-            config_.num_layers = *reinterpret_cast<const uint32_t*>(ptr);
-            ptr += 4;
+        else if (ends_with(key, ".block_count") && (val_type == 4 || val_type == 10)) {
+            config_.num_layers = (val_type == 4) ? *reinterpret_cast<const uint32_t*>(ptr) : (uint32_t)(*reinterpret_cast<const uint64_t*>(ptr));
+            ptr += (val_type == 4 ? 4 : 8);
         }
-        else if ((key == "gemma4.attention.head_count" || key == "llama.attention.head_count") && val_type == 4) {
-            config_.num_heads = *reinterpret_cast<const uint32_t*>(ptr);
-            ptr += 4;
+        else if (ends_with(key, ".attention.head_count") && (val_type == 4 || val_type == 10)) {
+            config_.num_heads = (val_type == 4) ? *reinterpret_cast<const uint32_t*>(ptr) : (uint32_t)(*reinterpret_cast<const uint64_t*>(ptr));
+            ptr += (val_type == 4 ? 4 : 8);
         }
-        else if ((key == "gemma4.attention.head_count_kv" || key == "llama.attention.head_count_kv") && val_type == 4) {
-            config_.num_kv_heads = *reinterpret_cast<const uint32_t*>(ptr);
-            ptr += 4;
+        else if (ends_with(key, ".attention.head_count_kv") && (val_type == 4 || val_type == 10)) {
+            config_.num_kv_heads = (val_type == 4) ? *reinterpret_cast<const uint32_t*>(ptr) : (uint32_t)(*reinterpret_cast<const uint64_t*>(ptr));
+            ptr += (val_type == 4 ? 4 : 8);
         }
-        else if ((key == "gemma4.attention.key_length" || key == "llama.attention.key_length") && val_type == 4) {
-            config_.head_dim = *reinterpret_cast<const uint32_t*>(ptr);
-            ptr += 4;
+        else if (ends_with(key, ".attention.key_length") && (val_type == 4 || val_type == 10)) {
+            config_.head_dim = (val_type == 4) ? *reinterpret_cast<const uint32_t*>(ptr) : (uint32_t)(*reinterpret_cast<const uint64_t*>(ptr));
+            ptr += (val_type == 4 ? 4 : 8);
         }
-        else if (key == "gemma4.attention.sliding_window" && val_type == 4) {
-            config_.sliding_window = *reinterpret_cast<const uint32_t*>(ptr);
-            ptr += 4;
+        else if (ends_with(key, ".attention.sliding_window") && (val_type == 4 || val_type == 10)) {
+            config_.sliding_window = (val_type == 4) ? *reinterpret_cast<const uint32_t*>(ptr) : (uint32_t)(*reinterpret_cast<const uint64_t*>(ptr));
+            ptr += (val_type == 4 ? 4 : 8);
         }
-        else if ((key == "gemma4.rope.freq_base" || key == "llama.rope.freq_base" || key == "gemma2.rope.freq_base") && val_type == 6) {
-            config_.rope_freq_base = *reinterpret_cast<const float*>(ptr);
-            ptr += 4;
+        else if (ends_with(key, ".attention.layer_norm_rms_epsilon")) {
+            config_.rms_norm_eps = read_float_val(val_type, ptr, end);
         }
-        else if ((key == "gemma4.rope.freq_base" || key == "llama.rope.freq_base" || key == "gemma2.rope.freq_base") && val_type == 4) {
-            config_.rope_freq_base = (float)(*reinterpret_cast<const uint32_t*>(ptr));
-            ptr += 4;
+        else if (ends_with(key, ".rope.freq_base_swa")) {
+            config_.rope_freq_base_swa = read_float_val(val_type, ptr, end);
         }
-        else if ((key == "gemma4.rope.freq_base_swa" || key == "gemma2.rope.freq_base_swa") && val_type == 6) {
-            config_.rope_freq_base_swa = *reinterpret_cast<const float*>(ptr);
-            ptr += 4;
+        else if (ends_with(key, ".rope.freq_base")) {
+            config_.rope_freq_base = read_float_val(val_type, ptr, end);
         }
-        else if ((key == "gemma4.rope.dimension_count" || key == "llama.rope.dimension_count" || key == "gemma2.rope.dimension_count") && val_type == 4) {
-            config_.rope_dimension_count = *reinterpret_cast<const uint32_t*>(ptr);
-            ptr += 4;
+        else if (ends_with(key, ".rope.dimension_count_swa") && (val_type == 4 || val_type == 10)) {
+            config_.rope_dimension_count_swa = (val_type == 4) ? *reinterpret_cast<const uint32_t*>(ptr) : (uint32_t)(*reinterpret_cast<const uint64_t*>(ptr));
+            ptr += (val_type == 4 ? 4 : 8);
         }
-        else if ((key == "gemma4.rope.dimension_count_swa" || key == "gemma2.rope.dimension_count_swa") && val_type == 4) {
-            config_.rope_dimension_count_swa = *reinterpret_cast<const uint32_t*>(ptr);
-            ptr += 4;
+        else if (ends_with(key, ".rope.dimension_count") && (val_type == 4 || val_type == 10)) {
+            config_.rope_dimension_count = (val_type == 4) ? *reinterpret_cast<const uint32_t*>(ptr) : (uint32_t)(*reinterpret_cast<const uint64_t*>(ptr));
+            ptr += (val_type == 4 ? 4 : 8);
         }
-        else if (key == "gemma4.final_logit_softcapping" && val_type == 6) {
-            config_.final_logit_softcapping = *reinterpret_cast<const float*>(ptr);
-            ptr += 4;
+        else if (ends_with(key, ".final_logit_softcapping")) {
+            config_.final_logit_softcapping = read_float_val(val_type, ptr, end);
+        }
+        else if (ends_with(key, ".attn_logit_softcapping")) {
+            config_.attn_logit_softcapping = read_float_val(val_type, ptr, end);
         }
         else if (key == "tokenizer.ggml.tokens" && val_type == 9) {
             uint32_t arr_type = *reinterpret_cast<const uint32_t*>(ptr);
@@ -236,6 +257,28 @@ bool GgufLoader::parse_header() {
         else {
             skip_gguf_value(val_type, ptr, end);
         }
+    }
+
+    // Determine derived architecture hyperparameters
+    config_.is_gemma = (config_.architecture.find("gemma") != std::string::npos);
+    if (config_.is_gemma) {
+        config_.ffn_activation = FfnActivation::GELU;
+        if (config_.final_logit_softcapping == 0.0f) config_.final_logit_softcapping = 30.0f;
+        if (config_.attn_logit_softcapping == 0.0f) config_.attn_logit_softcapping = 50.0f;
+    } else {
+        config_.ffn_activation = FfnActivation::SILU;
+        config_.final_logit_softcapping = 0.0f;
+        config_.attn_logit_softcapping = 0.0f;
+    }
+
+    if (config_.head_dim == 0 && config_.num_heads > 0) {
+        config_.head_dim = config_.embedding_dim / config_.num_heads;
+    }
+    if (config_.head_dim == 0) {
+        config_.head_dim = 128;
+    }
+    if (config_.num_kv_heads == 0) {
+        config_.num_kv_heads = config_.num_heads > 0 ? config_.num_heads : 8;
     }
 
     // Parse Tensor Info Headers

@@ -82,6 +82,12 @@ add_executable(test-pathways-e2e
     ${HAVEN_CORE_SRCS}
 )
 
+# Test Multi-Model Architecture Support (Qwen 2.5, LLaMA 3, Phi-3, Gemma)
+add_executable(test-multi-model-arch
+    tests/test_multi_model_arch.cpp
+    ${HAVEN_CORE_SRCS}
+)
+
 # Native Sovereign Plugins
 add_library(plugin_yt_music SHARED
     plugins/yt_music_plugin.cpp

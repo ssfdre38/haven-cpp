@@ -80,6 +80,9 @@ bool HavenEngine::load_model(const std::string& gguf_filepath) {
         layers_[l].attn_q               = loader_.get_tensor(prefix + "attn_q.weight");
         layers_[l].attn_k               = loader_.get_tensor(prefix + "attn_k.weight");
         layers_[l].attn_v               = loader_.get_tensor(prefix + "attn_v.weight");
+        layers_[l].attn_q_bias          = loader_.get_tensor(prefix + "attn_q.bias");
+        layers_[l].attn_k_bias          = loader_.get_tensor(prefix + "attn_k.bias");
+        layers_[l].attn_v_bias          = loader_.get_tensor(prefix + "attn_v.bias");
         layers_[l].attn_q_norm          = loader_.get_tensor(prefix + "attn_q_norm.weight");
         layers_[l].attn_k_norm          = loader_.get_tensor(prefix + "attn_k_norm.weight");
         layers_[l].attn_output          = loader_.get_tensor(prefix + "attn_output.weight");
@@ -222,9 +225,11 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
     // 1. Token Embedding Lookup
     if (token_embd_tensor_ && token < cfg.vocab_size) {
         Avx2Math::dequantize_row(embedding_scratch_.data(), *token_embd_tensor_, token, cfg.embedding_dim);
-        float emb_scale = std::sqrt((float)cfg.embedding_dim);
-        for (size_t i = 0; i < cfg.embedding_dim; ++i) {
-            embedding_scratch_[i] *= emb_scale;
+        if (cfg.is_gemma) {
+            float emb_scale = std::sqrt((float)cfg.embedding_dim);
+            for (size_t i = 0; i < cfg.embedding_dim; ++i) {
+                embedding_scratch_[i] *= emb_scale;
+            }
         }
     } else {
         for (size_t i = 0; i < cfg.embedding_dim; ++i) {
@@ -278,7 +283,7 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         const int q_dim = (lt.attn_q && lt.attn_q->shape.size() > 1) ? (int)lt.attn_q->shape[1] : (cfg.num_heads * cfg.head_dim);
         const int kv_dim = (lt.attn_k && lt.attn_k->shape.size() > 1) ? (int)lt.attn_k->shape[1] : (cfg.num_kv_heads * cfg.head_dim);
         const int actual_head_dim = (cfg.num_heads > 0) ? (q_dim / cfg.num_heads) : cfg.head_dim;
-        const float attn_scale = 1.0f; // Gemma 4 self.scaling = 1.0
+        const float attn_scale = cfg.is_gemma ? 1.0f : (1.0f / std::sqrt((float)actual_head_dim));
         const int gqa_ratio = std::max(1u, cfg.num_heads / cfg.num_kv_heads);
 
         // 2a. Pre-Attention RMSNorm
@@ -288,18 +293,21 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         // 2b. Q, K, V Projections
         if (lt.attn_q) {
             Avx2Math::gemv(q_scratch_.data(), *lt.attn_q, norm_scratch_.data(), q_dim, cfg.embedding_dim);
+            if (lt.attn_q_bias) Avx2Math::add_bias(q_scratch_.data(), *lt.attn_q_bias, q_dim);
         } else {
             for (int i = 0; i < q_dim; ++i) q_scratch_[i] = norm_scratch_[i % cfg.embedding_dim];
         }
 
         if (lt.attn_k) {
             Avx2Math::gemv(k_scratch_.data(), *lt.attn_k, norm_scratch_.data(), kv_dim, cfg.embedding_dim);
+            if (lt.attn_k_bias) Avx2Math::add_bias(k_scratch_.data(), *lt.attn_k_bias, kv_dim);
         } else {
             for (int i = 0; i < kv_dim; ++i) k_scratch_[i] = norm_scratch_[i % cfg.embedding_dim];
         }
 
         if (lt.attn_v) {
             Avx2Math::gemv(v_scratch_.data(), *lt.attn_v, norm_scratch_.data(), kv_dim, cfg.embedding_dim);
+            if (lt.attn_v_bias) Avx2Math::add_bias(v_scratch_.data(), *lt.attn_v_bias, kv_dim);
         } else {
             for (int i = 0; i < kv_dim; ++i) v_scratch_[i] = norm_scratch_[i % cfg.embedding_dim];
         }
@@ -319,13 +327,16 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
                 Avx2Math::rms_norm(k_h, k_h, k_norm_w, actual_head_dim, cfg.rms_norm_eps);
             }
         }
-        for (uint32_t h = 0; h < cfg.num_kv_heads; ++h) {
-            float* v_h = v_scratch_.data() + h * actual_head_dim;
-            Avx2Math::rms_norm(v_h, v_h, default_norm_weights_.data(), actual_head_dim, cfg.rms_norm_eps);
+        if (cfg.is_gemma && lt.attn_q_norm && lt.attn_k_norm) {
+            for (uint32_t h = 0; h < cfg.num_kv_heads; ++h) {
+                float* v_h = v_scratch_.data() + h * actual_head_dim;
+                Avx2Math::rms_norm(v_h, v_h, default_norm_weights_.data(), actual_head_dim, cfg.rms_norm_eps);
+            }
         }
 
-        // 2c. RoPE Rotary Embeddings (Gemma 4 ISWA: SWA 256 / Global 512 full head rotation)
-        bool is_swa = (l % 6 != 5);
+        // 2c. RoPE Rotary Embeddings
+        bool has_swa = (cfg.sliding_window > 0) && (cfg.is_gemma || cfg.architecture == "mistral");
+        bool is_swa = has_swa && (cfg.architecture == "mistral" || (l % 6 != 5));
         float layer_freq_base = is_swa ? cfg.rope_freq_base_swa : cfg.rope_freq_base;
         int rope_dim = actual_head_dim;
         const float* freq_factors_w = (!is_swa && rope_freqs_tensor_) ? reinterpret_cast<const float*>(rope_freqs_tensor_->data) : nullptr;
@@ -374,7 +385,9 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
                     dot += q_h[d] * k_s[d];
                 }
                 scores[i] = dot * attn_scale;
-                scores[i] = 50.0f * std::tanh(scores[i] / 50.0f);
+                if (cfg.attn_logit_softcapping > 0.0f) {
+                    scores[i] = cfg.attn_logit_softcapping * std::tanh(scores[i] / cfg.attn_logit_softcapping);
+                }
             }
 
             // Pure Raw Attention Softmax over active window
@@ -416,11 +429,15 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         const float* ffn_norm_w = lt.ffn_norm ? reinterpret_cast<const float*>(lt.ffn_norm->data) : ones_w;
         Avx2Math::rms_norm(norm_scratch_.data(), embedding_scratch_.data(), ffn_norm_w, cfg.embedding_dim, cfg.rms_norm_eps);
 
-        // 2h. FFN Gate & Up Projections (GeGLU)
+        // 2h. FFN Gate & Up Projections (SwiGLU for LLaMA / Qwen / Mistral, GeGLU for Gemma)
         if (lt.ffn_gate && lt.ffn_up) {
             Avx2Math::gemv(ffn_gate_scratch_.data(), *lt.ffn_gate, norm_scratch_.data(), cfg.hidden_dim, cfg.embedding_dim);
             Avx2Math::gemv(ffn_up_scratch_.data(), *lt.ffn_up, norm_scratch_.data(), cfg.hidden_dim, cfg.embedding_dim);
-            Avx2Math::gelu(ffn_gate_scratch_.data(), cfg.hidden_dim);
+            if (cfg.ffn_activation == FfnActivation::GELU) {
+                Avx2Math::gelu(ffn_gate_scratch_.data(), cfg.hidden_dim);
+            } else {
+                Avx2Math::silu(ffn_gate_scratch_.data(), cfg.hidden_dim);
+            }
             #pragma omp parallel for schedule(static)
             for (size_t i = 0; i < cfg.hidden_dim; ++i) {
                 ffn_gate_scratch_[i] *= ffn_up_scratch_[i];
@@ -505,8 +522,10 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         }
     }
 
-    // 4. Gemma 4 Logits Softcapping
-    Avx2Math::softcap_logits(out_logits, cfg.vocab_size, cfg.final_logit_softcapping > 0.0f ? cfg.final_logit_softcapping : 30.0f);
+    // 4. Final Logits Softcapping (Gemma 2 / 4)
+    if (cfg.final_logit_softcapping > 0.0f) {
+        Avx2Math::softcap_logits(out_logits, cfg.vocab_size, cfg.final_logit_softcapping);
+    }
 }
 
 void HavenEngine::generate(
@@ -533,8 +552,8 @@ void HavenEngine::generate(
         uint32_t next_token = sampler_.sample(logits_scratch_.data(), cfg.vocab_size, generated_tokens);
         generated_tokens.push_back(next_token);
 
-        // Check for Gemma 4 end-of-turn / stop tokens: <eos> (1), <turn|> (106), </s> (212)
-        if (next_token == tokenizer_.eos_token() || next_token == 1 || next_token == 106 || next_token == 212) {
+        // Check for end-of-turn / stop tokens across all architectures
+        if (tokenizer_.is_stop_token(next_token)) {
             break; // Model emitted end-of-turn
         }
 
