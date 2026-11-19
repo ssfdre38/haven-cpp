@@ -31,6 +31,8 @@ set(HAVEN_CORE_SRCS
     src/haven_tokenizer.cpp
     src/haven_engine.cpp
     src/haven_plugin_manager.cpp
+    src/haven_topology.cpp
+    src/haven_pathways.cpp
 )
 
 # Shared Library (haven_engine.dll / libhaven.so) for C# Gemmi & Android JNI
@@ -65,6 +67,18 @@ add_executable(test-quant
 # Test Lazy Plugin Manager Executable
 add_executable(test-lazy-plugins
     tests/test_lazy_plugins.cpp
+    ${HAVEN_CORE_SRCS}
+)
+
+# Test Haven Topology Fabric & Clean-Room Pathways Engine
+add_executable(test-topology-pathways
+    tests/test_topology_pathways.cpp
+    ${HAVEN_CORE_SRCS}
+)
+
+# Test Haven Topology Fabric & Pathways End-to-End & C ABI Exports
+add_executable(test-pathways-e2e
+    tests/test_pathways_e2e.cpp
     ${HAVEN_CORE_SRCS}
 )
 

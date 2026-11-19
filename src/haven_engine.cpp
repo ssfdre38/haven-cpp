@@ -21,9 +21,19 @@ HavenEngine::HavenEngine()
     ffn_up_scratch_.resize(14336, 0.0f);
     ffn_down_scratch_.resize(4096, 0.0f);
     logits_scratch_.resize(128256, 0.0f);
+
+    // Initialize Clean-Room Topology and Pathways Engine
+    topology_ = std::make_shared<TopologyManager>();
+    topology_->detect_topology();
+    pathways_ = std::make_shared<PathwaysEngine>(topology_);
+    pathways_->start();
 }
 
-HavenEngine::~HavenEngine() = default;
+HavenEngine::~HavenEngine() {
+    if (pathways_) {
+        pathways_->shutdown();
+    }
+}
 
 bool HavenEngine::load_model(const std::string& gguf_filepath) {
     if (!loader_.load_file(gguf_filepath)) {
@@ -529,12 +539,34 @@ void HavenEngine::generate(
         }
 
         std::string token_str = tokenizer_.decode_token(next_token);
+        if (pathways_) {
+            pathways_->publish_stream_token(next_token, token_str);
+        }
         if (on_token_callback && !on_token_callback(next_token, token_str)) {
             break; // Callback signaled stop
         }
 
         forward(next_token, pos++, logits_scratch_.data());
     }
+}
+
+std::future<std::vector<uint32_t>> HavenEngine::generate_async(
+    const std::vector<uint32_t>& prompt_tokens,
+    int max_new_tokens,
+    const std::function<bool(uint32_t token, const std::string& text)>& on_token_callback)
+{
+    return std::async(std::launch::async, [this, prompt_tokens, max_new_tokens, on_token_callback]() {
+        std::vector<uint32_t> results;
+        auto tracking_cb = [&](uint32_t tok, const std::string& text) -> bool {
+            results.push_back(tok);
+            if (on_token_callback) {
+                return on_token_callback(tok, text);
+            }
+            return true;
+        };
+        this->generate(prompt_tokens, max_new_tokens, tracking_cb);
+        return results;
+    });
 }
 
 } // namespace haven
@@ -626,4 +658,31 @@ HAVEN_API void haven_destroy_engine(void* engine) {
     if (engine) {
         delete reinterpret_cast<haven::HavenEngine*>(engine);
     }
+}
+
+HAVEN_API size_t haven_get_node_count(void* engine) {
+    if (!engine) return 0;
+    auto eng = reinterpret_cast<haven::HavenEngine*>(engine);
+    auto top = eng->get_topology();
+    return top ? top->get_nodes().size() : 0;
+}
+
+HAVEN_API bool haven_get_node_info(void* engine, uint32_t index, char* out_name, int max_name_len, uint32_t* out_backend, uint64_t* out_mem_free_mb) {
+    if (!engine || !out_name || max_name_len <= 0) return false;
+    auto eng = reinterpret_cast<haven::HavenEngine*>(engine);
+    auto top = eng->get_topology();
+    if (!top || index >= top->get_nodes().size()) return false;
+    const auto& node = top->get_nodes()[index];
+    std::strncpy(out_name, node.device_name.c_str(), max_name_len - 1);
+    out_name[max_name_len - 1] = '\0';
+    if (out_backend) *out_backend = static_cast<uint32_t>(node.backend);
+    if (out_mem_free_mb) *out_mem_free_mb = node.free_memory_bytes / (1024 * 1024);
+    return true;
+}
+
+HAVEN_API uint64_t haven_get_pathways_completed_tasks(void* engine) {
+    if (!engine) return 0;
+    auto eng = reinterpret_cast<haven::HavenEngine*>(engine);
+    auto p = eng->get_pathways();
+    return p ? p->get_completed_task_count() : 0;
 }

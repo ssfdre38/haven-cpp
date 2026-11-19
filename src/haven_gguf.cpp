@@ -54,7 +54,7 @@ bool GgufLoader::load_file(const std::string& filepath) {
     fstat(fd, &sb);
     file_size_ = sb.st_size;
     mmap_data_ = (const uint8_t*)mmap(NULL, file_size_, PROT_READ, MAP_SHARED, fd, 0);
-    close(fd);
+    ::close(fd);
 #endif
 
     if (!parse_header()) {

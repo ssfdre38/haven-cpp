@@ -16,9 +16,13 @@
 #include "haven_chunked_prefill.h"
 #include "haven_tokenizer.h"
 #include "haven_plugin_manager.h"
+#include "haven_topology.h"
+#include "haven_pathways.h"
 #include <string>
 #include <vector>
 #include <functional>
+#include <memory>
+#include <future>
 
 namespace haven {
 
@@ -92,6 +96,18 @@ public:
         int max_new_tokens,
         const std::function<bool(uint32_t token, const std::string& text)>& on_token_callback
     );
+
+    // Asynchronously generates tokens using Pathways non-blocking dataflow
+    std::future<std::vector<uint32_t>> generate_async(
+        const std::vector<uint32_t>& prompt_tokens,
+        int max_new_tokens,
+        const std::function<bool(uint32_t token, const std::string& text)>& on_token_callback = nullptr
+    );
+
+    std::shared_ptr<TopologyManager> get_topology() { return topology_; }
+    std::shared_ptr<const TopologyManager> get_topology() const { return topology_; }
+    std::shared_ptr<PathwaysEngine> get_pathways() { return pathways_; }
+    std::shared_ptr<const PathwaysEngine> get_pathways() const { return pathways_; }
 
     const ModelConfig& get_config() const { return loader_.get_config(); }
     const TensorDesc* get_token_embd_tensor() const { return token_embd_tensor_; }
@@ -190,6 +206,9 @@ private:
     std::vector<float> attn_scores_scratch_;
     std::vector<float> attn_heads_out_scratch_;
     std::vector<int> attn_indices_scratch_;
+
+    std::shared_ptr<TopologyManager> topology_;
+    std::shared_ptr<PathwaysEngine> pathways_;
 };
 
 } // namespace haven
@@ -219,3 +238,6 @@ HAVEN_API float  haven_get_speculative_rate(void* engine);
 HAVEN_API void   haven_forward(void* engine, uint32_t token, int pos, float* out_logits, uint32_t active_cluster);
 HAVEN_API uint32_t haven_sample_token(void* engine, float* logits, uint32_t vocab_size);
 HAVEN_API void   haven_destroy_engine(void* engine);
+HAVEN_API size_t   haven_get_node_count(void* engine);
+HAVEN_API bool     haven_get_node_info(void* engine, uint32_t index, char* out_name, int max_name_len, uint32_t* out_backend, uint64_t* out_mem_free_mb);
+HAVEN_API uint64_t haven_get_pathways_completed_tasks(void* engine);

@@ -4,6 +4,7 @@
 #include <immintrin.h>
 #include <vector>
 #include <cmath>
+#include <cstring>
 
 namespace haven {
 
