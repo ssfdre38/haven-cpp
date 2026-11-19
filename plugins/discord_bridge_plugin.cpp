@@ -4,6 +4,7 @@
 #include <sstream>
 #include <string>
 #include <algorithm>
+#include <filesystem>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -222,10 +223,10 @@ private:
 // Native Dynamic Library Export Entrypoints
 extern "C" {
 #ifdef _WIN32
-    __declspec(dllexport) haven::IHavenPlugin* create_haven_plugin() {
+    HAVEN_PLUGIN_EXPORT haven::IHavenPlugin* create_haven_plugin() {
         return new haven::DiscordBridgePlugin();
     }
-    __declspec(dllexport) void destroy_haven_plugin(haven::IHavenPlugin* plugin) {
+    HAVEN_PLUGIN_EXPORT void destroy_haven_plugin(haven::IHavenPlugin* plugin) {
         delete plugin;
     }
 #else

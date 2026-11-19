@@ -3,6 +3,8 @@
 #include <iostream>
 #include <thread>
 #include <cstdlib>
+#include <fstream>
+#include <filesystem>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -24,6 +26,7 @@ void TopologyManager::detect_topology() {
     nodes_.clear();
     has_tpu_ = false;
     has_gpu_ = false;
+    tpu_chip_count_ = 0;
 
     // 1. Detect Host CPU Node & Unified Memory
     ComputeNode cpu_node;
@@ -62,24 +65,69 @@ void TopologyManager::detect_topology() {
     cpu_node.memory_bandwidth_gbps = 68.0f; // Standard dual-channel DDR5 bus floor
     nodes_.push_back(cpu_node);
 
-    // 2. Probe for Native TPU Accelerator Interface (PJRT / Cloud Environment)
+    // 2. Probe for Native TPU Accelerator Interface (Sysfs, VFIO, PJRT, Cloud Environment)
+    size_t detected_tpu_chips = 0;
+#ifndef _WIN32
+    try {
+        if (std::filesystem::exists("/sys/bus/pci/devices")) {
+            for (const auto& entry : std::filesystem::directory_iterator("/sys/bus/pci/devices")) {
+                auto dev_path = entry.path() / "device";
+                auto ven_path = entry.path() / "vendor";
+                if (std::filesystem::exists(dev_path) && std::filesystem::exists(ven_path)) {
+                    std::ifstream dev_file(dev_path);
+                    std::ifstream ven_file(ven_path);
+                    std::string dev_id, ven_id;
+                    if (dev_file >> dev_id && ven_file >> ven_id) {
+                        // Google PCI Vendor: 0x1ae0, TPU v6e Trillium Device: 0x006f
+                        if (ven_id.find("1ae0") != std::string::npos && dev_id.find("006f") != std::string::npos) {
+                            detected_tpu_chips++;
+                        }
+                    }
+                }
+            }
+        }
+    } catch (...) {}
+#endif
+
     const char* tpu_env = std::getenv("TPU_NAME");
     const char* pjrt_env = std::getenv("PJRT_DEVICE");
-    if (tpu_env || (pjrt_env && std::string(pjrt_env).find("TPU") != std::string::npos)) {
+
+    if (detected_tpu_chips > 0 || tpu_env || (pjrt_env && std::string(pjrt_env).find("TPU") != std::string::npos)) {
+        has_tpu_ = true;
+        tpu_chip_count_ = detected_tpu_chips > 0 ? detected_tpu_chips : 1;
+
         ComputeNode tpu_node;
         tpu_node.node_id = static_cast<uint32_t>(nodes_.size());
         tpu_node.backend = DeviceBackend::TPU_PJRT;
-        tpu_node.device_name = tpu_env ? ("Google TPU Silicon (" + std::string(tpu_env) + ")") : "Google TPU Silicon (PJRT)";
+
+        std::string name_suffix;
+        if (tpu_env) {
+            name_suffix = std::string(tpu_env);
+        } else {
+            char hostname[256] = {0};
+#ifndef _WIN32
+            if (gethostname(hostname, sizeof(hostname)) == 0) {
+                name_suffix = hostname;
+            }
+#endif
+            if (name_suffix.empty()) name_suffix = "haven-tpu-v6e";
+        }
+
+        if (tpu_chip_count_ > 1) {
+            tpu_node.device_name = "Google TPU v6e Trillium Torus Fabric (" + std::to_string(tpu_chip_count_) + "x Cores, " + name_suffix + ")";
+        } else {
+            tpu_node.device_name = "Google TPU Silicon (" + name_suffix + ")";
+        }
+
         tpu_node.numa_domain = 1;
-        tpu_node.total_memory_bytes = 32ULL * 1024 * 1024 * 1024; // 32GB HBM per TPU chip
-        tpu_node.free_memory_bytes  = 30ULL * 1024 * 1024 * 1024;
-        tpu_node.peak_tflops = 275.0f; // TPU v4/v5 bfloat16 MXU rating
-        tpu_node.memory_bandwidth_gbps = 1200.0f; // High Bandwidth Memory
+        tpu_node.total_memory_bytes = tpu_chip_count_ * 32ULL * 1024 * 1024 * 1024; // 32GB HBM per TPU chip
+        tpu_node.free_memory_bytes  = tpu_chip_count_ * 30ULL * 1024 * 1024 * 1024;
+        tpu_node.peak_tflops = static_cast<float>(tpu_chip_count_) * 275.0f; // 275 TFLOPS per chip -> 2,200 TFLOPS for 8 chips
+        tpu_node.memory_bandwidth_gbps = static_cast<float>(tpu_chip_count_) * 1200.0f; // 1,200 GB/s per chip -> 9,600 GB/s
         tpu_node.primary_bus = InterconnectBus::OPTICAL_ICI;
         tpu_node.is_available = true;
 
         nodes_.push_back(tpu_node);
-        has_tpu_ = true;
     }
 
     // 3. Probe for Discrete GPU Topology (CUDA/Vulkan/DirectML Device Node)

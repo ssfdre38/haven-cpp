@@ -2,14 +2,22 @@
 #include <iostream>
 #include <vector>
 #include <cmath>
+#include <filesystem>
 
-int main() {
+int main(int argc, char** argv) {
     std::cout << "==================================================================\n";
     std::cout << "🔬 TESTING Q6_K QUANTIZATION KERNEL PRECISION VS FP32\n";
     std::cout << "==================================================================\n";
 
     haven::HavenEngine engine;
     std::string model_path = "C:\\Users\\admin\\gemma4-turbo-family\\haven-chat-v5.0.gguf";
+    if (argc > 1) {
+        model_path = argv[1];
+    } else {
+        if (!std::filesystem::exists(model_path) && std::filesystem::exists("/workspace/haven/ava-turbo-q4_k_m.gguf")) {
+            model_path = "/workspace/haven/ava-turbo-q4_k_m.gguf";
+        }
+    }
 
     if (!engine.load_model(model_path)) {
         std::cerr << "Failed to load model\n";

@@ -57,6 +57,7 @@ public:
 
     // Checks if native TPU PJRT runtime or driver interface is reachable
     bool has_tpu_accelerator() const { return has_tpu_; }
+    size_t get_tpu_chip_count() const { return tpu_chip_count_; }
 
     // Checks if discrete GPU topology is mapped
     bool has_gpu_accelerator() const { return has_gpu_; }
@@ -71,6 +72,7 @@ private:
     std::vector<ComputeNode> nodes_;
     bool has_tpu_ = false;
     bool has_gpu_ = false;
+    size_t tpu_chip_count_ = 0;
     uint32_t host_numa_nodes_ = 1;
 };
 

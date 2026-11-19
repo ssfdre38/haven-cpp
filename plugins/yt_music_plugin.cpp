@@ -87,10 +87,10 @@ public:
 // Native Dynamic Library Export Entrypoints
 extern "C" {
 #ifdef _WIN32
-    __declspec(dllexport) haven::IHavenPlugin* create_haven_plugin() {
+    HAVEN_PLUGIN_EXPORT haven::IHavenPlugin* create_haven_plugin() {
         return new haven::YouTubeMusicPlugin();
     }
-    __declspec(dllexport) void destroy_haven_plugin(haven::IHavenPlugin* plugin) {
+    HAVEN_PLUGIN_EXPORT void destroy_haven_plugin(haven::IHavenPlugin* plugin) {
         delete plugin;
     }
 #else

@@ -57,6 +57,12 @@ public:
 };
 
 // Function signatures exported by native plugin dynamic libraries (.dll / .so)
+#ifdef _WIN32
+#define HAVEN_PLUGIN_EXPORT extern "C" __declspec(dllexport)
+#else
+#define HAVEN_PLUGIN_EXPORT extern "C" __attribute__((visibility("default")))
+#endif
+
 using CreatePluginFunc = IHavenPlugin* (*)();
 using DestroyPluginFunc = void (*)(IHavenPlugin*);
 
