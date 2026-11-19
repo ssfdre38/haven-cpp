@@ -69,6 +69,36 @@ struct block_q6_K {
 };
 #pragma pack(pop)
 
+// 32-value quantized block for Q5_0
+#pragma pack(push, 1)
+struct block_q5_0 {
+    uint16_t d;       // FP16 scale factor
+    uint8_t  qh[4];   // 32 high bits (1 bit per weight)
+    uint8_t  qs[16];  // 32 low 4-bit nibbles (2 per byte)
+};
+#pragma pack(pop)
+
+// 256-value quantized block for Q5_K
+#pragma pack(push, 1)
+struct block_q5_K {
+    uint16_t d;          // Super-block scale (FP16)
+    uint16_t dmin;       // Super-block min (FP16)
+    uint8_t  scales[12]; // 6-bit sub-block scales/mins
+    uint8_t  qh[32];     // 256 high bits (1 bit per weight)
+    uint8_t  qs[128];    // 4-bit quantized weights (2 per byte)
+};
+#pragma pack(pop)
+
+// 256-value quantized block for Q3_K
+#pragma pack(push, 1)
+struct block_q3_K {
+    uint8_t  hmask[32];   // 256 high bits (1 bit per weight)
+    uint8_t  qs[64];      // 256 2-bit quantized weights (4 per byte)
+    uint8_t  scales[12];  // 16 6-bit scales
+    uint16_t d;           // Super-block scale (FP16)
+};
+#pragma pack(pop)
+
 struct TensorDesc {
     std::string name;
     QuantType type = QuantType::F32;

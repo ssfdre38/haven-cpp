@@ -121,6 +121,10 @@ public:
     size_t get_audio_frame_count() const { return sensory_bridge_.get_audio_frame_count(); }
     float get_current_attention_entropy() const { return telemetry_engine_.get_global_attention_entropy(); }
     float get_speculative_acceptance_rate() const { return speculative_engine_.get_acceptance_rate(); }
+    void set_speculative_enabled(bool enabled) { speculative_enabled_ = enabled; }
+    bool is_speculative_enabled() const { return speculative_enabled_; }
+    SpeculativeEngine& get_speculative_engine() { return speculative_engine_; }
+    const SpeculativeEngine& get_speculative_engine() const { return speculative_engine_; }
     std::string get_json_telemetry(int pos, uint32_t token) const { return telemetry_engine_.to_json_telemetry(pos, token); }
 
     const HavenTokenizer& get_tokenizer() const { return tokenizer_; }
@@ -178,6 +182,7 @@ private:
     PagedAttentionManager paged_attention_;
     YaRNScaler yarn_scaler_;
     SpeculativeEngine speculative_engine_;
+    bool speculative_enabled_ = false;
     FlashAttentionCpu flash_attn_;
     ChunkedPrefillScheduler chunked_prefill_;
     

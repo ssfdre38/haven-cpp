@@ -34,6 +34,14 @@ public:
         std::vector<uint32_t>& accepted_tokens
     );
 
+    // Fast pointer-based candidate verification avoiding std::vector allocations
+    size_t verify_candidates(
+        const SpeculativeCandidate& candidate,
+        const float* target_logits,
+        uint32_t vocab_size,
+        std::vector<uint32_t>& accepted_tokens
+    );
+
     // Updates speculative draft weights based on acceptance feedback
     void update_feedback(bool was_accepted);
 

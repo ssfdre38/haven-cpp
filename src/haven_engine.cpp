@@ -374,36 +374,22 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         for (uint32_t h = 0; h < cfg.num_heads; ++h) {
             const float* q_h = q_scratch_.data() + h * actual_head_dim;
             const uint32_t kv_head_idx = h / gqa_ratio;
-            float* scores = attn_scores_scratch_.data() + h * cfg.max_context_length;
-
-            // Compute QK^T over active window with Softcapping
-            for (int i = 0; i < active_attn_len; ++i) {
-                int abs_s = attn_indices_scratch_[i];
-                const float* k_s = layer_k + abs_s * kv_dim + kv_head_idx * actual_head_dim;
-                float dot = 0.0f;
-                for (int d = 0; d < actual_head_dim; ++d) {
-                    dot += q_h[d] * k_s[d];
-                }
-                scores[i] = dot * attn_scale;
-                if (cfg.attn_logit_softcapping > 0.0f) {
-                    scores[i] = cfg.attn_logit_softcapping * std::tanh(scores[i] / cfg.attn_logit_softcapping);
-                }
-            }
-
-            // Pure Raw Attention Softmax over active window
-            Avx2Math::softmax(scores, active_attn_len);
-
-            // Weighted Value Accumulation (Attn @ V) over active window
+            const uint32_t kv_head_offset = kv_head_idx * actual_head_dim;
             float* out_h = attn_heads_out_scratch_.data() + h * actual_head_dim;
-            for (int d = 0; d < actual_head_dim; ++d) {
-                float acc = 0.0f;
-                for (int i = 0; i < active_attn_len; ++i) {
-                    int abs_s = attn_indices_scratch_[i];
-                    const float* v_s = layer_v + abs_s * kv_dim + kv_head_idx * actual_head_dim;
-                    acc += scores[i] * v_s[d];
-                }
-                out_h[d] = acc;
-            }
+
+            FlashAttentionCpu::compute_tiled_attention(
+                q_h,
+                layer_k,
+                layer_v,
+                attn_indices_scratch_.data(),
+                (uint32_t)active_attn_len,
+                (uint32_t)actual_head_dim,
+                (uint32_t)kv_dim,
+                kv_head_offset,
+                attn_scale,
+                cfg.attn_logit_softcapping,
+                out_h
+            );
         }
 
         // 2f. Attention Output Projection
@@ -547,10 +533,12 @@ void HavenEngine::generate(
         forward(prompt_tokens[i], pos++, is_last_prompt ? logits_scratch_.data() : nullptr);
     }
 
-    // Auto-Regressive Token Generation Loop with Dynamic Soft-Pruning
-    for (int gen = 0; gen < max_new_tokens; ++gen) {
+    // Auto-Regressive Token Generation Loop with Dynamic Soft-Pruning & Speculative Decoding
+    int gen = 0;
+    while (gen < max_new_tokens) {
         uint32_t next_token = sampler_.sample(logits_scratch_.data(), cfg.vocab_size, generated_tokens);
         generated_tokens.push_back(next_token);
+        gen++;
 
         // Check for end-of-turn / stop tokens across all architectures
         if (tokenizer_.is_stop_token(next_token)) {
@@ -566,6 +554,39 @@ void HavenEngine::generate(
         }
 
         forward(next_token, pos++, logits_scratch_.data());
+
+        // Multi-Token Speculative Acceleration
+        if (speculative_enabled_ && gen < max_new_tokens) {
+            std::vector<uint32_t> current_context = prompt_tokens;
+            current_context.insert(current_context.end(), generated_tokens.begin(), generated_tokens.end());
+
+            SpeculativeCandidate candidate = speculative_engine_.draft_candidates(
+                current_context, embedding_scratch_.data(), cfg.embedding_dim
+            );
+
+            std::vector<uint32_t> accepted;
+            speculative_engine_.verify_candidates(candidate, logits_scratch_.data(), cfg.vocab_size, accepted);
+
+            bool any_accepted = !accepted.empty();
+            speculative_engine_.update_feedback(any_accepted);
+
+            for (uint32_t tok : accepted) {
+                if (gen >= max_new_tokens) break;
+                if (tokenizer_.is_stop_token(tok)) {
+                    generated_tokens.push_back(tok);
+                    gen++;
+                    return;
+                }
+                generated_tokens.push_back(tok);
+                gen++;
+
+                std::string s = tokenizer_.decode_token(tok);
+                if (pathways_) pathways_->publish_stream_token(tok, s);
+                if (on_token_callback && !on_token_callback(tok, s)) return;
+
+                forward(tok, pos++, logits_scratch_.data());
+            }
+        }
     }
 }
 

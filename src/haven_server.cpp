@@ -509,6 +509,40 @@ private:
                           << concept_str << "\" -> aura_vault.hmb\n" << std::flush;
             }
         }
+
+        // 2. Autonomous Plugin Tool Execution from Generated Stream
+        size_t tc_pos = full_text.find("<|tool_call|>");
+        if (tc_pos != std::string::npos) {
+            size_t act_start = tc_pos + 13;
+            size_t tc_end = full_text.find("<|tool_call|>", act_start);
+            std::string call_str = (tc_end != std::string::npos) 
+                ? full_text.substr(act_start, tc_end - act_start) 
+                : full_text.substr(act_start);
+            
+            size_t f = call_str.find_first_not_of(" \t\r\n");
+            size_t l = call_str.find_last_not_of(" \t\r\n");
+            if (f != std::string::npos && l != std::string::npos) {
+                call_str = call_str.substr(f, l - f + 1);
+            }
+
+            std::string action, payload;
+            size_t sp = call_str.find(' ');
+            if (sp != std::string::npos) {
+                action = call_str.substr(0, sp);
+                payload = call_str.substr(sp + 1);
+            } else {
+                action = call_str;
+            }
+
+            std::string output;
+            std::cout << "[HavenServer] \xE2\x9A\xA1 Autonomous Tool Dispatch: '" << action << "' (payload: '" << payload << "')...\n" << std::flush;
+            bool ok = haven_engine_.get_plugin_manager().dispatch_tool_execution(action, payload, output);
+            if (ok) {
+                std::cout << "[HavenServer] \xE2\x9C\x93 Tool '" << action << "' Succeeded: " << output << "\n" << std::flush;
+            } else {
+                std::cout << "[HavenServer] \xE2\x9C\x97 Tool '" << action << "' Unhandled or Failed.\n" << std::flush;
+            }
+        }
     }
 
     void handle_native_chat_completions(int client_sock, const std::string& request) {
@@ -581,6 +615,11 @@ private:
                 prompt = "<|turn>user\n" + last_user_msg + "<turn|>\n";
             }
             prompt += "<|turn>model\n";
+        }
+
+        if (body.find("\"tools\"") != std::string::npos) {
+            std::string tools_desc = haven_engine_.get_plugin_manager().get_tools_prompt_description();
+            prompt = "<|turn>system\n" + tools_desc + "<turn|>\n" + prompt;
         }
 
         auto tokens = haven_engine_.tokenize(prompt, true);
@@ -680,8 +719,38 @@ private:
                 haven_engine_.forward(next_tok, active_pos++, logits.data());
             }
 
-            std::string esc_content = escape_json_string(accumulated_response);
-            std::string json_resp = "{\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"content\":\"" + esc_content + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" + esc_content + "\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(tokens.size()) + ",\"completion_tokens\":" + std::to_string(accumulated_response.length() / 4) + ",\"total_tokens\":" + std::to_string(tokens.size() + accumulated_response.length() / 4) + "}}";
+            std::string tool_action = "";
+            std::string tool_payload = "";
+            size_t tc_pos = accumulated_response.find("<|tool_call|>");
+            if (tc_pos != std::string::npos) {
+                size_t act_start = tc_pos + 13;
+                size_t tc_end = accumulated_response.find("<|tool_call|>", act_start);
+                std::string call_str = (tc_end != std::string::npos)
+                    ? accumulated_response.substr(act_start, tc_end - act_start)
+                    : accumulated_response.substr(act_start);
+                size_t f = call_str.find_first_not_of(" \t\r\n");
+                size_t l = call_str.find_last_not_of(" \t\r\n");
+                if (f != std::string::npos && l != std::string::npos) call_str = call_str.substr(f, l - f + 1);
+                size_t sp = call_str.find(' ');
+                if (sp != std::string::npos) {
+                    tool_action = call_str.substr(0, sp);
+                    tool_payload = call_str.substr(sp + 1);
+                } else {
+                    tool_action = call_str;
+                }
+            }
+
+            std::string json_resp;
+            if (!tool_action.empty()) {
+                std::string text_before = accumulated_response.substr(0, tc_pos);
+                std::string esc_text = escape_json_string(text_before);
+                std::string esc_action = escape_json_string(tool_action);
+                std::string esc_payload = escape_json_string(tool_payload);
+                json_resp = "{\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":" + (text_before.empty() ? "null" : ("\"" + esc_text + "\"")) + ",\"tool_calls\":[{\"id\":\"call_sovereign_1\",\"type\":\"function\",\"function\":{\"name\":\"" + esc_action + "\",\"arguments\":\"{\\\"payload\\\":\\\"" + esc_payload + "\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(tokens.size()) + ",\"completion_tokens\":" + std::to_string(accumulated_response.length() / 4) + ",\"total_tokens\":" + std::to_string(tokens.size() + accumulated_response.length() / 4) + "}}";
+            } else {
+                std::string esc_content = escape_json_string(accumulated_response);
+                json_resp = "{\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"content\":\"" + esc_content + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" + esc_content + "\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(tokens.size()) + ",\"completion_tokens\":" + std::to_string(accumulated_response.length() / 4) + ",\"total_tokens\":" + std::to_string(tokens.size() + accumulated_response.length() / 4) + "}}";
+            }
 
             std::string http_resp = "HTTP/1.1 200 OK\r\n"
                                     "Content-Type: application/json; charset=utf-8\r\n"
@@ -1021,6 +1090,22 @@ private:
             std::string body = get_models_json();
             std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
                              + std::to_string(body.length()) + "\r\n\r\n" + body;
+            send_all(sock, resp.c_str(), (int)resp.length());
+        }
+        else if (path == "/v1/tools" || path == "/api/tools") {
+            const auto& plugins = haven_engine_.get_plugin_manager().get_loaded_plugins();
+            std::string json = "{\"object\":\"list\",\"data\":[";
+            bool first = true;
+            for (const auto& [id, record] : plugins) {
+                for (const auto& action : record.supported_actions) {
+                    if (!first) json += ",";
+                    json += "{\"type\":\"function\",\"function\":{\"name\":\"" + escape_json_string(action) + "\",\"description\":\"" + escape_json_string(record.metadata.name + ": " + record.metadata.description) + "\",\"parameters\":{\"type\":\"object\",\"properties\":{\"payload\":{\"type\":\"string\",\"description\":\"Query argument or instruction for " + escape_json_string(action) + "\"}},\"required\":[\"payload\"]}}}";
+                    first = false;
+                }
+            }
+            json += "]}";
+            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
+                             + std::to_string(json.length()) + "\r\n\r\n" + json;
             send_all(sock, resp.c_str(), (int)resp.length());
         }
         else if (path == "/v1/models/load" || path == "/api/models/load" || path == "/v1/models/switch") {

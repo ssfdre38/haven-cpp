@@ -61,13 +61,31 @@ size_t SpeculativeEngine::verify_candidates(
     uint32_t vocab_size,
     std::vector<uint32_t>& accepted_tokens)
 {
+    return verify_candidates(
+        candidate,
+        target_logits.empty() ? nullptr : target_logits.data(),
+        vocab_size,
+        accepted_tokens
+    );
+}
+
+size_t SpeculativeEngine::verify_candidates(
+    const SpeculativeCandidate& candidate,
+    const float* target_logits,
+    uint32_t vocab_size,
+    std::vector<uint32_t>& accepted_tokens)
+{
     accepted_tokens.clear();
     size_t accepted = 0;
 
     for (size_t i = 0; i < candidate.tokens.size(); ++i) {
         uint32_t tok = candidate.tokens[i];
-        if (tok < vocab_size && i < target_logits.size()) {
+        if (tok < vocab_size) {
             float confidence = candidate.probabilities[i];
+            if (target_logits && target_logits[tok] < -50.0f) {
+                // Rejected by target model's logits distribution
+                break;
+            }
             if (confidence >= acceptance_threshold_) {
                 accepted_tokens.push_back(tok);
                 accepted++;

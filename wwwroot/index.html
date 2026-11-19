@@ -314,6 +314,46 @@
             background: var(--bg-sidebar-hover);
         }
 
+        .ctx-meter-pill {
+            display: flex;
+            align-items: center;
+            gap: 7px;
+            padding: 5px 10px;
+            border-radius: var(--radius-md);
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            font-size: 11px;
+            color: var(--text-muted);
+            margin-left: 6px;
+        }
+
+        .ctx-bar-track {
+            width: 48px;
+            height: 5px;
+            background: #27272a;
+            border-radius: 3px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .ctx-bar-fill {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, #10b981, #f59e0b);
+            border-radius: 3px;
+            transition: width 0.3s ease, background 0.3s ease;
+        }
+
+        a.nav-pill-btn {
+            text-decoration: none;
+            color: var(--text-muted);
+        }
+
+        a.nav-pill-btn:hover {
+            color: #fff;
+            border-color: var(--border-hover);
+        }
+
         .model-item-card {
             display: flex;
             align-items: center;
@@ -941,9 +981,33 @@
                         <span id="nav-model-name">haven-chat-v5.0</span>
                         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="opacity: 0.7; margin-left: 2px;"><polyline points="6 9 12 15 18 9"/></svg>
                     </div>
+                    <div class="ctx-meter-pill" id="ctx-meter-pill" title="Active Context Window Usage">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="4"/><line x1="6" y1="12" x2="18" y2="12"/><line x1="12" y1="6" x2="12" y2="18"/></svg>
+                        <span id="ctx-tokens-lbl" style="font-family: var(--font-mono); font-size: 11px;">0 / 8,192 (0%)</span>
+                        <div class="ctx-bar-track">
+                            <div class="ctx-bar-fill" id="ctx-bar-fill"></div>
+                        </div>
+                    </div>
                 </div>
 
                 <div class="nav-right">
+                    <a href="/memories.html" target="_blank" class="nav-pill-btn" title="View 64-bit Haven Memory Bank (.hmb)">
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>
+                        <span>Memories</span>
+                    </a>
+                    <a href="/gallery.html" target="_blank" class="nav-pill-btn" title="View Sensory Vision & Audio Gallery">
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                        <span>Gallery</span>
+                    </a>
+                    <button class="nav-pill-btn" onclick="exportCurrentSession()" title="Export current session (JSON)">
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                        <span>Export</span>
+                    </button>
+                    <button class="nav-pill-btn" onclick="triggerImportSession()" title="Import session (JSON)">
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                        <span>Import</span>
+                    </button>
+                    <input type="file" id="import-session-file" style="display:none;" accept=".json" onchange="handleSessionFileImport(event)">
                     <button class="nav-pill-btn" onclick="openSystemPromptModal()">
                         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
                         <span>System</span>
@@ -1171,6 +1235,7 @@
             }
 
             fetchModelInfo();
+            updateContextMeter();
         }
 
         let availableModels = [];
@@ -1426,6 +1491,88 @@
             `).join('');
 
             scrollToBottom();
+            updateContextMeter();
+        }
+
+        function updateContextMeter() {
+            let totalChars = 0;
+            const conv = getActiveConversation();
+            if (conv) {
+                totalChars += (settings.system_prompt || '').length;
+                conv.messages.forEach(m => totalChars += (m.content || '').length);
+            }
+            const estTokens = Math.ceil(totalChars / 3.8);
+            const maxContext = 8192;
+            const pct = Math.min(100, Math.round((estTokens / maxContext) * 100));
+            const lbl = document.getElementById('ctx-tokens-lbl');
+            const fill = document.getElementById('ctx-bar-fill');
+            if (lbl) lbl.innerText = `${estTokens.toLocaleString()} / ${maxContext.toLocaleString()} (${pct}%)`;
+            if (fill) {
+                fill.style.width = `${pct}%`;
+                if (pct > 85) fill.style.background = '#ef4444';
+                else if (pct > 60) fill.style.background = '#f59e0b';
+                else fill.style.background = '#10b981';
+            }
+        }
+
+        function exportCurrentSession() {
+            const conv = getActiveConversation();
+            if (!conv || !conv.messages || conv.messages.length === 0) {
+                alert("Current conversation is empty.");
+                return;
+            }
+            const exportObj = {
+                haven_version: "2.0",
+                exported_at: new Date().toISOString(),
+                model: currentModelName,
+                title: conv.title,
+                messages: conv.messages,
+                settings: settings
+            };
+            const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(exportObj, null, 2));
+            const dl = document.createElement('a');
+            dl.setAttribute("href", dataStr);
+            const safeTitle = (conv.title || 'haven-session').replace(/[^a-z0-9_-]/gi, '_').toLowerCase();
+            dl.setAttribute("download", `${safeTitle}-${Date.now()}.json`);
+            document.body.appendChild(dl);
+            dl.click();
+            dl.remove();
+        }
+
+        function triggerImportSession() {
+            const inp = document.getElementById('import-session-file');
+            if (inp) inp.click();
+        }
+
+        function handleSessionFileImport(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                try {
+                    const data = JSON.parse(e.target.result);
+                    if (data && data.messages && Array.isArray(data.messages)) {
+                        const newId = 'chat_' + Date.now();
+                        const newConv = {
+                            id: newId,
+                            title: data.title || file.name.replace('.json', ''),
+                            model: data.model || currentModelName,
+                            messages: data.messages
+                        };
+                        conversations.unshift(newConv);
+                        activeConvId = newId;
+                        saveConversationsToStorage();
+                        renderActiveMessages();
+                        updateContextMeter();
+                    } else {
+                        alert("Invalid session JSON format.");
+                    }
+                } catch(err) {
+                    alert("Failed to parse session JSON: " + err.message);
+                }
+                event.target.value = '';
+            };
+            reader.readAsText(file);
         }
 
         function scrollToBottom() {
@@ -1626,6 +1773,7 @@
                 setGeneratingState(false);
                 saveConversationsToStorage();
                 activeController = null;
+                updateContextMeter();
             }
         }
 

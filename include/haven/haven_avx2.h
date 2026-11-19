@@ -35,6 +35,15 @@ public:
     // Dot product of quantized Q6_K weights with FP32 vector using AVX2 and FMA
     static float vec_dot_q6_K(int n, const block_q6_K* vx, const float* vy);
 
+    // Dot product of quantized Q5_0 weights with FP32 vector using AVX2 and FMA
+    static float vec_dot_q5_0(int n, const block_q5_0* vx, const float* vy);
+
+    // Dot product of quantized Q5_K weights with FP32 vector using AVX2 and FMA
+    static float vec_dot_q5_K(int n, const block_q5_K* vx, const float* vy);
+
+    // Dot product of quantized Q3_K weights with FP32 vector using AVX2 and FMA
+    static float vec_dot_q3_K(int n, const block_q3_K* vx, const float* vy);
+
     // Dot product of FP16 weights with FP32 vector
     static float vec_dot_f16(int n, const uint16_t* vx, const float* vy);
 

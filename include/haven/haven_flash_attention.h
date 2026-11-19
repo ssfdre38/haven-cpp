@@ -25,6 +25,21 @@ public:
         float* out_attn
     );
 
+    // Bare-metal AVX2 FlashAttention with online softmax, strided KV cache, index windows, and logit softcapping
+    static void compute_tiled_attention(
+        const float* q,
+        const float* layer_k,
+        const float* layer_v,
+        const int* indices,
+        uint32_t num_tokens,
+        uint32_t head_dim,
+        uint32_t kv_dim,
+        uint32_t kv_head_offset,
+        float scale,
+        float softcap,
+        float* out_attn
+    );
+
 private:
     uint32_t head_dim_;
     std::vector<float> scores_scratch_;
