@@ -103,6 +103,12 @@ add_executable(test-cluster-fabric
     ${HAVEN_CORE_SRCS}
 )
 
+# Test Haven Cloud TPU v6e Trillium 8-Core Torus Mesh Cluster
+add_executable(test-tpu-cluster-mesh
+    tests/test_tpu_cluster_mesh.cpp
+    ${HAVEN_CORE_SRCS}
+)
+
 # Native Sovereign Plugins
 add_library(plugin_yt_music SHARED
     plugins/yt_music_plugin.cpp
@@ -251,6 +257,7 @@ if (WIN32)
     target_link_libraries(test-pathways-e2e ws2_32 mlxc mlx openblas)
     target_link_libraries(test-multi-model-arch ws2_32 mlxc mlx openblas)
     target_link_libraries(test-cluster-fabric ws2_32 mlxc mlx openblas)
+    target_link_libraries(test-tpu-cluster-mesh ws2_32 mlxc mlx openblas)
     target_link_libraries(plugin_system_sensory psapi)
     target_link_libraries(plugin_screen_vision psapi)
     target_link_libraries(plugin_web_research winhttp)

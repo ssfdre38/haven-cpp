@@ -1,6 +1,7 @@
 #pragma once
 
 #include "haven_types.h"
+#include "haven_topology.h"
 #include <cstdint>
 #include <cstddef>
 #include <string>
@@ -73,12 +74,18 @@ struct ClusterNodeInfo {
     std::string address = "127.0.0.1";
     uint16_t port = 11438;
     ClusterRole role = ClusterRole::WORKER;
+    DeviceBackend backend = DeviceBackend::CPU_AVX2;
+    InterconnectBus bus = InterconnectBus::SYSTEM_RAM_BUS;
+    std::string device_name;
     uint32_t start_layer = 0;
     uint32_t end_layer = 0; // [start_layer, end_layer)
     uint64_t total_memory_bytes = 0;
     uint64_t free_memory_bytes = 0;
     float peak_tflops = 0.0f;
     float interconnect_latency_ms = 0.0f;
+    uint32_t torus_x = 0;
+    uint32_t torus_y = 0;
+    uint32_t torus_z = 0;
     bool is_alive = true;
 };
 
@@ -142,6 +149,7 @@ private:
     std::atomic<bool> is_running_{false};
 
     std::thread server_thread_;
+    mutable std::mutex threads_mutex_;
     std::vector<std::thread> client_threads_;
 
     mutable std::mutex peers_mutex_;
@@ -158,6 +166,10 @@ public:
 
     // Partitions total model layers across available cluster nodes
     void partition_layers(uint32_t total_layers, std::vector<ClusterNodeInfo>& nodes);
+
+    // Directly sets pre-partitioned cluster topology
+    void set_nodes(const std::vector<ClusterNodeInfo>& nodes, uint32_t total_layers);
+    const std::vector<ClusterNodeInfo>& get_nodes() const { return nodes_; }
 
     // Returns the node ID responsible for executing a specific layer index
     uint32_t get_node_for_layer(uint32_t layer_idx) const;
@@ -198,6 +210,13 @@ public:
     // Slices model and synchronizes partition table across all connected nodes
     bool sync_cluster_partition();
 
+    // Connects directly to a peer node in the cluster mesh
+    bool connect_peer_node(uint32_t node_id, const std::string& address, uint16_t port);
+
+    // Sends forward layer activations directly to a specific target node
+    bool send_activations_to_node(uint32_t target_node_id, uint64_t sequence_id, uint32_t step_pos,
+                                  uint32_t layer_boundary, const std::vector<float>& activations);
+
     // Sends forward layer activations to the next downstream pipeline stage
     bool forward_activations_to_next(uint64_t sequence_id, uint32_t step_pos, 
                                      uint32_t current_layer, const std::vector<float>& activations);
@@ -211,6 +230,8 @@ public:
     bool is_active() const { return is_active_; }
     const std::vector<ClusterNodeInfo>& get_nodes() const { return nodes_; }
     const PipelineClusterScheduler& get_scheduler() const { return scheduler_; }
+    void set_scheduler(const PipelineClusterScheduler& scheduler);
+    bool is_peer_connected(uint32_t node_id) const;
 
     // Generates cluster health and pipeline topology report
     std::string generate_cluster_report() const;

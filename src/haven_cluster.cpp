@@ -71,11 +71,23 @@ static bool send_all(socket_t sock, const void* data, size_t total_bytes) {
     return true;
 }
 
-// Helper: receive exact number of bytes
-static bool recv_all(socket_t sock, void* data, size_t total_bytes) {
+// Helper: receive exact number of bytes with polling timeout
+static bool recv_all(socket_t sock, void* data, size_t total_bytes, const std::atomic<bool>& is_running) {
     char* ptr = static_cast<char*>(data);
     size_t remaining = total_bytes;
-    while (remaining > 0) {
+    while (remaining > 0 && is_running.load()) {
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(sock, &read_fds);
+
+        timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = 100000; // 100ms timeout
+        int sel = ::select(static_cast<int>(sock + 1), &read_fds, nullptr, nullptr, &tv);
+        if (sel <= 0) {
+            continue; // check is_running
+        }
+
         int recvd = ::recv(sock, ptr, static_cast<int>(remaining), 0);
         if (recvd <= 0) {
             return false;
@@ -83,7 +95,7 @@ static bool recv_all(socket_t sock, void* data, size_t total_bytes) {
         remaining -= recvd;
         ptr += recvd;
     }
-    return true;
+    return remaining == 0;
 }
 
 // ============================================================================
@@ -242,7 +254,10 @@ bool ClusterTransportRing::connect_to_peer(uint32_t node_id, const std::string& 
     }
 
     // Launch background receiver thread for this peer connection
-    client_threads_.emplace_back(&ClusterTransportRing::client_recv_loop, this, sock_val, node_id);
+    {
+        std::lock_guard<std::mutex> lock(threads_mutex_);
+        client_threads_.emplace_back(&ClusterTransportRing::client_recv_loop, this, sock_val, node_id);
+    }
 
     std::cout << "🔗 [ClusterTransportRing] Connected to peer Node " << node_id 
               << " (" << address << ":" << port << ")\n";
@@ -256,14 +271,44 @@ void ClusterTransportRing::stop() {
 
     inbound_ring_->close();
 
-    // Close server listening socket
+    // 1. Shutdown all peer sockets to immediately unblock any blocking recv calls
+    {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        for (auto& [id, s_val] : peer_sockets_) {
+            socket_t s = static_cast<socket_t>(s_val);
+#if defined(_WIN32)
+            ::shutdown(s, SD_BOTH);
+#else
+            ::shutdown(s, SHUT_RDWR);
+#endif
+        }
+    }
+
+    // 2. Close server listening socket
     if (server_socket_ != ~0ULL) {
         socket_t s = static_cast<socket_t>(server_socket_);
         server_socket_ = ~0ULL;
         closesocket(s);
     }
 
-    // Close all peer sockets
+    if (server_thread_.joinable()) {
+        server_thread_.join();
+    }
+
+    // 3. Join all client receiver threads cleanly
+    std::vector<std::thread> to_join;
+    {
+        std::lock_guard<std::mutex> lock(threads_mutex_);
+        to_join = std::move(client_threads_);
+    }
+
+    for (auto& t : to_join) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+
+    // 4. Ensure any remaining peer sockets are closed
     {
         std::lock_guard<std::mutex> lock(peers_mutex_);
         for (auto& [id, s_val] : peer_sockets_) {
@@ -271,17 +316,6 @@ void ClusterTransportRing::stop() {
         }
         peer_sockets_.clear();
     }
-
-    if (server_thread_.joinable()) {
-        server_thread_.join();
-    }
-
-    for (auto& t : client_threads_) {
-        if (t.joinable()) {
-            t.join();
-        }
-    }
-    client_threads_.clear();
 }
 
 bool ClusterTransportRing::send_activation(uint32_t target_node_id, const HavenActivationFrame& frame) {
@@ -348,6 +382,19 @@ void ClusterTransportRing::server_listen_loop() {
     uint32_t incoming_node_counter = 100;
 
     while (is_running_) {
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(server_fd, &read_fds);
+
+        timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = 100000; // 100ms poll timeout
+
+        int sel = ::select(static_cast<int>(server_fd + 1), &read_fds, nullptr, nullptr, &tv);
+        if (sel <= 0) {
+            continue; // Timeout or interrupted; re-check is_running_
+        }
+
         sockaddr_in client_addr{};
         socklen_t client_len = sizeof(client_addr);
         socket_t client_fd = ::accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
@@ -366,7 +413,10 @@ void ClusterTransportRing::server_listen_loop() {
             peer_sockets_[assigned_id] = sock_val;
         }
 
-        client_threads_.emplace_back(&ClusterTransportRing::client_recv_loop, this, sock_val, assigned_id);
+        {
+            std::lock_guard<std::mutex> lock(threads_mutex_);
+            client_threads_.emplace_back(&ClusterTransportRing::client_recv_loop, this, sock_val, assigned_id);
+        }
     }
 }
 
@@ -376,7 +426,7 @@ void ClusterTransportRing::client_recv_loop(uint64_t socket_handle, uint32_t pee
     while (is_running_) {
         HavenActivationFrame frame;
         // 1. Read fixed 36-byte header
-        if (!recv_all(sock, &frame.header, sizeof(frame.header))) {
+        if (!recv_all(sock, &frame.header, sizeof(frame.header), is_running_)) {
             break; // Connection terminated
         }
 
@@ -389,21 +439,36 @@ void ClusterTransportRing::client_recv_loop(uint64_t socket_handle, uint32_t pee
         // 2. Read contiguous raw float data payload
         if (frame.header.payload_bytes > 0 && frame.header.element_count > 0) {
             frame.data.resize(frame.header.element_count);
-            if (!recv_all(sock, frame.data.data(), frame.header.payload_bytes)) {
+            if (!recv_all(sock, frame.data.data(), frame.header.payload_bytes, is_running_)) {
                 break;
             }
+        }
+
+        // Handle Handshake: map actual peer node ID in the transport ring
+        if (frame.header.flags & FRAME_FLAG_HANDSHAKE) {
+            uint32_t real_node_id = frame.header.from_node_id;
+            if (real_node_id != peer_node_id) {
+                std::lock_guard<std::mutex> lock(peers_mutex_);
+                peer_sockets_.erase(peer_node_id);
+                peer_sockets_[real_node_id] = socket_handle;
+                peer_node_id = real_node_id;
+            }
+            continue;
         }
 
         // Push directly into inbound ring buffer
         inbound_ring_->push(std::move(frame));
     }
 
-    // Peer disconnected: clean up
-    {
+    // Peer disconnected: clean up under mutex
+    if (is_running_) {
         std::lock_guard<std::mutex> lock(peers_mutex_);
-        peer_sockets_.erase(peer_node_id);
+        auto it = peer_sockets_.find(peer_node_id);
+        if (it != peer_sockets_.end() && it->second == socket_handle) {
+            peer_sockets_.erase(it);
+            closesocket(sock);
+        }
     }
-    closesocket(sock);
 }
 
 // ============================================================================
@@ -425,9 +490,16 @@ void PipelineClusterScheduler::partition_layers(uint32_t total_layers, std::vect
 
     // 1. Calculate weighted capacity based on memory footprint and TFLOPS
     double total_weight = 0.0;
-    std::vector<double> weights(num_nodes, 1.0);
+    std::vector<double> weights(num_nodes, 0.0);
 
     for (size_t i = 0; i < num_nodes; ++i) {
+        // Pure coordinator with 0 memory/flops does not take compute layers when workers exist
+        if (nodes_[i].role == ClusterRole::COORDINATOR && num_nodes > 1 && 
+            nodes_[i].total_memory_bytes == 0 && nodes_[i].peak_tflops == 0.0f) {
+            weights[i] = 0.0;
+            continue;
+        }
+
         double mem_weight = (nodes_[i].total_memory_bytes > 0) ? 
                             (double)nodes_[i].total_memory_bytes / (1024.0 * 1024.0 * 1024.0) : 16.0;
         double flops_weight = (nodes_[i].peak_tflops > 0.0f) ? (double)nodes_[i].peak_tflops : 10.0;
@@ -435,17 +507,28 @@ void PipelineClusterScheduler::partition_layers(uint32_t total_layers, std::vect
         total_weight += weights[i];
     }
 
+    if (total_weight <= 0.0) {
+        total_weight = 1.0;
+        weights[0] = 1.0;
+    }
+
     // 2. Assign layer ranges proportionally
     uint32_t current_layer = 0;
     for (size_t i = 0; i < num_nodes; ++i) {
+        if (weights[i] <= 0.0) {
+            nodes_[i].start_layer = 0;
+            nodes_[i].end_layer = 0;
+            continue;
+        }
+
         uint32_t node_layers = 0;
-        if (i == num_nodes - 1) {
+        if (i == num_nodes - 1 || current_layer >= total_layers_) {
             // Last node takes all remaining layers to ensure exact coverage
             node_layers = (total_layers_ > current_layer) ? (total_layers_ - current_layer) : 0;
         } else {
             double fraction = weights[i] / total_weight;
             node_layers = static_cast<uint32_t>(fraction * total_layers_);
-            if (node_layers == 0) node_layers = 1;
+            if (node_layers == 0 && current_layer < total_layers_) node_layers = 1;
         }
 
         nodes_[i].start_layer = current_layer;
@@ -454,6 +537,11 @@ void PipelineClusterScheduler::partition_layers(uint32_t total_layers, std::vect
     }
 
     nodes = nodes_; // update caller
+}
+
+void PipelineClusterScheduler::set_nodes(const std::vector<ClusterNodeInfo>& nodes, uint32_t total_layers) {
+    nodes_ = nodes;
+    total_layers_ = total_layers;
 }
 
 uint32_t PipelineClusterScheduler::get_node_for_layer(uint32_t layer_idx) const {
@@ -491,9 +579,24 @@ std::string PipelineClusterScheduler::generate_partition_report() const {
     ss << "║ Total Model Layers: " << total_layers_ << "\n";
     ss << "╟──────────────────────────────────────────────────────────────────────╢\n";
     for (const auto& node : nodes_) {
+        std::string backend_str = "CPU_AVX2 (Host Direct)";
+        if (node.backend == DeviceBackend::TPU_PJRT) {
+            backend_str = "TPU_PJRT (Optical ICI Torus)";
+        } else if (node.backend == DeviceBackend::GPU_NUMA) {
+            backend_str = "GPU_NUMA (Discrete PCIe/NVLink)";
+        } else if (node.backend == DeviceBackend::FABRIC_REMOTE) {
+            backend_str = "FABRIC_REMOTE (Zero-Copy Cluster Mesh)";
+        }
+
         uint32_t span = (node.end_layer >= node.start_layer) ? (node.end_layer - node.start_layer) : 0;
         ss << "║ Node " << node.node_id << " (" << (node.role == ClusterRole::COORDINATOR ? "COORDINATOR" : "WORKER") << ") "
            << "@ " << node.address << ":" << node.port << "\n"
+           << "║   Hardware : " << (node.device_name.empty() ? backend_str : node.device_name) << "\n"
+           << "║   Backend  : " << backend_str;
+        if (node.backend == DeviceBackend::TPU_PJRT) {
+            ss << " | Torus Mesh: (" << node.torus_x << ", " << node.torus_y << ", " << node.torus_z << ")";
+        }
+        ss << "\n"
            << "║   Layers   : [" << node.start_layer << " .. " << (node.end_layer > 0 ? node.end_layer - 1 : 0) << "] (" << span << " layers)\n"
            << "║   Memory   : " << (node.total_memory_bytes / (1024*1024*1024)) << " GB Total\n"
            << "║   Compute  : " << node.peak_tflops << " TFLOPS\n"
@@ -621,10 +724,25 @@ bool HavenClusterNode::sync_cluster_partition() {
     return transport_->broadcast_activation(sync_frame);
 }
 
-bool HavenClusterNode::forward_activations_to_next(uint64_t sequence_id, uint32_t step_pos,
-                                                  uint32_t current_layer, const std::vector<float>& activations) {
-    uint32_t next_node = scheduler_.get_node_for_layer(current_layer + 1);
+bool HavenClusterNode::connect_peer_node(uint32_t node_id, const std::string& address, uint16_t port) {
+    if (!transport_->connect_to_peer(node_id, address, port)) {
+        return false;
+    }
 
+    // Send handshake frame so peer knows who connected
+    HavenActivationFrame handshake;
+    handshake.header.magic = HAVEN_CLUSTER_MAGIC;
+    handshake.header.protocol_ver = HAVEN_CLUSTER_VERSION;
+    handshake.header.flags = FRAME_FLAG_HANDSHAKE;
+    handshake.header.from_node_id = static_cast<uint16_t>(local_node_id_);
+    handshake.header.to_node_id = static_cast<uint16_t>(node_id);
+    handshake.header.element_count = 0;
+    handshake.header.payload_bytes = 0;
+    return transport_->send_activation(node_id, handshake);
+}
+
+bool HavenClusterNode::send_activations_to_node(uint32_t target_node_id, uint64_t sequence_id, uint32_t step_pos,
+                                               uint32_t layer_boundary, const std::vector<float>& activations) {
     HavenActivationFrame frame;
     frame.header.magic = HAVEN_CLUSTER_MAGIC;
     frame.header.protocol_ver = HAVEN_CLUSTER_VERSION;
@@ -632,13 +750,32 @@ bool HavenClusterNode::forward_activations_to_next(uint64_t sequence_id, uint32_
     frame.header.sequence_id = sequence_id;
     frame.header.step_pos = step_pos;
     frame.header.from_node_id = static_cast<uint16_t>(local_node_id_);
-    frame.header.to_node_id = static_cast<uint16_t>(next_node);
-    frame.header.layer_boundary = static_cast<uint16_t>(current_layer + 1);
+    frame.header.to_node_id = static_cast<uint16_t>(target_node_id);
+    frame.header.layer_boundary = static_cast<uint16_t>(layer_boundary);
     frame.header.element_count = static_cast<uint32_t>(activations.size());
     frame.header.payload_bytes = static_cast<uint32_t>(activations.size() * sizeof(float));
     frame.data = activations;
 
-    return transport_->send_activation(next_node, frame);
+    return transport_->send_activation(target_node_id, frame);
+}
+
+bool HavenClusterNode::forward_activations_to_next(uint64_t sequence_id, uint32_t step_pos,
+                                                  uint32_t current_layer, const std::vector<float>& activations) {
+    uint32_t target_layer = (local_node_id_ == 0 && current_layer == 0) ? 0 : (current_layer + 1);
+    uint32_t next_node = scheduler_.get_node_for_layer(target_layer);
+    if (next_node == local_node_id_) {
+        next_node = 0; // Return to coordinator
+    }
+
+    return send_activations_to_node(next_node, sequence_id, step_pos, target_layer, activations);
+}
+
+void HavenClusterNode::set_scheduler(const PipelineClusterScheduler& scheduler) {
+    scheduler_ = scheduler;
+}
+
+bool HavenClusterNode::is_peer_connected(uint32_t node_id) const {
+    return transport_ && transport_->is_peer_connected(node_id);
 }
 
 bool HavenClusterNode::await_upstream_activations(HavenActivationFrame& out_frame, int timeout_ms) {
