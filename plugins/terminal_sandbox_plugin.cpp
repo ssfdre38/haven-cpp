@@ -51,6 +51,8 @@ public:
         if (action == "shell_status") {
 #ifdef _WIN32
             output = "🐚 Sovereign Shell Sandbox: ONLINE\nPlatform: Windows Native CLI / PowerShell\nStatus: Ready for command execution.";
+#elif defined(__APPLE__)
+            output = "🐚 Sovereign Shell Sandbox: ONLINE\nPlatform: macOS / Darwin Zsh / Bash\nStatus: Ready for command execution.";
 #else
             output = "🐚 Sovereign Shell Sandbox: ONLINE\nPlatform: Linux / POSIX Shell (/bin/sh, /bin/bash)\nStatus: Ready for command execution.";
 #endif

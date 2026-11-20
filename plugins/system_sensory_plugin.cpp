@@ -22,6 +22,16 @@
 #include <sys/sysinfo.h>
 #include <mntent.h>
 #include <sys/utsname.h>
+#elif defined(__APPLE__)
+#include <sys/sysctl.h>
+#include <mach/mach.h>
+#include <mach/vm_statistics.h>
+#include <mach/mach_types.h>
+#include <mach/mach_init.h>
+#include <mach/mach_host.h>
+#include <libproc.h>
+#include <sys/mount.h>
+#include <stdlib.h>
 #endif
 #endif
 
@@ -108,6 +118,23 @@ public:
                 int online = 1;
                 ac_online >> online;
                 on_ac = (online == 1);
+            }
+        }
+#elif defined(__APPLE__)
+        int64_t total_ram = 0;
+        size_t len = sizeof(total_ram);
+        if (sysctlbyname("hw.memsize", &total_ram, &len, nullptr, 0) == 0 && total_ram > 0) {
+            mach_port_t host_port = mach_host_self();
+            mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+            vm_statistics64_data_t vm_stat;
+            vm_size_t page_size = 4096;
+            host_page_size(host_port, &page_size);
+
+            if (host_statistics64(host_port, HOST_VM_INFO64, (host_info64_t)&vm_stat, &count) == KERN_SUCCESS) {
+                int64_t free_mem = ((int64_t)vm_stat.free_count + (int64_t)vm_stat.inactive_count) * (int64_t)page_size;
+                if (total_ram > free_mem) {
+                    mem_percent = (int)(100.0 * (1.0 - (double)free_mem / (double)total_ram));
+                }
             }
         }
 #endif
@@ -235,6 +262,7 @@ public:
         localtime_r(&now_c, &local_tm);
 
         if (action == "process_list" || action == "list_processes") {
+#if defined(__linux__) || defined(__ANDROID__)
             DIR* proc_dir = opendir("/proc");
             if (!proc_dir) {
                 output = "🖥️ [SystemSensory] Failed to open /proc directory.";
@@ -301,6 +329,63 @@ public:
             ss << "   [Total processes enumerated: " << procs.size() << "]\n";
             output = ss.str();
             return true;
+#elif defined(__APPLE__)
+            int bytes_needed = proc_listpids(PROC_ALL_PIDS, 0, nullptr, 0);
+            if (bytes_needed <= 0) {
+                output = "🖥️ [SystemSensory] Failed to enumerate macOS processes.";
+                return true;
+            }
+
+            int count_pids = bytes_needed / (int)sizeof(pid_t);
+            std::vector<pid_t> pids(count_pids);
+            int bytes_read = proc_listpids(PROC_ALL_PIDS, 0, pids.data(), bytes_needed);
+            int actual_pids = bytes_read / (int)sizeof(pid_t);
+
+            struct ProcessInfo {
+                pid_t pid;
+                std::string name;
+                int threads;
+            };
+            std::vector<ProcessInfo> procs;
+
+            for (int i = 0; i < actual_pids; ++i) {
+                pid_t pid = pids[i];
+                if (pid <= 0) continue;
+
+                char name_buf[256] = {0};
+                int nlen = proc_name(pid, name_buf, sizeof(name_buf));
+                std::string pname = (nlen > 0) ? name_buf : "[system]";
+
+                struct proc_taskinfo ti;
+                int ti_res = proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &ti, sizeof(ti));
+                int threads = (ti_res > 0) ? ti.pti_threadnum : 1;
+
+                procs.push_back({pid, pname, threads});
+            }
+
+            std::sort(procs.begin(), procs.end(), [](const ProcessInfo& a, const ProcessInfo& b) {
+                return a.pid < b.pid;
+            });
+
+            std::ostringstream ss;
+            ss << "🖥️ Active macOS / Darwin Processes (Top Active Snapshot):\n";
+            ss << "   PID     | Threads | Process Name\n";
+            ss << "   --------+---------+----------------------------\n";
+            int count = 0;
+            for (const auto& p : procs) {
+                if (count++ < 35) {
+                    char line[128];
+                    snprintf(line, sizeof(line), "   %-7d | %-7d | %s\n", p.pid, p.threads, p.name.c_str());
+                    ss << line;
+                }
+            }
+            ss << "   [Total processes enumerated: " << procs.size() << "]\n";
+            output = ss.str();
+            return true;
+#else
+            output = "🖥️ [SystemSensory] Process listing not supported on this POSIX variant.";
+            return true;
+#endif
         }
 
         if (action == "volume_info" || action == "disk_usage") {
@@ -342,6 +427,26 @@ public:
                 }
                 endmntent(mounts);
             }
+#elif defined(__APPLE__)
+            struct statfs* mntbuf = nullptr;
+            int n_mounts = getmntinfo(&mntbuf, MNT_WAIT);
+            if (n_mounts > 0 && mntbuf) {
+                for (int i = 0; i < n_mounts; ++i) {
+                    std::string fstype = mntbuf[i].f_fstypename;
+                    std::string dir = mntbuf[i].f_mntonname;
+                    std::string dev = mntbuf[i].f_mntfromname;
+
+                    if (fstype == "devfs" || fstype == "autofs") continue;
+
+                    double total_gb = (double)(mntbuf[i].f_blocks * mntbuf[i].f_bsize) / (1024.0 * 1024.0 * 1024.0);
+                    double free_gb = (double)(mntbuf[i].f_bavail * mntbuf[i].f_bsize) / (1024.0 * 1024.0 * 1024.0);
+                    char line[256];
+                    snprintf(line, sizeof(line), "   %-20s | %-11s | %8.1f GB | %7.1f GB | %s\n",
+                             dir.c_str(), fstype.c_str(), total_gb, free_gb, dev.c_str());
+                    ss << line;
+                    found_any = true;
+                }
+            }
 #endif
             if (!found_any) {
                 struct statvfs sv;
@@ -361,8 +466,61 @@ public:
         if (action == "hardware_vitals") {
             unsigned int threads = std::thread::hardware_concurrency();
             std::ostringstream ss;
+#if defined(__APPLE__)
+            ss << "⚡ Sovereign Hardware Vitals (macOS / Apple Silicon):\n";
+            char brand[256] = {0};
+            size_t b_len = sizeof(brand);
+            if (sysctlbyname("machdep.cpu.brand_string", brand, &b_len, nullptr, 0) == 0 && brand[0] != '\0') {
+                ss << "   • Processor: " << brand << "\n";
+            } else {
+                ss << "   • Architecture: Apple Silicon ARM64 / MLX Unified Memory\n";
+            }
+
+            struct timeval boottime;
+            size_t bt_len = sizeof(boottime);
+            if (sysctlbyname("kern.boottime", &boottime, &bt_len, nullptr, 0) == 0) {
+                time_t bsec = boottime.tv_sec;
+                time_t csec = std::time(nullptr);
+                long uptime_sec = (long)(csec - bsec);
+                long uptime_hrs = uptime_sec / 3600;
+                long uptime_min = (uptime_sec % 3600) / 60;
+                ss << "   • System Uptime: " << uptime_hrs << " hours, " << uptime_min << " minutes\n";
+            }
+
+            double loads[3] = {0.0, 0.0, 0.0};
+            if (getloadavg(loads, 3) != -1) {
+                char load_buf[128];
+                snprintf(load_buf, sizeof(load_buf), "   • Load Average: %.2f, %.2f, %.2f (1m, 5m, 15m)\n", loads[0], loads[1], loads[2]);
+                ss << load_buf;
+            }
+
+            int64_t total_ram = 0;
+            size_t mlen = sizeof(total_ram);
+            sysctlbyname("hw.memsize", &total_ram, &mlen, nullptr, 0);
+
+            mach_port_t host_port = mach_host_self();
+            mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+            vm_statistics64_data_t vm_stat;
+            vm_size_t page_size = 4096;
+            host_page_size(host_port, &page_size);
+
+            int mem_load = 0;
+            int64_t free_mem = 0;
+            if (host_statistics64(host_port, HOST_VM_INFO64, (host_info64_t)&vm_stat, &count) == KERN_SUCCESS && total_ram > 0) {
+                free_mem = ((int64_t)vm_stat.free_count + (int64_t)vm_stat.inactive_count) * (int64_t)page_size;
+                if (total_ram > free_mem) {
+                    mem_load = (int)(100.0 * (1.0 - (double)free_mem / (double)total_ram));
+                }
+            }
+
+            ss << "   • Hardware Concurrency: " << threads << " logical threads\n"
+               << "   • Unified Memory Load: " << mem_load << "%\n"
+               << "   • Unified RAM: " << (total_ram / (1024*1024*1024)) << " GB Total ("
+               << (free_mem / (1024*1024*1024)) << " GB Available)\n";
+            output = ss.str();
+            return true;
+#elif defined(__linux__) || defined(__ANDROID__)
             ss << "⚡ Sovereign Hardware Vitals (Linux / POSIX):\n";
-#if defined(__linux__) || defined(__ANDROID__)
             struct utsname un;
             if (uname(&un) == 0) {
                 ss << "   • OS Kernel: " << un.sysname << " " << un.release << " (" << un.machine << ")\n";
@@ -431,6 +589,22 @@ public:
             ss << "   • RAM Usage: " << mem_load << "% (" 
                << (free_ram_mb / 1024) << " GB free of "
                << (total_ram_mb / 1024) << " GB total)\n";
+        }
+#elif defined(__APPLE__)
+        int64_t total_ram = 0;
+        size_t mlen = sizeof(total_ram);
+        sysctlbyname("hw.memsize", &total_ram, &mlen, nullptr, 0);
+        mach_port_t host_port = mach_host_self();
+        mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+        vm_statistics64_data_t vm_stat;
+        vm_size_t page_size = 4096;
+        host_page_size(host_port, &page_size);
+        if (host_statistics64(host_port, HOST_VM_INFO64, (host_info64_t)&vm_stat, &count) == KERN_SUCCESS && total_ram > 0) {
+            int64_t free_mem = ((int64_t)vm_stat.free_count + (int64_t)vm_stat.inactive_count) * (int64_t)page_size;
+            int mem_load = (int)(100.0 * (1.0 - (double)free_mem / (double)total_ram));
+            ss << "   • Unified RAM Usage: " << mem_load << "% (" 
+               << (free_mem / (1024*1024*1024)) << " GB available of "
+               << (total_ram / (1024*1024*1024)) << " GB total)\n";
         }
 #endif
 #endif
