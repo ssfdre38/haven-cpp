@@ -1,4 +1,5 @@
 #include "haven/haven_plugin_manager.h"
+#include "haven/haven_mcp.h"
 #include <iostream>
 #include <vector>
 #include <chrono>
@@ -524,6 +525,11 @@ bool PluginManager::dispatch_tool_execution(const std::string& action, const std
         }
     }
 
+    // 5. Check connected Model Context Protocol (MCP) servers
+    if (mcp_manager_ && mcp_manager_->can_handle_tool(action)) {
+        return mcp_manager_->dispatch_tool(action, payload, output);
+    }
+
     return false;
 }
 
@@ -568,6 +574,11 @@ std::string PluginManager::get_tools_prompt_description() const {
          "<|tool_call|> volume_info <|tool_call|>\n"
          "Example:\n"
          "<|tool_call|> run_command git status <|tool_call|>\n";
+
+    if (mcp_manager_) {
+        s += mcp_manager_->get_tools_prompt_description();
+    }
+
     return s;
 }
 

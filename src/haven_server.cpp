@@ -1740,6 +1740,37 @@ private:
                              + std::to_string(json.length()) + "\r\n\r\n" + json;
             send(sock, resp.c_str(), (int)resp.length(), 0);
         }
+        else if (path == "/api/mcp/servers") {
+            std::string json = haven_engine_.get_mcp_manager().get_servers_json();
+            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
+                             + std::to_string(json.length()) + "\r\n\r\n" + json;
+            send(sock, resp.c_str(), (int)resp.length(), 0);
+        }
+        else if (path == "/api/mcp/tools") {
+            std::string json = haven_engine_.get_mcp_manager().get_tools_json();
+            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
+                             + std::to_string(json.length()) + "\r\n\r\n" + json;
+            send(sock, resp.c_str(), (int)resp.length(), 0);
+        }
+        else if (path == "/api/mcp/call") {
+            std::string action = extract_json_string(request, "action");
+            if (action.empty()) action = extract_json_string(request, "tool");
+            std::string payload = extract_json_string(request, "payload");
+            if (payload.empty()) payload = extract_json_string(request, "arguments");
+            std::string output;
+            bool ok = haven_engine_.get_mcp_manager().dispatch_tool(action, payload, output);
+            std::string json = "{\"ok\":" + std::string(ok ? "true" : "false") + ",\"action\":\"" + escape_json_string(action) + "\",\"output\":\"" + escape_json_string(output) + "\"}";
+            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
+                             + std::to_string(json.length()) + "\r\n\r\n" + json;
+            send(sock, resp.c_str(), (int)resp.length(), 0);
+        }
+        else if (path == "/api/mcp/reload") {
+            haven_engine_.get_mcp_manager().reload_all();
+            std::string json = "{\"ok\":true,\"servers_count\":" + std::to_string(haven_engine_.get_mcp_manager().get_active_server_count()) + ",\"tools_count\":" + std::to_string(haven_engine_.get_mcp_manager().get_tool_count()) + "}";
+            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
+                             + std::to_string(json.length()) + "\r\n\r\n" + json;
+            send(sock, resp.c_str(), (int)resp.length(), 0);
+        }
         else if (path == "/api/settings") {
             if (method == "POST") {
                 // Update sampler parameters

@@ -40,6 +40,7 @@ set(HAVEN_CORE_SRCS
     src/haven_topology.cpp
     src/haven_pathways.cpp
     src/haven_mlx.cpp
+    src/haven_mcp.cpp
 )
 
 # Shared Library (haven_engine.dll / libhaven.so) for C# Gemmi & Android JNI

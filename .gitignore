@@ -32,6 +32,8 @@ memories.json
 wwwroot/memories.json
 models_config.json
 wwwroot/models_config.json
+mcp_servers.json
+wwwroot/mcp_servers.json
 wwwroot/*.hmb
 
 # User Generated Media & Uploads (Preserved Locally)

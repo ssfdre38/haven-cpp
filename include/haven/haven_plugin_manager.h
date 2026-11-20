@@ -15,6 +15,8 @@
 
 namespace haven {
 
+class McpManager;
+
 struct LoadedPluginRecord {
     std::string filepath;
     PluginMetadata metadata;
@@ -78,6 +80,8 @@ public:
     void dispatch_sensory_tick(std::vector<float>& vision_emb, std::vector<float>& audio_emb);
 
     void set_execution_context(PluginExecutionContext* ctx) { execution_ctx_ = ctx; }
+    void set_mcp_manager(McpManager* mcp) { mcp_manager_ = mcp; }
+    McpManager* get_mcp_manager() const { return mcp_manager_; }
 
 private:
     bool probe_plugin_metadata(const std::string& filepath, PluginMetadata& out_meta, std::vector<std::string>& out_actions);
@@ -85,6 +89,7 @@ private:
     std::unordered_map<std::string, LoadedPluginRecord> plugins_;
     std::string plugins_dir_ = "plugins";
     PluginExecutionContext* execution_ctx_ = nullptr;
+    McpManager* mcp_manager_ = nullptr;
     bool lazy_load_enabled_ = true;
 };
 

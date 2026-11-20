@@ -1940,17 +1940,29 @@
         // Plugins & Tools Modal
         async function openPluginsModal() {
             const container = document.getElementById('plugins-list-container');
-            container.innerHTML = '<div style="text-align:center; padding: 20px; color: var(--text-dim);">Loading plugin catalog...</div>';
+            container.innerHTML = '<div style="text-align:center; padding: 20px; color: var(--text-dim);">Loading sovereign tools & MCP catalog...</div>';
             document.getElementById('plugins-modal').style.display = 'flex';
 
             try {
-                const res = await fetch('/api/plugins');
-                if (res.ok) {
-                    const data = await res.json();
+                const [pluginRes, mcpSrvRes, mcpToolsRes] = await Promise.all([
+                    fetch('/api/plugins'),
+                    fetch('/api/mcp/servers').catch(() => null),
+                    fetch('/api/mcp/tools').catch(() => null)
+                ]);
+
+                let pluginsHtml = '';
+                let mcpHtml = '';
+                let totalTools = 0;
+
+                if (pluginRes && pluginRes.ok) {
+                    const data = await pluginRes.json();
                     if (data.plugins && Array.isArray(data.plugins)) {
-                        document.getElementById('nav-plugins-count').innerText = `${data.plugins.length} Tools`;
-                        container.innerHTML = `
-                            <div class="plugin-grid">
+                        totalTools += data.plugins.length;
+                        pluginsHtml = `
+                            <div style="font-size:12px; font-weight:700; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:10px; display:flex; align-items:center; gap:6px;">
+                                <span>⚡ Native C-ABI Plugins (${data.plugins.length})</span>
+                            </div>
+                            <div class="plugin-grid" style="margin-bottom:24px;">
                                 ${data.plugins.map(p => `
                                     <div class="plugin-card">
                                         <div class="plugin-header-row">
@@ -1964,9 +1976,68 @@
                         `;
                     }
                 }
+
+                if (mcpToolsRes && mcpToolsRes.ok) {
+                    const mcpTools = await mcpToolsRes.json();
+                    const mcpServers = (mcpSrvRes && mcpSrvRes.ok) ? await mcpSrvRes.json() : [];
+
+                    if (Array.isArray(mcpTools) && mcpTools.length > 0) {
+                        totalTools += mcpTools.length;
+                        mcpHtml = `
+                            <div style="font-size:12px; font-weight:700; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:10px; display:flex; align-items:center; justify-content:space-between;">
+                                <span>🔌 Connected Model Context Protocol (MCP) Tools (${mcpTools.length})</span>
+                                <button class="btn-secondary" style="padding:2px 8px; font-size:11px;" onclick="reloadMcpServers()">🔄 Reconnect MCP</button>
+                            </div>
+                            <div class="plugin-grid">
+                                ${mcpTools.map(t => `
+                                    <div class="plugin-card" style="border-color:rgba(16,185,129,0.25);">
+                                        <div class="plugin-header-row">
+                                            <span class="plugin-name" style="color:#10b981;">${escapeHtml(t.action)}</span>
+                                            <span style="font-size:10px; font-family:var(--font-mono); color:#10b981; background:rgba(16,185,129,0.12); padding:1px 5px; border-radius:4px;">MCP : ${escapeHtml(t.server)}</span>
+                                        </div>
+                                        <div class="plugin-desc">${escapeHtml(t.description || 'Model Context Protocol external action')}</div>
+                                    </div>
+                                `).join('')}
+                            </div>
+                        `;
+                    } else if (Array.isArray(mcpServers) && mcpServers.length > 0) {
+                        mcpHtml = `
+                            <div style="font-size:12px; font-weight:700; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:10px; display:flex; align-items:center; justify-content:space-between;">
+                                <span>🔌 Model Context Protocol (MCP) Servers (${mcpServers.length})</span>
+                                <button class="btn-secondary" style="padding:2px 8px; font-size:11px;" onclick="reloadMcpServers()">🔄 Reconnect MCP</button>
+                            </div>
+                            <div class="plugin-grid">
+                                ${mcpServers.map(s => `
+                                    <div class="plugin-card">
+                                        <div class="plugin-header-row">
+                                            <span class="plugin-name">${escapeHtml(s.name)}</span>
+                                            <span style="font-size:10px; font-family:var(--font-mono); color:${s.status === 'CONNECTED' ? '#10b981' : '#f59e0b'}; background:rgba(255,255,255,0.05); padding:1px 5px; border-radius:4px;">${escapeHtml(s.status)}</span>
+                                        </div>
+                                        <div class="plugin-desc">Command: <code>${escapeHtml(s.command)}</code> | ${s.tools_count} tools registered</div>
+                                    </div>
+                                `).join('')}
+                            </div>
+                        `;
+                    }
+                }
+
+                if (totalTools > 0) {
+                    document.getElementById('nav-plugins-count').innerText = `${totalTools} Tools`;
+                }
+                container.innerHTML = (pluginsHtml || '<div style="color:var(--text-dim); padding:10px;">No native plugins discovered.</div>') + (mcpHtml || '');
+
             } catch (e) {
-                container.innerHTML = '<div style="text-align:center; padding: 20px; color: #ef4444;">Failed to load plugins.</div>';
+                container.innerHTML = '<div style="text-align:center; padding: 20px; color: #ef4444;">Failed to load plugins or MCP tools.</div>';
             }
+        }
+
+        async function reloadMcpServers() {
+            try {
+                const res = await fetch('/api/mcp/reload', { method: 'POST' });
+                if (res.ok) {
+                    openPluginsModal();
+                }
+            } catch (e) {}
         }
 
         function closePluginsModal() {

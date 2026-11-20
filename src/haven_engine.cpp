@@ -27,6 +27,9 @@ HavenEngine::HavenEngine()
     topology_->detect_topology();
     pathways_ = std::make_shared<PathwaysEngine>(topology_);
     pathways_->start();
+
+    // Link Model Context Protocol (MCP) Subsystem to Plugin Manager
+    plugin_manager_.set_mcp_manager(&mcp_manager_);
 }
 
 HavenEngine::~HavenEngine() {

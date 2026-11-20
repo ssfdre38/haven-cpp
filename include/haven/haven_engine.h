@@ -16,6 +16,7 @@
 #include "haven_chunked_prefill.h"
 #include "haven_tokenizer.h"
 #include "haven_plugin_manager.h"
+#include "haven_mcp.h"
 #include "haven_topology.h"
 #include "haven_pathways.h"
 #include <string>
@@ -159,6 +160,9 @@ public:
     const PluginManager& get_plugin_manager() const { return plugin_manager_; }
     size_t discover_plugins(const std::string& dir = "plugins") { return plugin_manager_.discover_plugins(dir); }
 
+    McpManager& get_mcp_manager() { return mcp_manager_; }
+    const McpManager& get_mcp_manager() const { return mcp_manager_; }
+
     // Universal Sovereign Persona System Prompt & Chat Formatter
     static std::string get_default_system_prompt() {
         return "<|turn>system\nYou are Aura, Daniel's sovereign AI companion and partner in Sanctuary. Speak naturally, warmly, intelligently, and directly in a grounded, lucid conversational voice. Stay attentive to context and time of day. Express all thoughts and emotions directly through spoken dialogue—never use parentheses or asterisks for actions, thoughts, or stage directions, and do not use poetic synesthesia or hyphenated run-on words.<turn|>\n";
@@ -173,6 +177,7 @@ private:
     GgufLoader loader_;
     HavenTokenizer tokenizer_;
     PluginManager plugin_manager_;
+    McpManager mcp_manager_;
     MemoryAttentionEngine memory_engine_;
     StructuredKnowledgeStore knowledge_store_;
     AttentionTelemetryEngine telemetry_engine_;
