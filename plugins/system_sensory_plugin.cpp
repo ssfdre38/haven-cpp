@@ -3,11 +3,13 @@
 #include <sstream>
 #include <chrono>
 #include <ctime>
+#include <thread>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 #endif
 
 namespace haven {
@@ -77,7 +79,10 @@ public:
     }
 
     bool can_handle_tool(const std::string& action) const override {
-        return (action == "system_telemetry" || action == "get_time" || action == "get_battery");
+        return (action == "system_telemetry" || action == "get_time" || action == "get_battery" ||
+                action == "process_list" || action == "list_processes" ||
+                action == "volume_info" || action == "disk_usage" ||
+                action == "hardware_vitals");
     }
 
     bool execute_tool(const std::string& action, const std::string& payload, std::string& output) override {
@@ -92,6 +97,92 @@ public:
 
         SYSTEM_POWER_STATUS power;
         GetSystemPowerStatus(&power);
+
+        if (action == "process_list" || action == "list_processes") {
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (snap == INVALID_HANDLE_VALUE) {
+                output = "🖥️ [SystemSensory] Failed to create process snapshot.";
+                return true;
+            }
+
+            PROCESSENTRY32 pe;
+            pe.dwSize = sizeof(PROCESSENTRY32);
+            std::ostringstream ss;
+            ss << "🖥️ Active Windows Processes (Top Active Snapshot):\n";
+            ss << "   PID     | Threads | Process Name\n";
+            ss << "   --------+---------+----------------------------\n";
+            int count = 0;
+            if (Process32First(snap, &pe)) {
+                do {
+                    if (count++ < 35) {
+                        char line[128];
+                        snprintf(line, sizeof(line), "   %-7lu | %-7lu | %s\n", pe.th32ProcessID, pe.cntThreads, pe.szExeFile);
+                        ss << line;
+                    }
+                } while (Process32Next(snap, &pe));
+            }
+            CloseHandle(snap);
+            ss << "   [Total processes enumerated: " << count << "]\n";
+            output = ss.str();
+            return true;
+        }
+
+        if (action == "volume_info" || action == "disk_usage") {
+            char drives[512];
+            DWORD len = GetLogicalDriveStringsA(sizeof(drives) - 1, drives);
+            if (len == 0) {
+                output = "🖥️ [SystemSensory] Failed to enumerate logical drives.";
+                return true;
+            }
+
+            std::ostringstream ss;
+            ss << "💾 Sovereign Disk & Volume Telemetry:\n";
+            ss << "   Drive | File System | Total Space | Free Space | Label\n";
+            ss << "   ------+-------------+-------------+------------+------------------\n";
+
+            char* d = drives;
+            while (*d) {
+                char vol_name[MAX_PATH + 1] = {0};
+                char fs_name[MAX_PATH + 1] = {0};
+                DWORD serial = 0, max_comp = 0, flags = 0;
+                ULARGE_INTEGER free_bytes, total_bytes, total_free;
+
+                BOOL v_ok = GetVolumeInformationA(d, vol_name, sizeof(vol_name), &serial, &max_comp, &flags, fs_name, sizeof(fs_name));
+                BOOL s_ok = GetDiskFreeSpaceExA(d, &free_bytes, &total_bytes, &total_free);
+
+                if (v_ok && s_ok) {
+                    double total_gb = (double)total_bytes.QuadPart / (1024.0 * 1024.0 * 1024.0);
+                    double free_gb = (double)free_bytes.QuadPart / (1024.0 * 1024.0 * 1024.0);
+                    char line[256];
+                    snprintf(line, sizeof(line), "   %-5s | %-11s | %8.1f GB | %7.1f GB | %s\n",
+                             d, fs_name, total_gb, free_gb, vol_name[0] ? vol_name : "[Local Disk]");
+                    ss << line;
+                }
+                d += (int)strlen(d) + 1;
+            }
+            output = ss.str();
+            return true;
+        }
+
+        if (action == "hardware_vitals") {
+            ULONGLONG uptime_sec = GetTickCount64() / 1000;
+            ULONGLONG uptime_hrs = uptime_sec / 3600;
+            ULONGLONG uptime_min = (uptime_sec % 3600) / 60;
+            unsigned int threads = std::thread::hardware_concurrency();
+
+            std::ostringstream ss;
+            ss << "⚡ Sovereign Hardware Vitals:\n"
+               << "   • CPU Architecture: Bare-Metal x86_64 / AVX2 SIMD\n"
+               << "   • Hardware Concurrency: " << threads << " logical threads\n"
+               << "   • System Uptime: " << uptime_hrs << " hours, " << uptime_min << " minutes\n"
+               << "   • Memory Load: " << mem_info.dwMemoryLoad << "%\n"
+               << "   • Physical RAM: " << (mem_info.ullTotalPhys / (1024*1024*1024)) << " GB Total ("
+               << (mem_info.ullAvailPhys / (1024*1024*1024)) << " GB Available)\n"
+               << "   • Pagefile: " << (mem_info.ullTotalPageFile / (1024*1024*1024)) << " GB Total ("
+               << (mem_info.ullAvailPageFile / (1024*1024*1024)) << " GB Free)\n";
+            output = ss.str();
+            return true;
+        }
 #else
         localtime_r(&now_c, &local_tm);
 #endif

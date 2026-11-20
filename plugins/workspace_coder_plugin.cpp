@@ -9,6 +9,37 @@
 
 namespace haven {
 
+static std::string extract_json_field(const std::string& json, const std::string& field) {
+    std::string key = "\"" + field + "\":";
+    size_t pos = json.find(key);
+    if (pos == std::string::npos) return "";
+    pos += key.length();
+    while (pos < json.length() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\r' || json[pos] == '\n')) pos++;
+    if (pos >= json.length()) return "";
+    if (json[pos] == '"') {
+        pos++;
+        std::string res;
+        while (pos < json.length()) {
+            if (json[pos] == '\\' && pos + 1 < json.length()) {
+                char next = json[pos + 1];
+                if (next == 'n') res += '\n';
+                else if (next == 'r') res += '\r';
+                else if (next == 't') res += '\t';
+                else if (next == '"') res += '"';
+                else if (next == '\\') res += '\\';
+                else { res += '\\'; res += next; }
+                pos += 2;
+            } else if (json[pos] == '"') {
+                break;
+            } else {
+                res += json[pos++];
+            }
+        }
+        return res;
+    }
+    return "";
+}
+
 class WorkspaceCoderPlugin : public IHavenPlugin {
 public:
     PluginMetadata get_metadata() const override {
@@ -35,6 +66,11 @@ public:
     bool can_handle_tool(const std::string& action) const override {
         return (action == "read_file" ||
                 action == "read_code" ||
+                action == "write_file" ||
+                action == "edit_file" ||
+                action == "patch_file" ||
+                action == "create_directory" ||
+                action == "delete_file" ||
                 action == "list_directory" ||
                 action == "list_files" ||
                 action == "search_code" ||
@@ -80,6 +116,150 @@ public:
                 return true;
             } catch (const std::exception& e) {
                 output = "📁 [WorkspaceCoder] Error reading file: " + std::string(e.what());
+                return true;
+            }
+        }
+
+        if (action == "write_file") {
+            std::string path_str = extract_json_field(payload, "path");
+            std::string content = extract_json_field(payload, "content");
+
+            // If not JSON, split by first newline: <filepath>\n<content>
+            if (path_str.empty()) {
+                size_t nl = payload.find('\n');
+                if (nl != std::string::npos) {
+                    path_str = payload.substr(0, nl);
+                    content = payload.substr(nl + 1);
+                } else {
+                    path_str = payload;
+                    content = "";
+                }
+            }
+
+            // Trim quotes or spaces from path
+            while (!path_str.empty() && (path_str.front() == ' ' || path_str.front() == '"' || path_str.front() == '\'')) path_str.erase(0, 1);
+            while (!path_str.empty() && (path_str.back() == ' ' || path_str.back() == '\r' || path_str.back() == '"' || path_str.back() == '\'')) path_str.pop_back();
+
+            if (path_str.empty()) {
+                output = "📁 [WorkspaceCoder] write_file requires a valid target file path.";
+                return true;
+            }
+
+            try {
+                std::filesystem::path p(path_str);
+                if (p.has_parent_path()) {
+                    std::filesystem::create_directories(p.parent_path());
+                }
+
+                std::ofstream ofs(path_str, std::ios::binary | std::ios::trunc);
+                if (!ofs.is_open()) {
+                    output = "📁 [WorkspaceCoder] Failed to open file for writing: " + path_str;
+                    return true;
+                }
+
+                ofs.write(content.data(), content.size());
+                ofs.close();
+
+                output = "📁 [WorkspaceCoder] ✓ Successfully wrote " + std::to_string(content.size()) + " bytes to: " + path_str;
+                return true;
+            } catch (const std::exception& e) {
+                output = "📁 [WorkspaceCoder] Write error: " + std::string(e.what());
+                return true;
+            }
+        }
+
+        if (action == "edit_file" || action == "patch_file") {
+            std::string path_str = extract_json_field(payload, "path");
+            std::string target = extract_json_field(payload, "target");
+            std::string replacement = extract_json_field(payload, "replacement");
+
+            // Delimited fallback: <path>\n---TARGET---\n<target>\n---REPLACEMENT---\n<replacement>
+            if (path_str.empty()) {
+                size_t t_pos = payload.find("---TARGET---");
+                size_t r_pos = payload.find("---REPLACEMENT---");
+                if (t_pos != std::string::npos && r_pos != std::string::npos && r_pos > t_pos) {
+                    path_str = payload.substr(0, t_pos);
+                    target = payload.substr(t_pos + 12, r_pos - (t_pos + 12));
+                    replacement = payload.substr(r_pos + 17);
+                    if (!target.empty() && target.front() == '\n') target.erase(0, 1);
+                    if (!replacement.empty() && replacement.front() == '\n') replacement.erase(0, 1);
+                }
+            }
+
+            while (!path_str.empty() && (path_str.front() == ' ' || path_str.front() == '\n' || path_str.front() == '"' || path_str.front() == '\'')) path_str.erase(0, 1);
+            while (!path_str.empty() && (path_str.back() == ' ' || path_str.back() == '\r' || path_str.back() == '\n' || path_str.back() == '"' || path_str.back() == '\'')) path_str.pop_back();
+
+            if (path_str.empty() || !std::filesystem::exists(path_str)) {
+                output = "📁 [WorkspaceCoder] Target file not found for patch: " + path_str;
+                return true;
+            }
+
+            try {
+                std::ifstream ifs(path_str, std::ios::binary);
+                std::string file_content((std::istreambuf_iterator<char>(ifs)), (std::istreambuf_iterator<char>()));
+                ifs.close();
+
+                size_t match_pos = file_content.find(target);
+                if (match_pos == std::string::npos) {
+                    output = "📁 [WorkspaceCoder] Error: Target text block not found in file: " + path_str;
+                    return true;
+                }
+
+                file_content.replace(match_pos, target.length(), replacement);
+
+                std::ofstream ofs(path_str, std::ios::binary | std::ios::trunc);
+                ofs.write(file_content.data(), file_content.size());
+                ofs.close();
+
+                output = "📁 [WorkspaceCoder] ✓ Successfully patched target in: " + path_str;
+                return true;
+            } catch (const std::exception& e) {
+                output = "📁 [WorkspaceCoder] Patch error: " + std::string(e.what());
+                return true;
+            }
+        }
+
+        if (action == "create_directory") {
+            std::string dir_path = payload;
+            while (!dir_path.empty() && (dir_path.front() == ' ' || dir_path.front() == '"' || dir_path.front() == '\'')) dir_path.erase(0, 1);
+            while (!dir_path.empty() && (dir_path.back() == ' ' || dir_path.back() == '\r' || dir_path.back() == '"' || dir_path.back() == '\'')) dir_path.pop_back();
+
+            if (dir_path.empty()) {
+                output = "📁 [WorkspaceCoder] Please specify a directory path to create.";
+                return true;
+            }
+
+            try {
+                bool created = std::filesystem::create_directories(dir_path);
+                output = std::string("📁 [WorkspaceCoder] Directory ") + (created ? "created" : "already exists") + ": " + dir_path;
+                return true;
+            } catch (const std::exception& e) {
+                output = "📁 [WorkspaceCoder] Failed to create directory: " + std::string(e.what());
+                return true;
+            }
+        }
+
+        if (action == "delete_file") {
+            std::string path_str = payload;
+            while (!path_str.empty() && (path_str.front() == ' ' || path_str.front() == '"' || path_str.front() == '\'')) path_str.erase(0, 1);
+            while (!path_str.empty() && (path_str.back() == ' ' || path_str.back() == '\r' || path_str.back() == '"' || path_str.back() == '\'')) path_str.pop_back();
+
+            if (path_str.empty() || path_str == "/" || path_str == "\\" || path_str == "C:" || path_str == "C:\\" || path_str.starts_with("C:\\Windows")) {
+                output = "📁 [WorkspaceCoder] Blocked: Deletion of critical system or root paths is prohibited.";
+                return true;
+            }
+
+            if (!std::filesystem::exists(path_str)) {
+                output = "📁 [WorkspaceCoder] Target file does not exist: " + path_str;
+                return true;
+            }
+
+            try {
+                bool ok = std::filesystem::remove(path_str);
+                output = "📁 [WorkspaceCoder] " + std::string(ok ? "✓ Deleted: " : "Failed to delete: ") + path_str;
+                return true;
+            } catch (const std::exception& e) {
+                output = "📁 [WorkspaceCoder] Delete error: " + std::string(e.what());
                 return true;
             }
         }

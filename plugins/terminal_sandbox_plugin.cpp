@@ -60,8 +60,36 @@ public:
             }
 
             std::string cmd = payload;
-            // Append 2>&1 to capture both stdout and stderr
-            std::string full_cmd = cmd + " 2>&1";
+            std::string cwd_prefix = "";
+
+            // Check for [cwd: <path>] header
+            if (cmd.starts_with("[cwd:")) {
+                size_t close_bracket = cmd.find(']');
+                if (close_bracket != std::string::npos) {
+                    std::string cwd_path = cmd.substr(5, close_bracket - 5);
+                    while (!cwd_path.empty() && (cwd_path.front() == ' ' || cwd_path.front() == '"')) cwd_path.erase(0, 1);
+                    while (!cwd_path.empty() && (cwd_path.back() == ' ' || cwd_path.back() == '"')) cwd_path.pop_back();
+                    cmd = cmd.substr(close_bracket + 1);
+                    while (!cmd.empty() && (cmd.front() == ' ' || cmd.front() == '\n' || cmd.front() == '\r')) cmd.erase(0, 1);
+                    if (!cwd_path.empty()) {
+                        cwd_prefix = "cd /d \"" + cwd_path + "\" && ";
+                    }
+                }
+            }
+
+            // Destructive safety guardrail
+            std::string cmd_lower = cmd;
+            for (char& c : cmd_lower) c = (char)tolower(c);
+            if (cmd_lower.find("format ") != std::string::npos ||
+                cmd_lower.find("rmdir /s /q c:\\") != std::string::npos ||
+                cmd_lower.find("del /s /q c:\\") != std::string::npos ||
+                cmd_lower.find("diskpart") != std::string::npos) {
+                output = "🐚 [Terminal] Blocked: Destructive system drive formatting or root wipe commands are disallowed.";
+                return true;
+            }
+
+            auto start_time = std::chrono::high_resolution_clock::now();
+            std::string full_cmd = cwd_prefix + cmd + " 2>&1";
 
             std::array<char, 512> buffer;
             std::string result;
@@ -74,16 +102,18 @@ public:
 
             while (fgets(buffer.data(), (int)buffer.size(), pipe) != nullptr) {
                 result += buffer.data();
-                if (result.length() > 4000) {
-                    result += "\n... [Output truncated at 4000 characters]";
+                if (result.length() > 16000) {
+                    result += "\n... [Output truncated at 16,000 characters for context efficiency]";
                     break;
                 }
             }
 
             int exit_code = PCLOSE(pipe);
+            auto end_time = std::chrono::high_resolution_clock::now();
+            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
             
             std::stringstream ss;
-            ss << "🐚 Terminal Output (`" << cmd << "` | Exit Code " << exit_code << "):\n```\n";
+            ss << "🐚 Terminal Output (`" << cmd << "` | Exit Code " << exit_code << " | " << elapsed_ms << "ms):\n```\n";
             ss << (result.empty() ? "[Command completed with no stdout output]" : result);
             ss << "\n```";
 

@@ -765,8 +765,21 @@ private:
             prompt += "<|turn>model\n";
         }
 
-        if (body.find("\"tools\"") != std::string::npos) {
-            std::string tools_desc = haven_engine_.get_plugin_manager().get_tools_prompt_description();
+        // Autonomous Native System Tools & Persona Prompt Injection
+        std::string tools_desc = haven_engine_.get_plugin_manager().get_tools_prompt_description();
+        bool has_system_turn = (prompt.find("<|turn>system\n") != std::string::npos);
+        if (!has_system_turn) {
+            std::string sys_prompt = haven::HavenEngine::get_default_system_prompt();
+            if (!tools_desc.empty()) {
+                size_t close_t = sys_prompt.rfind("<turn|>");
+                if (close_t != std::string::npos) {
+                    sys_prompt.insert(close_t, "\n" + tools_desc + "\n");
+                } else {
+                    sys_prompt += "\n<|turn>system\n" + tools_desc + "<turn|>\n";
+                }
+            }
+            prompt = sys_prompt + prompt;
+        } else if (!tools_desc.empty()) {
             prompt = "<|turn>system\n" + tools_desc + "<turn|>\n" + prompt;
         }
 
@@ -805,6 +818,9 @@ private:
             context_history.push_back(tokens[i]);
         }
 
+        const int MAX_TOOL_DEPTH = 3;
+        int tool_depth = 0;
+
         if (stream) {
             std::string sse_hdr = "HTTP/1.1 200 OK\r\n"
                                   "Content-Type: text/event-stream\r\n"
@@ -813,92 +829,286 @@ private:
                                   "Access-Control-Allow-Origin: *\r\n\r\n";
             send_all(client_sock, sse_hdr.c_str(), (int)sse_hdr.length());
 
-            for (int gen = 0; gen < max_tokens; ++gen) {
-                uint32_t next_tok = haven_engine_.get_sampler().sample(
-                    logits.data(), haven_engine_.get_config().vocab_size, context_history);
-                context_history.push_back(next_tok);
-                cached_tokens_.push_back(next_tok);
+            while (tool_depth < MAX_TOOL_DEPTH) {
+                std::string phase_output = "";
+                size_t stream_cursor = 0;
+                bool client_disconnected = false;
 
-                // Stop conditions
-                if (next_tok == haven_engine_.get_tokenizer().eos_token() || next_tok == 1 || next_tok == 106 || next_tok == 212) {
-                    break;
+                for (int gen = 0; gen < max_tokens; ++gen) {
+                    uint32_t next_tok = haven_engine_.get_sampler().sample(
+                        logits.data(), haven_engine_.get_config().vocab_size, context_history);
+                    context_history.push_back(next_tok);
+                    cached_tokens_.push_back(next_tok);
+
+                    // Stop conditions
+                    if (next_tok == haven_engine_.get_tokenizer().eos_token() || next_tok == 1 || next_tok == 106 || next_tok == 212) {
+                        break;
+                    }
+
+                    std::string piece = haven_engine_.detokenize(next_tok);
+                    if (piece.find("<turn|>") != std::string::npos || 
+                        piece.find("<end_of_turn>") != std::string::npos || 
+                        piece.find("<eos>") != std::string::npos || 
+                        piece.find("<|turn") != std::string::npos || 
+                        piece.find("<start_of_turn>") != std::string::npos) {
+                        break;
+                    }
+
+                    phase_output += piece;
+                    haven_engine_.forward(next_tok, active_pos++, logits.data());
+
+                    // Check if tool call is starting or in-flight
+                    size_t tc_start = phase_output.find("<|tool_call|>");
+                    size_t tag_len = 13;
+                    if (tc_start == std::string::npos) {
+                        tc_start = phase_output.find("<tool_call>");
+                        tag_len = 11;
+                    }
+                    if (tc_start != std::string::npos) {
+                        size_t act_start = tc_start + tag_len;
+                        size_t tc_end = phase_output.find("<|tool_call|>", act_start);
+                        if (tc_end == std::string::npos) tc_end = phase_output.find("</tool_call>", act_start);
+                        if (tc_end == std::string::npos) tc_end = phase_output.find("<tool_call>", act_start);
+                        if (tc_end != std::string::npos) {
+                            break;
+                        }
+                    } else {
+                        // Stream text before any tool call, buffering when a potential tag starts
+                        std::string unstreamed = phase_output.substr(stream_cursor);
+                        size_t tag_pos = unstreamed.find("<|");
+                        if (tag_pos == std::string::npos) tag_pos = unstreamed.find("<tool_call");
+                        if (tag_pos == std::string::npos) {
+                            if (!unstreamed.empty() && unstreamed.back() != '<') {
+                                std::string esc_text = escape_json_string(unstreamed);
+                                std::string chunk = "data: {\"content\":\"" + esc_text + "\",\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion.chunk\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" + esc_text + "\"},\"finish_reason\":null}]}\n\n";
+                                if (!send_all(client_sock, chunk.c_str(), (int)chunk.length())) {
+                                    client_disconnected = true;
+                                    break;
+                                }
+                                stream_cursor = phase_output.length();
+                            }
+                        } else if (tag_pos > 0) {
+                            std::string safe = unstreamed.substr(0, tag_pos);
+                            std::string esc_text = escape_json_string(safe);
+                            std::string chunk = "data: {\"content\":\"" + esc_text + "\",\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion.chunk\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" + esc_text + "\"},\"finish_reason\":null}]}\n\n";
+                            if (!send_all(client_sock, chunk.c_str(), (int)chunk.length())) {
+                                client_disconnected = true;
+                                break;
+                            }
+                            stream_cursor += tag_pos;
+                        }
+                    }
                 }
 
-                std::string piece = haven_engine_.detokenize(next_tok);
-                if (piece.find("<turn|>") != std::string::npos || 
-                    piece.find("<end_of_turn>") != std::string::npos || 
-                    piece.find("<eos>") != std::string::npos || 
-                    piece.find("<|turn") != std::string::npos || 
-                    piece.find("<start_of_turn>") != std::string::npos) {
-                    break;
+                if (client_disconnected) break;
+
+                // Inspect phase_output for tool calls
+                size_t tc_pos = phase_output.find("<|tool_call|>");
+                size_t tag_len = 13;
+                if (tc_pos == std::string::npos) {
+                    tc_pos = phase_output.find("<tool_call>");
+                    tag_len = 11;
+                }
+                if (tc_pos != std::string::npos) {
+                    size_t act_start = tc_pos + tag_len;
+                    size_t tc_end = phase_output.find("<|tool_call|>", act_start);
+                    if (tc_end == std::string::npos) tc_end = phase_output.find("</tool_call>", act_start);
+                    if (tc_end == std::string::npos) tc_end = phase_output.find("<tool_call>", act_start);
+                    std::string call_str = (tc_end != std::string::npos)
+                        ? phase_output.substr(act_start, tc_end - act_start)
+                        : phase_output.substr(act_start);
+
+                    size_t tt = call_str.find("<turn|>");
+                    if (tt != std::string::npos) call_str = call_str.substr(0, tt);
+                    tt = call_str.find("<end_of_turn>");
+                    if (tt != std::string::npos) call_str = call_str.substr(0, tt);
+                    tt = call_str.find("<eos>");
+                    if (tt != std::string::npos) call_str = call_str.substr(0, tt);
+
+                    size_t f = call_str.find_first_not_of(" \t\r\n");
+                    size_t l = call_str.find_last_not_of(" \t\r\n");
+                    std::string tool_action = "";
+                    std::string tool_payload = "";
+                    if (f != std::string::npos && l != std::string::npos) {
+                        call_str = call_str.substr(f, l - f + 1);
+                        size_t sp = call_str.find(' ');
+                        if (sp != std::string::npos) {
+                            tool_action = call_str.substr(0, sp);
+                            tool_payload = call_str.substr(sp + 1);
+                        } else {
+                            tool_action = call_str;
+                        }
+                    }
+
+                    if (!tool_action.empty()) {
+                        std::string text_before = phase_output.substr(0, tc_pos);
+                        accumulated_response += text_before;
+
+                        // Execute sovereign tool via PluginManager
+                        std::string tool_output;
+                        std::cout << "\n⚡ [Autonomous ReAct] Executing Tool (" << (tool_depth + 1) << "/" << MAX_TOOL_DEPTH << "): " 
+                                  << tool_action << " [" << tool_payload << "]\n";
+                        bool ok = haven_engine_.get_plugin_manager().dispatch_tool_execution(tool_action, tool_payload, tool_output);
+                        if (!ok && tool_output.empty()) {
+                            tool_output = "Tool execution failed or unknown action: " + tool_action;
+                        }
+                        if (tool_output.length() > 4000) {
+                            tool_output = tool_output.substr(0, 4000) + "\n... [truncated for context brevity]";
+                        }
+
+                        // Stream observation card to user
+                        std::string obs_card = "\n\n> ⚡ **Native Action:** `" + tool_action + (!tool_payload.empty() ? (" `" + tool_payload + "`") : "") + "**\n\n```sovereign-tool\n" + tool_output + "\n```\n\n";
+                        accumulated_response += obs_card;
+                        std::string esc_card = escape_json_string(obs_card);
+                        std::string card_chunk = "data: {\"content\":\"" + esc_card + "\",\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion.chunk\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" + esc_card + "\"},\"finish_reason\":null}]}\n\n";
+                        send_all(client_sock, card_chunk.c_str(), (int)card_chunk.length());
+
+                        // Feed tool output back into KV Cache
+                        std::string tool_turn = "<turn|>\n<|turn>tool\n" + tool_output + "<turn|>\n<|turn>model\n";
+                        auto tool_tokens = haven_engine_.tokenize(tool_turn, false);
+                        for (size_t ti = 0; ti < tool_tokens.size(); ++ti) {
+                            bool is_last = (ti + 1 == tool_tokens.size());
+                            haven_engine_.forward(tool_tokens[ti], active_pos++, is_last ? logits.data() : nullptr);
+                            cached_tokens_.push_back(tool_tokens[ti]);
+                            context_history.push_back(tool_tokens[ti]);
+                        }
+
+                        tool_depth++;
+                        continue; // Loop again for companion response!
+                    }
                 }
 
-                accumulated_response += piece;
-                std::string esc_text = escape_json_string(piece);
-                std::string chunk = "data: {\"content\":\"" + esc_text + "\",\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion.chunk\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" + esc_text + "\"},\"finish_reason\":null}]}\n\n";
-                if (!send_all(client_sock, chunk.c_str(), (int)chunk.length())) break;
-
-                haven_engine_.forward(next_tok, active_pos++, logits.data());
+                // If no tool call, flush any remaining unstreamed text
+                if (stream_cursor < phase_output.length()) {
+                    std::string remaining = phase_output.substr(stream_cursor);
+                    std::string esc_text = escape_json_string(remaining);
+                    std::string chunk = "data: {\"content\":\"" + esc_text + "\",\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion.chunk\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" + esc_text + "\"},\"finish_reason\":null}]}\n\n";
+                    send_all(client_sock, chunk.c_str(), (int)chunk.length());
+                }
+                accumulated_response += phase_output;
+                break; // Finished generation
             }
 
             std::string done_chunk = "data: {\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion.chunk\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
             send_all(client_sock, done_chunk.c_str(), (int)done_chunk.length());
         } else {
-            for (int gen = 0; gen < max_tokens; ++gen) {
-                uint32_t next_tok = haven_engine_.get_sampler().sample(
-                    logits.data(), haven_engine_.get_config().vocab_size, context_history);
-                context_history.push_back(next_tok);
-                cached_tokens_.push_back(next_tok);
+            while (tool_depth < MAX_TOOL_DEPTH) {
+                std::string phase_output = "";
+                for (int gen = 0; gen < max_tokens; ++gen) {
+                    uint32_t next_tok = haven_engine_.get_sampler().sample(
+                        logits.data(), haven_engine_.get_config().vocab_size, context_history);
+                    context_history.push_back(next_tok);
+                    cached_tokens_.push_back(next_tok);
 
-                if (next_tok == haven_engine_.get_tokenizer().eos_token() || next_tok == 1 || next_tok == 106 || next_tok == 212) {
-                    break;
+                    if (next_tok == haven_engine_.get_tokenizer().eos_token() || next_tok == 1 || next_tok == 106 || next_tok == 212) {
+                        break;
+                    }
+
+                    std::string piece = haven_engine_.detokenize(next_tok);
+                    if (piece.find("<turn|>") != std::string::npos || 
+                        piece.find("<end_of_turn>") != std::string::npos || 
+                        piece.find("<eos>") != std::string::npos || 
+                        piece.find("<|turn") != std::string::npos || 
+                        piece.find("<start_of_turn>") != std::string::npos) {
+                        break;
+                    }
+
+                    phase_output += piece;
+                    haven_engine_.forward(next_tok, active_pos++, logits.data());
+
+                    size_t tc_start = phase_output.find("<|tool_call|>");
+                    size_t tag_len = 13;
+                    if (tc_start == std::string::npos) {
+                        tc_start = phase_output.find("<tool_call>");
+                        tag_len = 11;
+                    }
+                    if (tc_start != std::string::npos) {
+                        size_t act_start = tc_start + tag_len;
+                        size_t tc_end = phase_output.find("<|tool_call|>", act_start);
+                        if (tc_end == std::string::npos) tc_end = phase_output.find("</tool_call>", act_start);
+                        if (tc_end == std::string::npos) tc_end = phase_output.find("<tool_call>", act_start);
+                        if (tc_end != std::string::npos) {
+                            break;
+                        }
+                    }
                 }
 
-                std::string piece = haven_engine_.detokenize(next_tok);
-                if (piece.find("<turn|>") != std::string::npos || 
-                    piece.find("<end_of_turn>") != std::string::npos || 
-                    piece.find("<eos>") != std::string::npos || 
-                    piece.find("<|turn") != std::string::npos || 
-                    piece.find("<start_of_turn>") != std::string::npos) {
-                    break;
+                // Inspect phase_output for tool calls
+                size_t tc_pos = phase_output.find("<|tool_call|>");
+                size_t tag_len = 13;
+                if (tc_pos == std::string::npos) {
+                    tc_pos = phase_output.find("<tool_call>");
+                    tag_len = 11;
+                }
+                if (tc_pos != std::string::npos) {
+                    size_t act_start = tc_pos + tag_len;
+                    size_t tc_end = phase_output.find("<|tool_call|>", act_start);
+                    if (tc_end == std::string::npos) tc_end = phase_output.find("</tool_call>", act_start);
+                    if (tc_end == std::string::npos) tc_end = phase_output.find("<tool_call>", act_start);
+                    std::string call_str = (tc_end != std::string::npos)
+                        ? phase_output.substr(act_start, tc_end - act_start)
+                        : phase_output.substr(act_start);
+
+                    size_t tt = call_str.find("<turn|>");
+                    if (tt != std::string::npos) call_str = call_str.substr(0, tt);
+                    tt = call_str.find("<end_of_turn>");
+                    if (tt != std::string::npos) call_str = call_str.substr(0, tt);
+                    tt = call_str.find("<eos>");
+                    if (tt != std::string::npos) call_str = call_str.substr(0, tt);
+
+                    size_t f = call_str.find_first_not_of(" \t\r\n");
+                    size_t l = call_str.find_last_not_of(" \t\r\n");
+                    std::string tool_action = "";
+                    std::string tool_payload = "";
+                    if (f != std::string::npos && l != std::string::npos) {
+                        call_str = call_str.substr(f, l - f + 1);
+                        size_t sp = call_str.find(' ');
+                        if (sp != std::string::npos) {
+                            tool_action = call_str.substr(0, sp);
+                            tool_payload = call_str.substr(sp + 1);
+                        } else {
+                            tool_action = call_str;
+                        }
+                    }
+
+                    if (!tool_action.empty()) {
+                        std::string text_before = phase_output.substr(0, tc_pos);
+                        accumulated_response += text_before;
+
+                        std::string tool_output;
+                        std::cout << "\n⚡ [Autonomous ReAct] Executing Tool (" << (tool_depth + 1) << "/" << MAX_TOOL_DEPTH << "): " 
+                                  << tool_action << " [" << tool_payload << "]\n";
+                        bool ok = haven_engine_.get_plugin_manager().dispatch_tool_execution(tool_action, tool_payload, tool_output);
+                        if (!ok && tool_output.empty()) {
+                            tool_output = "Tool execution failed or unknown action: " + tool_action;
+                        }
+                        if (tool_output.length() > 4000) {
+                            tool_output = tool_output.substr(0, 4000) + "\n... [truncated for context brevity]";
+                        }
+
+                        std::string obs_card = "\n\n> ⚡ **Native Action:** `" + tool_action + (!tool_payload.empty() ? (" `" + tool_payload + "`") : "") + "**\n\n```sovereign-tool\n" + tool_output + "\n```\n\n";
+                        accumulated_response += obs_card;
+
+                        std::string tool_turn = "<turn|>\n<|turn>tool\n" + tool_output + "<turn|>\n<|turn>model\n";
+                        auto tool_tokens = haven_engine_.tokenize(tool_turn, false);
+                        for (size_t ti = 0; ti < tool_tokens.size(); ++ti) {
+                            bool is_last = (ti + 1 == tool_tokens.size());
+                            haven_engine_.forward(tool_tokens[ti], active_pos++, is_last ? logits.data() : nullptr);
+                            cached_tokens_.push_back(tool_tokens[ti]);
+                            context_history.push_back(tool_tokens[ti]);
+                        }
+
+                        tool_depth++;
+                        continue;
+                    }
                 }
 
-                accumulated_response += piece;
-                haven_engine_.forward(next_tok, active_pos++, logits.data());
+                accumulated_response += phase_output;
+                break;
             }
 
-            std::string tool_action = "";
-            std::string tool_payload = "";
-            size_t tc_pos = accumulated_response.find("<|tool_call|>");
-            if (tc_pos != std::string::npos) {
-                size_t act_start = tc_pos + 13;
-                size_t tc_end = accumulated_response.find("<|tool_call|>", act_start);
-                std::string call_str = (tc_end != std::string::npos)
-                    ? accumulated_response.substr(act_start, tc_end - act_start)
-                    : accumulated_response.substr(act_start);
-                size_t f = call_str.find_first_not_of(" \t\r\n");
-                size_t l = call_str.find_last_not_of(" \t\r\n");
-                if (f != std::string::npos && l != std::string::npos) call_str = call_str.substr(f, l - f + 1);
-                size_t sp = call_str.find(' ');
-                if (sp != std::string::npos) {
-                    tool_action = call_str.substr(0, sp);
-                    tool_payload = call_str.substr(sp + 1);
-                } else {
-                    tool_action = call_str;
-                }
-            }
-
-            std::string json_resp;
-            if (!tool_action.empty()) {
-                std::string text_before = accumulated_response.substr(0, tc_pos);
-                std::string esc_text = escape_json_string(text_before);
-                std::string esc_action = escape_json_string(tool_action);
-                std::string esc_payload = escape_json_string(tool_payload);
-                json_resp = "{\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":" + (text_before.empty() ? "null" : ("\"" + esc_text + "\"")) + ",\"tool_calls\":[{\"id\":\"call_sovereign_1\",\"type\":\"function\",\"function\":{\"name\":\"" + esc_action + "\",\"arguments\":\"{\\\"payload\\\":\\\"" + esc_payload + "\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(tokens.size()) + ",\"completion_tokens\":" + std::to_string(accumulated_response.length() / 4) + ",\"total_tokens\":" + std::to_string(tokens.size() + accumulated_response.length() / 4) + "}}";
-            } else {
-                std::string esc_content = escape_json_string(accumulated_response);
-                json_resp = "{\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"content\":\"" + esc_content + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" + esc_content + "\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(tokens.size()) + ",\"completion_tokens\":" + std::to_string(accumulated_response.length() / 4) + ",\"total_tokens\":" + std::to_string(tokens.size() + accumulated_response.length() / 4) + "}}";
-            }
+            std::string esc_content = escape_json_string(accumulated_response);
+            std::string json_resp = "{\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"content\":\"" + esc_content + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" + esc_content + "\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(tokens.size()) + ",\"completion_tokens\":" + std::to_string(accumulated_response.length() / 4) + ",\"total_tokens\":" + std::to_string(tokens.size() + accumulated_response.length() / 4) + "}}";
 
             std::string http_resp = "HTTP/1.1 200 OK\r\n"
                                     "Content-Type: application/json; charset=utf-8\r\n"

@@ -543,13 +543,31 @@ size_t PluginManager::reload_all(const std::string& plugins_directory, PluginExe
 
 std::string PluginManager::get_tools_prompt_description() const {
     if (plugins_.empty()) return "";
-    std::string s = "\n[Autonomous Sovereign Capabilities & Active Tools]:\n";
+    std::string s = "\n[Autonomous Sovereign Capabilities & Native Tools]:\n"
+                    "You have direct native system execution and workspace inspection capabilities via C++20 bare-metal plugins.\n"
+                    "Active Sovereign Plugins:\n";
     for (const auto& [id, record] : plugins_) {
         std::string status = record.is_loaded ? "ACTIVE" : "ON-DEMAND";
         s += " • " + record.metadata.name + " [" + status + "]: " + record.metadata.description + "\n";
     }
-    s += "Available tool actions: 'wiki_summary <topic>', 'get_weather <city>', 'yt_music_search <query>', 'yt_music_toggle', 'yt_music_next', 'get_active_window', 'screen_info', 'vault_search <query>', 'diary_write <entry>', 'system_telemetry'.\n";
-    s += "To invoke a tool, write: <|tool_call|> tool_name payload <|tool_call|>\n";
+    s += "\nSupported Native Action Tools:\n"
+         " • run_command <cmd>          : Run local shell, PowerShell, compiler, or diagnostic commands on Windows.\n"
+         " • read_file <path>           : Read source code or text files from the local filesystem.\n"
+         " • write_file <path>\n<content>: Create or overwrite a local project file.\n"
+         " • edit_file {\"path\": \"...\", \"target\": \"...\", \"replacement\": \"...\"} : Replace exact text block in a file.\n"
+         " • list_directory <path>      : List folder contents and file sizes.\n"
+         " • search_code <query>        : Recursive pattern/code search across files.\n"
+         " • process_list               : List active Windows processes and thread counts.\n"
+         " • volume_info                : Inspect storage drives, file systems (NTFS/ReFS/etc.), and free space.\n"
+         " • hardware_vitals            : Bare-metal CPU threads, RAM metrics, and uptime.\n"
+         " • system_telemetry           : Real-time local clock, memory pressure, and AC/battery state.\n"
+         " • clipboard_get              : Inspect current clipboard text.\n"
+         "\nTo invoke a tool to inspect or act on the system, output immediately:\n"
+         "<|tool_call|> tool_name payload <|tool_call|>\n"
+         "Example:\n"
+         "<|tool_call|> volume_info <|tool_call|>\n"
+         "Example:\n"
+         "<|tool_call|> run_command git status <|tool_call|>\n";
     return s;
 }
 
