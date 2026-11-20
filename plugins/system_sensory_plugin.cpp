@@ -4,12 +4,25 @@
 #include <chrono>
 #include <ctime>
 #include <thread>
+#include <vector>
+#include <algorithm>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <psapi.h>
 #include <tlhelp32.h>
+#else
+#include <unistd.h>
+#include <sys/types.h>
+#include <dirent.h>
+#include <fstream>
+#include <sys/statvfs.h>
+#if defined(__linux__) || defined(__ANDROID__)
+#include <sys/sysinfo.h>
+#include <mntent.h>
+#include <sys/utsname.h>
+#endif
 #endif
 
 namespace haven {
@@ -60,9 +73,44 @@ public:
         int battery_life = (int)power.BatteryLifePercent;
         bool on_ac = (power.ACLineStatus == 1);
 #else
-        int mem_percent = 50;
+        int mem_percent = 0;
         int battery_life = 100;
         bool on_ac = true;
+
+#if defined(__linux__) || defined(__ANDROID__)
+        struct sysinfo si;
+        if (sysinfo(&si) == 0 && si.totalram > 0) {
+            unsigned long long total_b = (unsigned long long)si.totalram * si.mem_unit;
+            unsigned long long free_b = (unsigned long long)si.freeram * si.mem_unit;
+            if (total_b > 0) {
+                mem_percent = (int)(100.0 * (1.0 - (double)free_b / (double)total_b));
+            }
+        }
+        // Inspect Linux power supply: /sys/class/power_supply/BAT0 or BAT1
+        std::ifstream bat_cap("/sys/class/power_supply/BAT0/capacity");
+        if (!bat_cap.is_open()) {
+            bat_cap.open("/sys/class/power_supply/BAT1/capacity");
+        }
+        if (bat_cap.is_open()) {
+            bat_cap >> battery_life;
+            std::ifstream bat_status("/sys/class/power_supply/BAT0/status");
+            if (!bat_status.is_open()) bat_status.open("/sys/class/power_supply/BAT1/status");
+            if (bat_status.is_open()) {
+                std::string st;
+                bat_status >> st;
+                on_ac = (st == "Charging" || st == "Full");
+            }
+        } else {
+            // Check AC online
+            std::ifstream ac_online("/sys/class/power_supply/AC/online");
+            if (!ac_online.is_open()) ac_online.open("/sys/class/power_supply/ACAD/online");
+            if (ac_online.is_open()) {
+                int online = 1;
+                ac_online >> online;
+                on_ac = (online == 1);
+            }
+        }
+#endif
 #endif
 
         std::ostringstream ss;
@@ -185,6 +233,179 @@ public:
         }
 #else
         localtime_r(&now_c, &local_tm);
+
+        if (action == "process_list" || action == "list_processes") {
+            DIR* proc_dir = opendir("/proc");
+            if (!proc_dir) {
+                output = "🖥️ [SystemSensory] Failed to open /proc directory.";
+                return true;
+            }
+
+            struct ProcessInfo {
+                pid_t pid;
+                std::string name;
+                int threads;
+            };
+            std::vector<ProcessInfo> procs;
+
+            struct dirent* entry;
+            while ((entry = readdir(proc_dir)) != nullptr) {
+                if (entry->d_name[0] >= '0' && entry->d_name[0] <= '9') {
+                    pid_t pid = (pid_t)std::atoi(entry->d_name);
+                    if (pid <= 0) continue;
+
+                    std::string comm_path = std::string("/proc/") + entry->d_name + "/comm";
+                    std::ifstream comm_file(comm_path);
+                    std::string comm_name = "[unknown]";
+                    if (comm_file.is_open()) {
+                        std::getline(comm_file, comm_name);
+                    }
+
+                    int threads = 1;
+                    std::string status_path = std::string("/proc/") + entry->d_name + "/status";
+                    std::ifstream status_file(status_path);
+                    if (status_file.is_open()) {
+                        std::string line;
+                        while (std::getline(status_file, line)) {
+                            if (line.starts_with("Threads:")) {
+                                size_t pos = line.find_first_of("0123456789");
+                                if (pos != std::string::npos) {
+                                    threads = std::atoi(line.c_str() + pos);
+                                }
+                                break;
+                            }
+                        }
+                    }
+
+                    procs.push_back({pid, comm_name, threads});
+                }
+            }
+            closedir(proc_dir);
+
+            std::sort(procs.begin(), procs.end(), [](const ProcessInfo& a, const ProcessInfo& b) {
+                return a.pid < b.pid;
+            });
+
+            std::ostringstream ss;
+            ss << "🖥️ Active Linux / POSIX Processes (Top Active Snapshot):\n";
+            ss << "   PID     | Threads | Process Name\n";
+            ss << "   --------+---------+----------------------------\n";
+            int count = 0;
+            for (const auto& p : procs) {
+                if (count++ < 35) {
+                    char line[128];
+                    snprintf(line, sizeof(line), "   %-7d | %-7d | %s\n", p.pid, p.threads, p.name.c_str());
+                    ss << line;
+                }
+            }
+            ss << "   [Total processes enumerated: " << procs.size() << "]\n";
+            output = ss.str();
+            return true;
+        }
+
+        if (action == "volume_info" || action == "disk_usage") {
+            std::ostringstream ss;
+            ss << "💾 Sovereign Disk & Volume Telemetry (POSIX / Linux):\n";
+            ss << "   Mount Point          | File System | Total Space | Free Space | Device\n";
+            ss << "   ---------------------+-------------+-------------+------------+------------------\n";
+
+            bool found_any = false;
+#if defined(__linux__) || defined(__ANDROID__)
+            FILE* mounts = setmntent("/proc/mounts", "r");
+            if (!mounts) mounts = setmntent("/etc/mtab", "r");
+            if (mounts) {
+                struct mntent* ent;
+                while ((ent = getmntent(mounts)) != nullptr) {
+                    std::string fs_type = ent->mnt_type ? ent->mnt_type : "";
+                    std::string fs_name = ent->mnt_fsname ? ent->mnt_fsname : "";
+                    std::string dir = ent->mnt_dir ? ent->mnt_dir : "";
+
+                    if (fs_type == "proc" || fs_type == "sysfs" || fs_type == "devpts" || 
+                        fs_type == "cgroup" || fs_type == "cgroup2" || fs_type == "pstore" || 
+                        fs_type == "bpf" || fs_type == "tracefs" || fs_type == "autofs" ||
+                        fs_type == "securityfs" || fs_type == "configfs" || fs_type == "debugfs" ||
+                        fs_type == "fusectl" || fs_type == "hugetlbfs" || fs_type == "mqueue" ||
+                        fs_type == "devtmpfs") {
+                        continue;
+                    }
+
+                    struct statvfs sv;
+                    if (statvfs(ent->mnt_dir, &sv) == 0 && sv.f_blocks > 0) {
+                        double total_gb = (double)(sv.f_blocks * sv.f_frsize) / (1024.0 * 1024.0 * 1024.0);
+                        double free_gb = (double)(sv.f_bavail * sv.f_frsize) / (1024.0 * 1024.0 * 1024.0);
+                        char line[256];
+                        snprintf(line, sizeof(line), "   %-20s | %-11s | %8.1f GB | %7.1f GB | %s\n",
+                                 dir.c_str(), fs_type.c_str(), total_gb, free_gb, fs_name.c_str());
+                        ss << line;
+                        found_any = true;
+                    }
+                }
+                endmntent(mounts);
+            }
+#endif
+            if (!found_any) {
+                struct statvfs sv;
+                if (statvfs("/", &sv) == 0) {
+                    double total_gb = (double)(sv.f_blocks * sv.f_frsize) / (1024.0 * 1024.0 * 1024.0);
+                    double free_gb = (double)(sv.f_bavail * sv.f_frsize) / (1024.0 * 1024.0 * 1024.0);
+                    char line[256];
+                    snprintf(line, sizeof(line), "   %-20s | %-11s | %8.1f GB | %7.1f GB | %s\n",
+                             "/", "posix", total_gb, free_gb, "/dev/root");
+                    ss << line;
+                }
+            }
+            output = ss.str();
+            return true;
+        }
+
+        if (action == "hardware_vitals") {
+            unsigned int threads = std::thread::hardware_concurrency();
+            std::ostringstream ss;
+            ss << "⚡ Sovereign Hardware Vitals (Linux / POSIX):\n";
+#if defined(__linux__) || defined(__ANDROID__)
+            struct utsname un;
+            if (uname(&un) == 0) {
+                ss << "   • OS Kernel: " << un.sysname << " " << un.release << " (" << un.machine << ")\n";
+            } else {
+                ss << "   • OS Platform: POSIX / Linux Bare-Metal\n";
+            }
+
+            struct sysinfo si;
+            if (sysinfo(&si) == 0) {
+                long uptime_sec = si.uptime;
+                long uptime_hrs = uptime_sec / 3600;
+                long uptime_min = (uptime_sec % 3600) / 60;
+
+                double load1 = si.loads[0] / 65536.0;
+                double load5 = si.loads[1] / 65536.0;
+                double load15 = si.loads[2] / 65536.0;
+
+                unsigned long long total_ram_mb = ((unsigned long long)si.totalram * si.mem_unit) / (1024 * 1024);
+                unsigned long long free_ram_mb = ((unsigned long long)si.freeram * si.mem_unit) / (1024 * 1024);
+                unsigned long long total_swap_mb = ((unsigned long long)si.totalswap * si.mem_unit) / (1024 * 1024);
+                unsigned long long free_swap_mb = ((unsigned long long)si.freeswap * si.mem_unit) / (1024 * 1024);
+                int mem_load = total_ram_mb > 0 ? (int)(100.0 * (1.0 - (double)free_ram_mb / (double)total_ram_mb)) : 0;
+
+                char vitals_buf[256];
+                snprintf(vitals_buf, sizeof(vitals_buf), "   • Load Average: %.2f, %.2f, %.2f (1m, 5m, 15m)\n", load1, load5, load15);
+
+                ss << "   • Hardware Concurrency: " << threads << " logical threads\n"
+                   << "   • System Uptime: " << uptime_hrs << " hours, " << uptime_min << " minutes\n"
+                   << vitals_buf
+                   << "   • Memory Load: " << mem_load << "%\n"
+                   << "   • Physical RAM: " << (total_ram_mb / 1024) << " GB Total (" << (free_ram_mb / 1024) << " GB Free)\n"
+                   << "   • Swap Space: " << (total_swap_mb / 1024) << " GB Total (" << (free_swap_mb / 1024) << " GB Free)\n"
+                   << "   • Running Processes: " << si.procs << " active\n";
+            } else {
+                ss << "   • Hardware Concurrency: " << threads << " logical threads\n";
+            }
+#else
+            ss << "   • Hardware Concurrency: " << threads << " logical threads\n"
+               << "   • OS Architecture: POSIX Sovereign Environment\n";
+#endif
+            output = ss.str();
+            return true;
+        }
 #endif
         char time_buf[64];
         std::strftime(time_buf, sizeof(time_buf), "%I:%M %p (%Z)", &local_tm);
@@ -200,6 +421,18 @@ public:
             ss << "   • Battery: " << (int)power.BatteryLifePercent << "% ("
                << (power.ACLineStatus == 1 ? "Charging" : "Discharging") << ")\n";
         }
+#else
+#if defined(__linux__) || defined(__ANDROID__)
+        struct sysinfo si;
+        if (sysinfo(&si) == 0 && si.totalram > 0) {
+            unsigned long long total_ram_mb = ((unsigned long long)si.totalram * si.mem_unit) / (1024 * 1024);
+            unsigned long long free_ram_mb = ((unsigned long long)si.freeram * si.mem_unit) / (1024 * 1024);
+            int mem_load = total_ram_mb > 0 ? (int)(100.0 * (1.0 - (double)free_ram_mb / (double)total_ram_mb)) : 0;
+            ss << "   • RAM Usage: " << mem_load << "% (" 
+               << (free_ram_mb / 1024) << " GB free of "
+               << (total_ram_mb / 1024) << " GB total)\n";
+        }
+#endif
 #endif
         output = ss.str();
         return true;

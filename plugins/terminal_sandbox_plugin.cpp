@@ -49,7 +49,11 @@ public:
 
     bool execute_tool(const std::string& action, const std::string& payload, std::string& output) override {
         if (action == "shell_status") {
+#ifdef _WIN32
             output = "🐚 Sovereign Shell Sandbox: ONLINE\nPlatform: Windows Native CLI / PowerShell\nStatus: Ready for command execution.";
+#else
+            output = "🐚 Sovereign Shell Sandbox: ONLINE\nPlatform: Linux / POSIX Shell (/bin/sh, /bin/bash)\nStatus: Ready for command execution.";
+#endif
             return true;
         }
 
@@ -72,18 +76,30 @@ public:
                     cmd = cmd.substr(close_bracket + 1);
                     while (!cmd.empty() && (cmd.front() == ' ' || cmd.front() == '\n' || cmd.front() == '\r')) cmd.erase(0, 1);
                     if (!cwd_path.empty()) {
+#ifdef _WIN32
                         cwd_prefix = "cd /d \"" + cwd_path + "\" && ";
+#else
+                        cwd_prefix = "cd \"" + cwd_path + "\" && ";
+#endif
                     }
                 }
             }
 
-            // Destructive safety guardrail
+            // Destructive safety guardrail (cross-platform Windows & *nix)
             std::string cmd_lower = cmd;
             for (char& c : cmd_lower) c = (char)tolower(c);
             if (cmd_lower.find("format ") != std::string::npos ||
                 cmd_lower.find("rmdir /s /q c:\\") != std::string::npos ||
                 cmd_lower.find("del /s /q c:\\") != std::string::npos ||
-                cmd_lower.find("diskpart") != std::string::npos) {
+                cmd_lower.find("diskpart") != std::string::npos ||
+                cmd_lower.find("rm -rf /") != std::string::npos ||
+                cmd_lower.find("rm -rf /*") != std::string::npos ||
+                cmd_lower.find("rm -r /") != std::string::npos ||
+                cmd_lower.find("mkfs") != std::string::npos ||
+                cmd_lower.find("dd if=/dev/zero") != std::string::npos ||
+                cmd_lower.find("dd if=/dev/urandom") != std::string::npos ||
+                cmd_lower.find(":(){ :|:& };:") != std::string::npos ||
+                cmd_lower.find("chmod -r 777 /") != std::string::npos) {
                 output = "🐚 [Terminal] Blocked: Destructive system drive formatting or root wipe commands are disallowed.";
                 return true;
             }

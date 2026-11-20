@@ -244,7 +244,11 @@ public:
             while (!path_str.empty() && (path_str.front() == ' ' || path_str.front() == '"' || path_str.front() == '\'')) path_str.erase(0, 1);
             while (!path_str.empty() && (path_str.back() == ' ' || path_str.back() == '\r' || path_str.back() == '"' || path_str.back() == '\'')) path_str.pop_back();
 
-            if (path_str.empty() || path_str == "/" || path_str == "\\" || path_str == "C:" || path_str == "C:\\" || path_str.starts_with("C:\\Windows")) {
+            if (path_str.empty() || path_str == "/" || path_str == "\\" || 
+                path_str == "C:" || path_str == "C:\\" || path_str.starts_with("C:\\Windows") ||
+                path_str == "/bin" || path_str == "/sbin" || path_str == "/usr" || 
+                path_str == "/etc" || path_str == "/lib" || path_str == "/dev" || 
+                path_str == "/boot" || path_str == "/sys" || path_str == "/proc") {
                 output = "📁 [WorkspaceCoder] Blocked: Deletion of critical system or root paths is prohibited.";
                 return true;
             }

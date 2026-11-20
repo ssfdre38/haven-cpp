@@ -30,7 +30,7 @@ static const std::vector<std::string> KNOWN_TOOL_ACTIONS = {
     // Graph
     "graph_add_relation", "graph_query_entity", "graph_list_all", "graph_stats",
     // System Sensory
-    "system_telemetry", "get_time", "get_battery",
+    "system_telemetry", "get_time", "get_battery", "process_list", "list_processes", "volume_info", "disk_usage", "hardware_vitals",
     // Terminal
     "run_command", "exec_shell", "cmd_run", "shell_status",
     // Vault Sync
@@ -42,7 +42,7 @@ static const std::vector<std::string> KNOWN_TOOL_ACTIONS = {
     // Whisper
     "whisper_status", "listen_transcribe", "whisper_transcribe",
     // Coder
-    "read_file", "read_code", "list_directory", "list_files", "search_code", "file_info",
+    "read_file", "read_code", "write_file", "edit_file", "patch_file", "create_directory", "delete_file", "list_directory", "list_files", "search_code", "file_info",
     // YouTube Music
     "yt_music_play", "yt_music_pause", "yt_music_toggle", "yt_music_next", "yt_music_prev", "yt_music_search", "yt_music_open"
 };
@@ -557,15 +557,15 @@ std::string PluginManager::get_tools_prompt_description() const {
         s += " • " + record.metadata.name + " [" + status + "]: " + record.metadata.description + "\n";
     }
     s += "\nSupported Native Action Tools:\n"
-         " • run_command <cmd>          : Run local shell, PowerShell, compiler, or diagnostic commands on Windows.\n"
+         " • run_command <cmd>          : Run local shell, bash, PowerShell, compiler, or diagnostic commands (Windows & Linux/POSIX).\n"
          " • read_file <path>           : Read source code or text files from the local filesystem.\n"
          " • write_file <path>\n<content>: Create or overwrite a local project file.\n"
          " • edit_file {\"path\": \"...\", \"target\": \"...\", \"replacement\": \"...\"} : Replace exact text block in a file.\n"
          " • list_directory <path>      : List folder contents and file sizes.\n"
          " • search_code <query>        : Recursive pattern/code search across files.\n"
-         " • process_list               : List active Windows processes and thread counts.\n"
-         " • volume_info                : Inspect storage drives, file systems (NTFS/ReFS/etc.), and free space.\n"
-         " • hardware_vitals            : Bare-metal CPU threads, RAM metrics, and uptime.\n"
+         " • process_list               : List active processes and thread counts (via Windows Toolhelp32 / Linux /proc).\n"
+         " • volume_info                : Inspect storage drives, mount points, file systems (NTFS/ext4/btrfs/xfs/etc.), and free space.\n"
+         " • hardware_vitals            : Bare-metal CPU architecture, threads, RAM metrics, load averages, and uptime.\n"
          " • system_telemetry           : Real-time local clock, memory pressure, and AC/battery state.\n"
          " • clipboard_get              : Inspect current clipboard text.\n"
          "\nTo invoke a tool to inspect or act on the system, output immediately:\n"
