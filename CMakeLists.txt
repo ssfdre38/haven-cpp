@@ -12,13 +12,34 @@ else()
     add_link_options(-fopenmp)
 endif()
 
-include_directories(include "C:/Users/admin/source/ollama-main/mlx/include")
-
-link_directories(
-    "C:/Users/admin/source/ollama-main/build/mlx/mlx/_deps/mlx-c-build"
-    "C:/Users/admin/source/ollama-main/build/mlx/mlx/_deps/mlx-build"
-    "C:/Users/admin/source/ollama-main/build/mlx/mlx"
-)
+if (WIN32)
+    find_path(MLX_INCLUDE_DIR "mlx/c/mlx.h"
+        PATHS "C:/Users/admin/source/ollama-main/mlx/include"
+    )
+    if (MLX_INCLUDE_DIR)
+        include_directories(include ${MLX_INCLUDE_DIR})
+        add_definitions(-DHAVEN_HAS_MLX)
+        link_directories(
+            "C:/Users/admin/source/ollama-main/build/mlx/mlx/_deps/mlx-c-build"
+            "C:/Users/admin/source/ollama-main/build/mlx/mlx/_deps/mlx-build"
+            "C:/Users/admin/source/ollama-main/build/mlx/mlx"
+        )
+    else()
+        include_directories(include)
+    endif()
+elseif (APPLE)
+    find_path(MLX_INCLUDE_DIR "mlx/c/mlx.h"
+        PATHS "/usr/local/include"
+    )
+    if (MLX_INCLUDE_DIR)
+        include_directories(include ${MLX_INCLUDE_DIR})
+        add_definitions(-DHAVEN_HAS_MLX)
+    else()
+        include_directories(include)
+    endif()
+else()
+    include_directories(include)
+endif()
 
 set(HAVEN_CORE_SRCS
     src/haven_avx2.cpp
@@ -106,6 +127,12 @@ add_executable(test-cluster-fabric
 # Test Haven Cloud TPU v6e Trillium 8-Core Torus Mesh Cluster
 add_executable(test-tpu-cluster-mesh
     tests/test_tpu_cluster_mesh.cpp
+    ${HAVEN_CORE_SRCS}
+)
+
+# Cross-System Multi-Node Cluster Executable (Windows / Linux / Cloud)
+add_executable(test-cross-system-node
+    tests/test_cross_system_node.cpp
     ${HAVEN_CORE_SRCS}
 )
 
@@ -258,6 +285,7 @@ if (WIN32)
     target_link_libraries(test-multi-model-arch ws2_32 mlxc mlx openblas)
     target_link_libraries(test-cluster-fabric ws2_32 mlxc mlx openblas)
     target_link_libraries(test-tpu-cluster-mesh ws2_32 mlxc mlx openblas)
+    target_link_libraries(test-cross-system-node ws2_32 mlxc mlx openblas)
     target_link_libraries(plugin_system_sensory psapi)
     target_link_libraries(plugin_screen_vision psapi)
     target_link_libraries(plugin_web_research winhttp)
@@ -268,4 +296,17 @@ if (WIN32)
     target_link_libraries(plugin_gaming psapi)
     target_link_libraries(plugin_whisper_ear winhttp)
     target_link_libraries(plugin_smart_home winhttp)
+else()
+    target_link_libraries(haven_engine pthread dl)
+    target_link_libraries(haven-cli pthread dl)
+    target_link_libraries(haven-server pthread dl)
+    target_link_libraries(test-standalone pthread dl)
+    target_link_libraries(test-quant pthread dl)
+    target_link_libraries(test-lazy-plugins pthread dl)
+    target_link_libraries(test-topology-pathways pthread dl)
+    target_link_libraries(test-pathways-e2e pthread dl)
+    target_link_libraries(test-multi-model-arch pthread dl)
+    target_link_libraries(test-cluster-fabric pthread dl)
+    target_link_libraries(test-tpu-cluster-mesh pthread dl)
+    target_link_libraries(test-cross-system-node pthread dl)
 endif()

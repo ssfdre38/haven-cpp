@@ -1,4 +1,6 @@
 #include "haven/haven_mlx.h"
+
+#if defined(HAVEN_HAS_MLX)
 #include "mlx/c/mlx.h"
 
 #include <iostream>
@@ -248,3 +250,45 @@ std::vector<std::string> HavenMLXEngine::get_tensor_names() const {
 }
 
 } // namespace haven
+
+#else // !defined(HAVEN_HAS_MLX)
+
+namespace haven {
+
+struct HavenMLXEngine::Impl {};
+
+HavenMLXEngine::HavenMLXEngine() = default;
+HavenMLXEngine::~HavenMLXEngine() = default;
+
+bool HavenMLXEngine::is_available() {
+    return false;
+}
+
+bool HavenMLXEngine::is_mlx_model_dir(const std::string&) {
+    return false;
+}
+
+bool HavenMLXEngine::inspect_mlx_dir(const std::string&, MLXModelMetadata&) {
+    return false;
+}
+
+bool HavenMLXEngine::load_model(const std::string&, std::string& err_out) {
+    err_out = "MLX runtime is not available on this platform.";
+    return false;
+}
+
+void HavenMLXEngine::unload() {
+    loaded_ = false;
+}
+
+bool HavenMLXEngine::has_tensor(const std::string&) const {
+    return false;
+}
+
+std::vector<std::string> HavenMLXEngine::get_tensor_names() const {
+    return {};
+}
+
+} // namespace haven
+
+#endif // HAVEN_HAS_MLX
