@@ -41,6 +41,7 @@ set(HAVEN_CORE_SRCS
     src/haven_pathways.cpp
     src/haven_mlx.cpp
     src/haven_mcp.cpp
+    src/haven_cluster.cpp
 )
 
 # Shared Library (haven_engine.dll / libhaven.so) for C# Gemmi & Android JNI
@@ -93,6 +94,12 @@ add_executable(test-pathways-e2e
 # Test Multi-Model Architecture Support (Qwen 2.5, LLaMA 3, Phi-3, Gemma)
 add_executable(test-multi-model-arch
     tests/test_multi_model_arch.cpp
+    ${HAVEN_CORE_SRCS}
+)
+
+# Test Haven Sovereign Multi-Node Cluster & Pipeline Parallel Fabric
+add_executable(test-cluster-fabric
+    tests/test_cluster_fabric.cpp
     ${HAVEN_CORE_SRCS}
 )
 
@@ -234,15 +241,16 @@ set_target_properties(plugin_smart_home PROPERTIES
 )
 
 if (WIN32)
-    target_link_libraries(haven_engine mlxc mlx openblas)
-    target_link_libraries(haven-cli mlxc mlx openblas)
+    target_link_libraries(haven_engine ws2_32 mlxc mlx openblas)
+    target_link_libraries(haven-cli ws2_32 mlxc mlx openblas)
     target_link_libraries(haven-server ws2_32 psapi mlxc mlx openblas)
     target_link_libraries(test-standalone ws2_32 mlxc mlx openblas)
     target_link_libraries(test-quant ws2_32 mlxc mlx openblas)
     target_link_libraries(test-lazy-plugins ws2_32 psapi mlxc mlx openblas)
-    target_link_libraries(test-topology-pathways mlxc mlx openblas)
-    target_link_libraries(test-pathways-e2e mlxc mlx openblas)
-    target_link_libraries(test-multi-model-arch mlxc mlx openblas)
+    target_link_libraries(test-topology-pathways ws2_32 mlxc mlx openblas)
+    target_link_libraries(test-pathways-e2e ws2_32 mlxc mlx openblas)
+    target_link_libraries(test-multi-model-arch ws2_32 mlxc mlx openblas)
+    target_link_libraries(test-cluster-fabric ws2_32 mlxc mlx openblas)
     target_link_libraries(plugin_system_sensory psapi)
     target_link_libraries(plugin_screen_vision psapi)
     target_link_libraries(plugin_web_research winhttp)

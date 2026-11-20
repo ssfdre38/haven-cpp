@@ -1,5 +1,6 @@
 #include "haven/haven_engine.h"
 #include "haven/haven_mlx.h"
+#include "haven/haven_cluster.h"
 #include <iostream>
 #include <string>
 #include <vector>
@@ -61,6 +62,7 @@ public:
         }
         load_persona();
         load_model_dirs();
+        cluster_node_.init_coordinator(port_ + 2, 32);
     }
 
     ~HavenMicroServer() {
@@ -87,6 +89,7 @@ private:
     bool running_;
     std::thread server_thread_;
     HavenEngine haven_engine_;
+    HavenClusterNode cluster_node_;
     HavenMLXEngine mlx_engine_;
     bool is_mlx_active_ = false;
     std::mutex engine_mutex_;
@@ -1767,6 +1770,55 @@ private:
         else if (path == "/api/mcp/reload") {
             haven_engine_.get_mcp_manager().reload_all();
             std::string json = "{\"ok\":true,\"servers_count\":" + std::to_string(haven_engine_.get_mcp_manager().get_active_server_count()) + ",\"tools_count\":" + std::to_string(haven_engine_.get_mcp_manager().get_tool_count()) + "}";
+            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
+                             + std::to_string(json.length()) + "\r\n\r\n" + json;
+            send(sock, resp.c_str(), (int)resp.length(), 0);
+        }
+        else if (path == "/api/cluster/status") {
+            std::ostringstream ss;
+            ss << "{\"ok\":true,"
+               << "\"role\":\"" << (cluster_node_.get_role() == ClusterRole::COORDINATOR ? "coordinator" : "worker") << "\","
+               << "\"node_id\":" << cluster_node_.get_local_node_id() << ","
+               << "\"listen_port\":" << (port_ + 2) << ","
+               << "\"active\":" << (cluster_node_.is_active() ? "true" : "false") << ","
+               << "\"connected_nodes\":" << cluster_node_.get_nodes().size() << "}";
+            std::string json = ss.str();
+            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
+                             + std::to_string(json.length()) + "\r\n\r\n" + json;
+            send(sock, resp.c_str(), (int)resp.length(), 0);
+        }
+        else if (path == "/api/cluster/nodes") {
+            std::ostringstream ss;
+            ss << "{\"ok\":true,\"nodes\":[";
+            const auto& nodes = cluster_node_.get_nodes();
+            for (size_t i = 0; i < nodes.size(); ++i) {
+                if (i > 0) ss << ",";
+                ss << "{\"node_id\":" << nodes[i].node_id
+                   << ",\"address\":\"" << nodes[i].address << "\""
+                   << ",\"port\":" << nodes[i].port
+                   << ",\"role\":\"" << (nodes[i].role == ClusterRole::COORDINATOR ? "coordinator" : "worker") << "\""
+                   << ",\"start_layer\":" << nodes[i].start_layer
+                   << ",\"end_layer\":" << nodes[i].end_layer
+                   << ",\"total_memory_gb\":" << (nodes[i].total_memory_bytes / (1024*1024*1024))
+                   << ",\"peak_tflops\":" << nodes[i].peak_tflops
+                   << ",\"alive\":" << (nodes[i].is_alive ? "true" : "false") << "}";
+            }
+            ss << "]}";
+            std::string json = ss.str();
+            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
+                             + std::to_string(json.length()) + "\r\n\r\n" + json;
+            send(sock, resp.c_str(), (int)resp.length(), 0);
+        }
+        else if (path == "/api/cluster/join") {
+            std::string coord_ip = extract_json_string(request, "coordinator_ip");
+            if (coord_ip.empty()) coord_ip = "127.0.0.1";
+            std::string coord_port_str = extract_json_string(request, "coordinator_port");
+            uint16_t coord_port = coord_port_str.empty() ? 11438 : (uint16_t)std::stoi(coord_port_str);
+            std::string local_id_str = extract_json_string(request, "node_id");
+            uint32_t local_id = local_id_str.empty() ? 1 : (uint32_t)std::stoi(local_id_str);
+
+            bool ok = cluster_node_.init_worker(local_id, (uint16_t)(port_ + 3), coord_ip, coord_port);
+            std::string json = "{\"ok\":" + std::string(ok ? "true" : "false") + ",\"role\":\"worker\",\"coordinator\":\"" + coord_ip + ":" + std::to_string(coord_port) + "\"}";
             std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
                              + std::to_string(json.length()) + "\r\n\r\n" + json;
             send(sock, resp.c_str(), (int)resp.length(), 0);
