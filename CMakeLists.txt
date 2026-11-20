@@ -136,6 +136,12 @@ add_executable(test-cross-system-node
     ${HAVEN_CORE_SRCS}
 )
 
+# Distributed Cluster + Pathways DAG Executable (Unified Multi-Node Engine)
+add_executable(test-pathways-distributed-cluster
+    tests/test_pathways_distributed_cluster.cpp
+    ${HAVEN_CORE_SRCS}
+)
+
 # Native Sovereign Plugins
 add_library(plugin_yt_music SHARED
     plugins/yt_music_plugin.cpp
@@ -286,6 +292,7 @@ if (WIN32)
     target_link_libraries(test-cluster-fabric ws2_32 mlxc mlx openblas)
     target_link_libraries(test-tpu-cluster-mesh ws2_32 mlxc mlx openblas)
     target_link_libraries(test-cross-system-node ws2_32 mlxc mlx openblas)
+    target_link_libraries(test-pathways-distributed-cluster ws2_32 mlxc mlx openblas)
     target_link_libraries(plugin_system_sensory psapi)
     target_link_libraries(plugin_screen_vision psapi)
     target_link_libraries(plugin_web_research winhttp)
@@ -309,4 +316,5 @@ else()
     target_link_libraries(test-cluster-fabric pthread dl)
     target_link_libraries(test-tpu-cluster-mesh pthread dl)
     target_link_libraries(test-cross-system-node pthread dl)
+    target_link_libraries(test-pathways-distributed-cluster pthread dl)
 endif()
