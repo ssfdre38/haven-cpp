@@ -154,6 +154,12 @@ add_executable(test-tpu-live-generation
     ${HAVEN_CORE_SRCS}
 )
 
+# Secure Cluster Protocol Verification Test (SHCP Mutual Authentication & Crypto Handshake)
+add_executable(test-secure-cluster
+    tests/test_secure_cluster.cpp
+    ${HAVEN_CORE_SRCS}
+)
+
 # Native Sovereign Plugins
 add_library(plugin_yt_music SHARED
     plugins/yt_music_plugin.cpp
@@ -307,6 +313,7 @@ if (WIN32)
     target_link_libraries(test-pathways-distributed-cluster ws2_32 mlxc mlx openblas)
     target_link_libraries(test-live-cluster-generation ws2_32 mlxc mlx openblas)
     target_link_libraries(test-tpu-live-generation ws2_32 mlxc mlx openblas)
+    target_link_libraries(test-secure-cluster ws2_32 mlxc mlx openblas)
     target_link_libraries(plugin_system_sensory psapi)
     target_link_libraries(plugin_screen_vision psapi)
     target_link_libraries(plugin_web_research winhttp)
@@ -333,4 +340,5 @@ else()
     target_link_libraries(test-pathways-distributed-cluster pthread dl)
     target_link_libraries(test-live-cluster-generation pthread dl)
     target_link_libraries(test-tpu-live-generation pthread dl)
+    target_link_libraries(test-secure-cluster pthread dl)
 endif()

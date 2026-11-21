@@ -2,6 +2,7 @@
 
 #include "haven_types.h"
 #include "haven_topology.h"
+#include "haven_security.h"
 #include <cstdint>
 #include <cstddef>
 #include <string>
@@ -35,7 +36,9 @@ enum ClusterFrameFlags : uint16_t {
     FRAME_FLAG_EOS          = 0x0004,
     FRAME_FLAG_LOGITS       = 0x0008,
     FRAME_FLAG_HEARTBEAT    = 0x0010,
-    FRAME_FLAG_HANDSHAKE    = 0x0020
+    FRAME_FLAG_HANDSHAKE    = 0x0020,
+    FRAME_FLAG_AUTH_REJECT  = 0x0040,
+    FRAME_FLAG_ENCRYPTED    = 0x0080
 };
 
 // Fixed 36-byte wire header for zero-copy binary streaming
@@ -139,6 +142,8 @@ public:
     bool is_peer_connected(uint32_t node_id) const;
     std::vector<uint32_t> get_connected_peer_ids() const;
     uint16_t get_listen_port() const { return listen_port_; }
+    void set_cluster_token(const std::string& token) { cluster_token_ = token; }
+    const std::string& get_cluster_token() const { return cluster_token_; }
 
 private:
     void server_listen_loop();
@@ -147,6 +152,7 @@ private:
     uint16_t listen_port_ = 0;
     uint64_t server_socket_ = ~0ULL;
     std::atomic<bool> is_running_{false};
+    std::string cluster_token_;
 
     std::thread server_thread_;
     mutable std::mutex threads_mutex_;
@@ -201,6 +207,14 @@ public:
     bool init_worker(uint32_t local_node_id, uint16_t listen_port, 
                      const std::string& coordinator_addr, uint16_t coordinator_port);
 
+    // Security & Authentication
+    void set_cluster_token(const std::string& token);
+    const std::string& get_cluster_token() const { return cluster_token_; }
+    std::string generate_invite_uri(const std::string& host_override = "") const;
+    bool init_worker_with_token(uint32_t local_node_id, uint16_t listen_port, 
+                                const std::string& invite_or_host, uint16_t coordinator_port = 0,
+                                const std::string& token = "");
+
     // Shuts down cluster networking
     void shutdown();
 
@@ -227,6 +241,7 @@ public:
     // Status queries
     ClusterRole get_role() const { return role_; }
     uint32_t get_local_node_id() const { return local_node_id_; }
+    uint16_t get_listen_port() const { return listen_port_; }
     bool is_active() const { return is_active_; }
     const std::vector<ClusterNodeInfo>& get_nodes() const { return nodes_; }
     const PipelineClusterScheduler& get_scheduler() const { return scheduler_; }
@@ -245,6 +260,7 @@ private:
     std::vector<ClusterNodeInfo> nodes_;
     PipelineClusterScheduler scheduler_;
     std::unique_ptr<ClusterTransportRing> transport_;
+    std::string cluster_token_;
 };
 
 } // namespace haven

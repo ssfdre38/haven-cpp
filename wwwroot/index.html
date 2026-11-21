@@ -520,6 +520,133 @@
             display: inline-block;
         }
 
+        /* Sovereign Cluster Mesh Styling */
+        .cluster-pill {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .cluster-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: #10b981;
+            box-shadow: 0 0 6px #10b981;
+            display: inline-block;
+        }
+        .cluster-dot.inactive {
+            background: #ef4444;
+            box-shadow: 0 0 6px #ef4444;
+        }
+        .cluster-section {
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 14px 16px;
+            margin-bottom: 14px;
+        }
+        .invite-box {
+            background: rgba(15, 23, 42, 0.85);
+            border: 1px dashed var(--accent-cyan);
+            padding: 10px 14px;
+            border-radius: 8px;
+            font-family: var(--font-mono);
+            font-size: 11px;
+            color: var(--accent-cyan);
+            word-break: break-all;
+            cursor: pointer;
+            user-select: all;
+            margin-top: 8px;
+            transition: var(--transition);
+        }
+        .invite-box:hover {
+            background: rgba(56, 189, 248, 0.1);
+            border-color: #38bdf8;
+        }
+        .nodes-table-container {
+            overflow-x: auto;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            background: rgba(15, 23, 42, 0.4);
+            margin-top: 8px;
+        }
+        .nodes-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+        }
+        .nodes-table th, .nodes-table td {
+            padding: 8px 12px;
+            text-align: left;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        .nodes-table th {
+            color: var(--text-dim);
+            font-weight: 500;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            background: rgba(255, 255, 255, 0.02);
+        }
+        .nodes-table td {
+            font-family: var(--font-mono);
+            color: var(--text-muted);
+        }
+        .badge-pill {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 10px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            background: rgba(56, 189, 248, 0.15);
+            color: var(--accent-cyan);
+            border: 1px solid rgba(56, 189, 248, 0.3);
+        }
+        .badge-pill.worker {
+            background: rgba(168, 85, 247, 0.15);
+            color: #c084fc;
+            border-color: rgba(168, 85, 247, 0.3);
+        }
+        .btn-sm {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            color: var(--text-muted);
+            padding: 4px 10px;
+            border-radius: var(--radius-sm);
+            font-size: 11px;
+            cursor: pointer;
+            font-family: inherit;
+            transition: var(--transition);
+        }
+        .btn-sm:hover {
+            color: #fff;
+            border-color: var(--border-hover);
+        }
+        .btn-sm.secondary {
+            color: var(--accent-cyan);
+            border-color: rgba(56, 189, 248, 0.3);
+        }
+        .btn-sm.secondary:hover {
+            background: rgba(56, 189, 248, 0.1);
+            border-color: var(--accent-cyan);
+        }
+        .cluster-input {
+            background: rgba(15, 23, 42, 0.85);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-sm);
+            padding: 8px 12px;
+            color: #fff;
+            font-size: 12px;
+            font-family: var(--font-mono);
+            outline: none;
+            transition: var(--transition);
+        }
+        .cluster-input:focus {
+            border-color: var(--accent-cyan);
+        }
+
         .glass-dropdown {
             display: none;
             position: absolute;
@@ -1375,6 +1502,12 @@
                         <span id="nav-telemetry-pill">AVX2 • 12T</span>
                     </button>
 
+                    <!-- Sovereign Cluster Mesh Status -->
+                    <button class="nav-pill-btn cluster-pill" onclick="openClusterModal()" title="Sovereign Cluster Mesh & Cryptographic Pairing">
+                        <span class="cluster-dot" id="nav-cluster-dot"></span>
+                        <span id="nav-cluster-pill">Cluster: Mesh</span>
+                    </button>
+
                     <!-- Sampler Hyperparameters (Quick 1-Click Icon) -->
                     <button class="icon-btn-pill" onclick="openSettingsModal()" title="Sampler Parameters (Temperature, Top-P, Min-P)">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
@@ -1402,6 +1535,10 @@
 
                             <div class="dropdown-divider"></div>
                             <div class="dropdown-section-title">Sovereign Ecosystem</div>
+                            <button class="dropdown-menu-item" onclick="openClusterModal(); closeMoreMenu();">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
+                                <span>Sovereign Cluster Mesh</span>
+                            </button>
                             <button class="dropdown-menu-item" onclick="openPluginsModal(); closeMoreMenu();">
                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
                                 <span>Sovereign Plugins (<span id="nav-plugins-count">17 Tools</span>)</span>
@@ -1726,6 +1863,80 @@
         </div>
     </div>
 
+    <!-- Sovereign Cluster Mesh Modal -->
+    <div class="modal-overlay" id="cluster-modal" onclick="if(event.target === this) closeClusterModal()">
+        <div class="modal-card" style="max-width: 680px;">
+            <div class="modal-header">
+                <div>
+                    <div class="modal-title" style="display:flex; align-items:center; gap:8px;">
+                        <span>🔒 Sovereign Cluster Mesh</span>
+                        <span class="badge-pill" id="cluster-badge-role">Coordinator</span>
+                    </div>
+                    <div style="font-size: 12px; color: var(--text-dim); margin-top: 2px;">Zero-Trust 256-bit cryptographic pairing & wire-encrypted tensor pipeline</div>
+                </div>
+                <button class="icon-btn" onclick="closeClusterModal()">✕</button>
+            </div>
+            <div class="modal-body">
+                <!-- Coordinator Invite URI Section -->
+                <div class="cluster-section" id="cluster-coord-section">
+                    <div class="setting-label-row">
+                        <span style="font-weight:600; font-size:13px; color:#fff;">Cluster Pairing Invite URI</span>
+                        <button class="btn-sm" onclick="copyInviteUri()" id="btn-copy-invite">📋 Copy Invite</button>
+                    </div>
+                    <div class="setting-desc" style="font-size: 12px; color: var(--text-dim); margin-top: 4px;">Share this cryptographically authenticated invite with worker nodes (Gemma / TPU / GPU / Apple Silicon):</div>
+                    <div class="invite-box" id="cluster-invite-uri" onclick="copyInviteUri()" title="Click to copy pairing URI">Loading cluster invite URI...</div>
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-top:10px;">
+                        <div style="font-size:11px; color:var(--text-dim); font-family:var(--font-mono);">
+                            Auth: <span id="cluster-auth-badge" style="color:#10b981;">256-Bit Mutual Challenge Handshake</span>
+                        </div>
+                        <button class="btn-sm secondary" onclick="regenerateClusterToken()" title="Generate fresh 256-bit pairing key">🔄 Regenerate Token</button>
+                    </div>
+                </div>
+
+                <!-- Connected Nodes Table -->
+                <div class="cluster-section">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                        <span style="font-weight:600; font-size:13px; color:#fff;">Connected Nodes (<span id="cluster-nodes-count">1</span>)</span>
+                        <button class="btn-sm secondary" onclick="refreshClusterNodes()">🔄 Refresh Nodes</button>
+                    </div>
+                    <div class="nodes-table-container">
+                        <table class="nodes-table">
+                            <thead>
+                                <tr>
+                                    <th>Node ID</th>
+                                    <th>Address</th>
+                                    <th>Role</th>
+                                    <th>Layers</th>
+                                    <th>RAM / FLOPS</th>
+                                    <th>Status</th>
+                                </tr>
+                            </thead>
+                            <tbody id="cluster-nodes-tbody">
+                                <tr>
+                                    <td colspan="6" style="text-align:center; padding:12px; color:var(--text-dim);">Querying cluster mesh topology...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Join Another Cluster Section -->
+                <div class="cluster-section">
+                    <span style="font-weight:600; font-size:13px; color:#fff;">Join an Existing Haven Cluster</span>
+                    <div class="setting-desc" style="font-size: 12px; color: var(--text-dim); margin-top: 4px;">Paste an invite URI (<code style="color:var(--accent-cyan);">haven://cluster?...</code>) to link this node into a distributed cluster:</div>
+                    <div style="display:flex; gap:8px; margin-top:8px;">
+                        <input type="text" id="cluster-join-input" placeholder="haven://cluster?host=192.168.1.50&port=11438&token=..." class="cluster-input" style="flex:1;">
+                        <button class="btn-primary" onclick="joinRemoteCluster()" id="btn-join-cluster" style="white-space:nowrap;">Join Mesh</button>
+                    </div>
+                    <div id="cluster-join-status" style="font-size:12px; margin-top:6px; display:none;"></div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-primary" onclick="closeClusterModal()">Done</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         // State Management
         let conversations = [];
@@ -1786,6 +1997,8 @@
         async function initApp() {
             await fetchPersonaSettings();
             await fetchTelemetryVitals();
+            await fetchClusterStatus();
+            setInterval(fetchClusterStatus, 15000);
 
             try {
                 const savedSettings = localStorage.getItem('haven_engine_settings');
@@ -3017,6 +3230,158 @@
                     repetition_penalty: settings.repetition_penalty
                 })
             }).catch(() => {});
+        }
+
+        // Sovereign Cluster Mesh Functions
+        let currentInviteUri = "";
+
+        async function fetchClusterStatus() {
+            try {
+                const res = await fetch('/api/cluster/status');
+                if (!res.ok) return;
+                const data = await res.json();
+
+                const pill = document.getElementById('nav-cluster-pill');
+                const dot = document.getElementById('nav-cluster-dot');
+                const badge = document.getElementById('cluster-badge-role');
+
+                if (data.active) {
+                    if (dot) dot.classList.remove('inactive');
+                    const roleLabel = data.role === 'coordinator' ? 'Coordinator' : 'Worker';
+                    const nodeCount = data.connected_nodes || 1;
+                    if (pill) pill.innerText = `Cluster: ${nodeCount} Node${nodeCount === 1 ? '' : 's'}`;
+                    if (badge) {
+                        badge.innerText = roleLabel;
+                        badge.className = data.role === 'coordinator' ? 'badge-pill' : 'badge-pill worker';
+                    }
+                } else {
+                    if (dot) dot.classList.add('inactive');
+                    if (pill) pill.innerText = 'Cluster: Standalone';
+                    if (badge) badge.innerText = 'Standalone';
+                }
+
+                if (data.invite_uri) {
+                    currentInviteUri = data.invite_uri;
+                    const uriBox = document.getElementById('cluster-invite-uri');
+                    if (uriBox) uriBox.innerText = data.invite_uri;
+                }
+            } catch (e) {
+                console.error("Cluster status fetch error:", e);
+            }
+        }
+
+        async function refreshClusterNodes() {
+            try {
+                const res = await fetch('/api/cluster/nodes');
+                if (!res.ok) return;
+                const data = await res.json();
+                const tbody = document.getElementById('cluster-nodes-tbody');
+                const countLbl = document.getElementById('cluster-nodes-count');
+                if (!tbody) return;
+
+                if (!data.nodes || data.nodes.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; padding:12px; color:var(--text-dim);">No peers currently connected.</td></tr>';
+                    if (countLbl) countLbl.innerText = '0';
+                    return;
+                }
+
+                if (countLbl) countLbl.innerText = data.nodes.length;
+                let html = '';
+                data.nodes.forEach(n => {
+                    const isCoord = n.role === 'coordinator';
+                    const roleBadge = isCoord ? '<span class="badge-pill">Coord</span>' : '<span class="badge-pill worker">Worker</span>';
+                    const statusDot = n.alive ? '<span style="color:#10b981;">● Online</span>' : '<span style="color:#ef4444;">● Offline</span>';
+                    const layerRange = `${n.start_layer} - ${n.end_layer}`;
+                    const memFlops = `${n.total_memory_gb || 0} GB / ${(n.peak_tflops || 0).toFixed(1)} TF`;
+                    html += `<tr>
+                        <td><strong>Node ${n.node_id}</strong></td>
+                        <td>${n.address}:${n.port}</td>
+                        <td>${roleBadge}</td>
+                        <td>${layerRange}</td>
+                        <td>${memFlops}</td>
+                        <td>${statusDot}</td>
+                    </tr>`;
+                });
+                tbody.innerHTML = html;
+            } catch (e) {
+                console.error("Nodes fetch error:", e);
+            }
+        }
+
+        function openClusterModal() {
+            document.getElementById('cluster-modal').style.display = 'flex';
+            fetchClusterStatus();
+            refreshClusterNodes();
+        }
+
+        function closeClusterModal() {
+            document.getElementById('cluster-modal').style.display = 'none';
+        }
+
+        async function copyInviteUri() {
+            if (!currentInviteUri) return;
+            try {
+                await navigator.clipboard.writeText(currentInviteUri);
+                const btn = document.getElementById('btn-copy-invite');
+                const orig = btn.innerText;
+                btn.innerText = '✓ Copied!';
+                setTimeout(() => { btn.innerText = orig; }, 2000);
+            } catch (e) {
+                prompt("Copy Cluster Invite URI:", currentInviteUri);
+            }
+        }
+
+        async function regenerateClusterToken() {
+            if (!confirm("Regenerating the cluster token will require all worker nodes to re-authenticate with the new token. Proceed?")) return;
+            try {
+                const res = await fetch('/api/cluster/token', { method: 'POST' });
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data.invite_uri) {
+                        currentInviteUri = data.invite_uri;
+                        const uriBox = document.getElementById('cluster-invite-uri');
+                        if (uriBox) uriBox.innerText = data.invite_uri;
+                    }
+                    alert("✓ New 256-bit cluster token generated and active.");
+                }
+            } catch (e) {
+                alert("Failed to regenerate token: " + e.message);
+            }
+        }
+
+        async function joinRemoteCluster() {
+            const input = document.getElementById('cluster-join-input');
+            const statusDiv = document.getElementById('cluster-join-status');
+            const target = input.value.trim();
+            if (!target) {
+                alert("Please paste a haven://cluster?... invite URI or coordinator IP");
+                return;
+            }
+
+            statusDiv.style.display = 'block';
+            statusDiv.style.color = 'var(--accent-cyan)';
+            statusDiv.innerText = 'Authenticating and connecting to coordinator...';
+
+            try {
+                const res = await fetch('/api/cluster/join', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ invite_uri: target })
+                });
+                const data = await res.json();
+                if (data.ok) {
+                    statusDiv.style.color = '#10b981';
+                    statusDiv.innerText = '✓ Successfully authenticated and joined cluster mesh!';
+                    fetchClusterStatus();
+                    refreshClusterNodes();
+                } else {
+                    statusDiv.style.color = '#ef4444';
+                    statusDiv.innerText = '❌ Failed to join cluster. Ensure coordinator is online and token is valid.';
+                }
+            } catch (e) {
+                statusDiv.style.color = '#ef4444';
+                statusDiv.innerText = '❌ Connection error: ' + e.message;
+            }
         }
 
         document.addEventListener('DOMContentLoaded', initApp);

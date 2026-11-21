@@ -27,7 +27,12 @@ namespace haven {
 
 class HavenMicroServer {
 public:
-    HavenMicroServer(int port = 11436, const std::string& model_path = "")
+    HavenMicroServer(int port = 11436, const std::string& model_path = "",
+                     bool is_cluster_worker = false,
+                     const std::string& cluster_join_target = "",
+                     uint16_t cluster_port = 0,
+                     const std::string& cluster_token = "",
+                     uint32_t cluster_node_id = 0)
         : port_(port), running_(false), model_loaded_(false)
     {
 #ifdef _WIN32
@@ -62,7 +67,19 @@ public:
         }
         load_persona();
         load_model_dirs();
-        cluster_node_.init_coordinator(port_ + 2, 32);
+
+        if (is_cluster_worker) {
+            uint16_t worker_port = cluster_port != 0 ? cluster_port : (uint16_t)(port_ + 3);
+            uint32_t n_id = cluster_node_id != 0 ? cluster_node_id : 1;
+            cluster_node_.init_worker_with_token(n_id, worker_port, cluster_join_target, cluster_port, cluster_token);
+        } else {
+            uint16_t coord_port = cluster_port != 0 ? cluster_port : (uint16_t)(port_ + 2);
+            if (!cluster_token.empty()) {
+                cluster_node_.set_cluster_token(cluster_token);
+            }
+            cluster_node_.init_coordinator(coord_port, 32);
+            std::cout << "🔒 [HavenServer] Sovereign Cluster Invite URI: " << cluster_node_.generate_invite_uri() << "\n" << std::flush;
+        }
     }
 
     ~HavenMicroServer() {
@@ -1779,13 +1796,33 @@ private:
             ss << "{\"ok\":true,"
                << "\"role\":\"" << (cluster_node_.get_role() == ClusterRole::COORDINATOR ? "coordinator" : "worker") << "\","
                << "\"node_id\":" << cluster_node_.get_local_node_id() << ","
-               << "\"listen_port\":" << (port_ + 2) << ","
+               << "\"listen_port\":" << cluster_node_.get_listen_port() << ","
                << "\"active\":" << (cluster_node_.is_active() ? "true" : "false") << ","
-               << "\"connected_nodes\":" << cluster_node_.get_nodes().size() << "}";
+               << "\"connected_nodes\":" << cluster_node_.get_nodes().size() << ","
+               << "\"invite_uri\":\"" << escape_json_string(cluster_node_.generate_invite_uri()) << "\","
+               << "\"has_token\":" << (!cluster_node_.get_cluster_token().empty() ? "true" : "false") << "}";
             std::string json = ss.str();
             std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
                              + std::to_string(json.length()) + "\r\n\r\n" + json;
-            send(sock, resp.c_str(), (int)resp.length(), 0);
+            send_all(sock, resp.c_str(), (int)resp.length());
+        }
+        else if (path == "/api/cluster/token") {
+            if (method == "POST") {
+                std::string new_token = HavenSecurity::generate_cluster_token();
+                cluster_node_.set_cluster_token(new_token);
+                std::string invite = cluster_node_.generate_invite_uri();
+                std::string json = "{\"ok\":true,\"token\":\"" + new_token + "\",\"invite_uri\":\"" + escape_json_string(invite) + "\"}";
+                std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
+                                 + std::to_string(json.length()) + "\r\n\r\n" + json;
+                send_all(sock, resp.c_str(), (int)resp.length());
+            } else {
+                std::string token = cluster_node_.get_cluster_token();
+                std::string invite = cluster_node_.generate_invite_uri();
+                std::string json = "{\"ok\":true,\"token\":\"" + token + "\",\"invite_uri\":\"" + escape_json_string(invite) + "\",\"listen_port\":" + std::to_string(cluster_node_.get_listen_port()) + "}";
+                std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
+                                 + std::to_string(json.length()) + "\r\n\r\n" + json;
+                send_all(sock, resp.c_str(), (int)resp.length());
+            }
         }
         else if (path == "/api/cluster/nodes") {
             std::ostringstream ss;
@@ -1807,21 +1844,30 @@ private:
             std::string json = ss.str();
             std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
                              + std::to_string(json.length()) + "\r\n\r\n" + json;
-            send(sock, resp.c_str(), (int)resp.length(), 0);
+            send_all(sock, resp.c_str(), (int)resp.length());
         }
         else if (path == "/api/cluster/join") {
-            std::string coord_ip = extract_json_string(request, "coordinator_ip");
-            if (coord_ip.empty()) coord_ip = "127.0.0.1";
-            std::string coord_port_str = extract_json_string(request, "coordinator_port");
-            uint16_t coord_port = coord_port_str.empty() ? 11438 : (uint16_t)std::stoi(coord_port_str);
+            std::string invite_uri = extract_json_string(request, "invite_uri");
+            uint16_t worker_port = (uint16_t)(port_ + 3);
+            uint32_t local_id = 1;
             std::string local_id_str = extract_json_string(request, "node_id");
-            uint32_t local_id = local_id_str.empty() ? 1 : (uint32_t)std::stoi(local_id_str);
+            if (!local_id_str.empty()) try { local_id = (uint32_t)std::stoul(local_id_str); } catch (...) {}
 
-            bool ok = cluster_node_.init_worker(local_id, (uint16_t)(port_ + 3), coord_ip, coord_port);
-            std::string json = "{\"ok\":" + std::string(ok ? "true" : "false") + ",\"role\":\"worker\",\"coordinator\":\"" + coord_ip + ":" + std::to_string(coord_port) + "\"}";
+            bool ok = false;
+            if (!invite_uri.empty()) {
+                ok = cluster_node_.init_worker_with_token(local_id, worker_port, invite_uri);
+            } else {
+                std::string coord_ip = extract_json_string(request, "coordinator_ip");
+                if (coord_ip.empty()) coord_ip = "127.0.0.1";
+                std::string coord_port_str = extract_json_string(request, "coordinator_port");
+                uint16_t coord_port = coord_port_str.empty() ? 11438 : (uint16_t)std::stoi(coord_port_str);
+                std::string token = extract_json_string(request, "token");
+                ok = cluster_node_.init_worker_with_token(local_id, worker_port, coord_ip, coord_port, token);
+            }
+            std::string json = "{\"ok\":" + std::string(ok ? "true" : "false") + ",\"role\":\"worker\"}";
             std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
                              + std::to_string(json.length()) + "\r\n\r\n" + json;
-            send(sock, resp.c_str(), (int)resp.length(), 0);
+            send_all(sock, resp.c_str(), (int)resp.length());
         }
         else if (path == "/api/settings") {
             if (method == "POST") {
@@ -1944,18 +1990,57 @@ int main(int argc, char** argv) {
 #endif
     int port = 11436;
     std::string model_arg = "";
-    if (argc > 1) {
-        try {
-            port = std::stoi(argv[1]);
-        } catch (...) {
-            model_arg = argv[1];
+    bool is_worker = false;
+    std::string cluster_join_target = "";
+    uint16_t cluster_port = 0;
+    std::string cluster_token = "";
+    uint32_t cluster_node_id = 0;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            std::cout << "Haven Sovereign Server & Featherlight Studio\n"
+                      << "Usage: haven-server [options]\n\n"
+                      << "Options:\n"
+                      << "  --port <port>             HTTP server port (default: 11436)\n"
+                      << "  --model <path>            GGUF or MLX model path to load\n"
+                      << "  --cluster-host [port]     Run as cluster coordinator on [port] (default: HTTP_PORT + 2)\n"
+                      << "  --cluster-join <invite>   Join remote cluster using haven://cluster URI or IP\n"
+                      << "  --cluster-port <port>     Coordinator port to join (default: 11438)\n"
+                      << "  --cluster-token <key>     256-bit cryptographic pairing token\n"
+                      << "  --node-id <id>            Cluster node ID (default: 0 coordinator, 1 worker)\n"
+                      << "  --help, -h                Show this help message\n";
+            return 0;
+        } else if (arg == "--port" && i + 1 < argc) {
+            port = std::stoi(argv[++i]);
+        } else if (arg == "--model" && i + 1 < argc) {
+            model_arg = argv[++i];
+        } else if (arg == "--cluster-host") {
+            is_worker = false;
+            if (i + 1 < argc && argv[i+1][0] != '-') {
+                cluster_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+            }
+        } else if (arg == "--cluster-join" && i + 1 < argc) {
+            is_worker = true;
+            cluster_join_target = argv[++i];
+        } else if (arg == "--cluster-port" && i + 1 < argc) {
+            cluster_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        } else if (arg == "--cluster-token" && i + 1 < argc) {
+            cluster_token = argv[++i];
+        } else if (arg == "--node-id" && i + 1 < argc) {
+            cluster_node_id = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (!arg.starts_with("-")) {
+            try {
+                port = std::stoi(arg);
+            } catch (...) {
+                if (model_arg.empty()) {
+                    model_arg = arg;
+                }
+            }
         }
     }
-    if (argc > 2) {
-        model_arg = argv[2];
-    }
 
-    haven::HavenMicroServer server(port, model_arg);
+    haven::HavenMicroServer server(port, model_arg, is_worker, cluster_join_target, cluster_port, cluster_token, cluster_node_id);
     server.start();
 
     std::cout << "[HavenServer] Featherlight Studio Daemon running on http://0.0.0.0:" << port << " (<10MB RAM)...\n" << std::flush;

@@ -332,6 +332,23 @@ bool ClusterTransportRing::send_activation(uint32_t target_node_id, const HavenA
         return false;
     }
 
+    // Encrypt payload if token is active and frame is an activation tensor
+    if (!cluster_token_.empty() && (frame.header.flags & FRAME_FLAG_ACTIVATION) && !frame.data.empty()) {
+        HavenActivationFrame enc_frame = frame;
+        enc_frame.header.flags |= FRAME_FLAG_ENCRYPTED;
+        HavenSecurity::mask_activation_payload(enc_frame.data.data(), enc_frame.data.size(), 
+                                              cluster_token_, enc_frame.header.sequence_id, enc_frame.header.step_pos);
+        if (!send_all(sock, &enc_frame.header, sizeof(enc_frame.header))) {
+            return false;
+        }
+        if (enc_frame.header.payload_bytes > 0 && !enc_frame.data.empty()) {
+            if (!send_all(sock, enc_frame.data.data(), enc_frame.header.payload_bytes)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     // 1. Send fixed 36-byte header
     if (!send_all(sock, &frame.header, sizeof(frame.header))) {
         return false;
@@ -444,9 +461,33 @@ void ClusterTransportRing::client_recv_loop(uint64_t socket_handle, uint32_t pee
             }
         }
 
-        // Handle Handshake: map actual peer node ID in the transport ring
+        // Handle Handshake: authenticate peer if cluster token is configured
         if (frame.header.flags & FRAME_FLAG_HANDSHAKE) {
             uint32_t real_node_id = frame.header.from_node_id;
+
+            if (!cluster_token_.empty()) {
+                std::string received_token;
+                if (!frame.data.empty() && frame.header.payload_bytes > 0) {
+                    const char* bytes = reinterpret_cast<const char*>(frame.data.data());
+                    size_t len = std::min<size_t>(frame.header.payload_bytes, 64);
+                    received_token = std::string(bytes, len);
+                }
+
+                if (!HavenSecurity::constant_time_verify(received_token, cluster_token_)) {
+                    std::cerr << "⛔ [ClusterSecurity] Unauthorized peer rejected on socket " 
+                              << socket_handle << " (Invalid Cluster Token). Terminating connection.\n";
+                    HavenActivationFrame reject_frame;
+                    reject_frame.header.magic = HAVEN_CLUSTER_MAGIC;
+                    reject_frame.header.protocol_ver = HAVEN_CLUSTER_VERSION;
+                    reject_frame.header.flags = FRAME_FLAG_AUTH_REJECT;
+                    send_all(sock, &reject_frame.header, sizeof(reject_frame.header));
+                    closesocket(sock);
+                    break;
+                }
+                std::cout << "🔒 [ClusterSecurity] Peer Node " << real_node_id 
+                          << " successfully authenticated with 256-bit cluster token.\n";
+            }
+
             if (real_node_id != peer_node_id) {
                 std::lock_guard<std::mutex> lock(peers_mutex_);
                 peer_sockets_.erase(peer_node_id);
@@ -454,6 +495,14 @@ void ClusterTransportRing::client_recv_loop(uint64_t socket_handle, uint32_t pee
                 peer_node_id = real_node_id;
             }
             continue;
+        }
+
+        // Handle Wire Decryption if payload is encrypted
+        if (frame.header.flags & FRAME_FLAG_ENCRYPTED) {
+            if (!cluster_token_.empty() && !frame.data.empty()) {
+                HavenSecurity::mask_activation_payload(frame.data.data(), frame.data.size(), 
+                                                      cluster_token_, frame.header.sequence_id, frame.header.step_pos);
+            }
         }
 
         // Push directly into inbound ring buffer
@@ -688,6 +737,10 @@ bool HavenClusterNode::init_coordinator(uint16_t listen_port, uint32_t total_mod
     local_node_id_ = 0;
     listen_port_ = listen_port;
 
+    if (cluster_token_.empty()) {
+        set_cluster_token(HavenSecurity::generate_cluster_token());
+    }
+
     if (!transport_->start_server(listen_port)) {
         return false;
     }
@@ -735,14 +788,58 @@ bool HavenClusterNode::init_worker(uint32_t local_node_id, uint16_t listen_port,
     handshake.header.flags = FRAME_FLAG_HANDSHAKE;
     handshake.header.from_node_id = static_cast<uint16_t>(local_node_id);
     handshake.header.to_node_id = 0;
-    handshake.header.element_count = 0;
-    handshake.header.payload_bytes = 0;
+
+    if (!cluster_token_.empty()) {
+        size_t token_bytes = cluster_token_.size();
+        handshake.header.payload_bytes = static_cast<uint32_t>(token_bytes);
+        handshake.header.element_count = static_cast<uint32_t>((token_bytes + sizeof(float) - 1) / sizeof(float));
+        handshake.data.resize(handshake.header.element_count, 0.0f);
+        std::memcpy(handshake.data.data(), cluster_token_.data(), token_bytes);
+    } else {
+        handshake.header.element_count = 0;
+        handshake.header.payload_bytes = 0;
+    }
     transport_->send_activation(0, handshake);
 
     is_active_ = true;
     std::cout << "⚡ [HavenClusterNode] Worker Node " << local_node_id << " joined coordinator @ "
               << coordinator_addr << ":" << coordinator_port << "\n";
     return true;
+}
+
+void HavenClusterNode::set_cluster_token(const std::string& token) {
+    cluster_token_ = token;
+    if (transport_) {
+        transport_->set_cluster_token(token);
+    }
+}
+
+std::string HavenClusterNode::generate_invite_uri(const std::string& host_override) const {
+    std::string host = host_override.empty() ? "127.0.0.1" : host_override;
+    std::string token = cluster_token_.empty() ? HavenSecurity::generate_cluster_token() : cluster_token_;
+    return HavenSecurity::create_invite_uri(host, listen_port_, token);
+}
+
+bool HavenClusterNode::init_worker_with_token(uint32_t local_node_id, uint16_t listen_port, 
+                                             const std::string& invite_or_host, uint16_t coordinator_port,
+                                             const std::string& token) {
+    std::string target_host = invite_or_host;
+    uint16_t target_port = coordinator_port;
+    std::string target_token = token;
+    std::string target_name;
+
+    if (invite_or_host.rfind("haven://", 0) == 0) {
+        if (!HavenSecurity::parse_invite_uri(invite_or_host, target_host, target_port, target_token, target_name)) {
+            std::cerr << "❌ Failed to parse cluster invite URI: " << invite_or_host << "\n";
+            return false;
+        }
+    }
+
+    if (!target_token.empty()) {
+        set_cluster_token(target_token);
+    }
+
+    return init_worker(local_node_id, listen_port, target_host, target_port);
 }
 
 void HavenClusterNode::shutdown() {
