@@ -187,6 +187,9 @@ bool GgufLoader::parse_header() {
         }
         else if (key == "general.alignment" && val_type == 4) {
             alignment = *reinterpret_cast<const uint32_t*>(ptr);
+            if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
+                alignment = 32;
+            }
             ptr += 4;
         }
         else if (ends_with(key, ".context_length") && (val_type == 4 || val_type == 10)) {
@@ -308,11 +311,51 @@ bool GgufLoader::parse_header() {
     }
 
     // Calculate Data Offset (aligned to alignment boundary)
+    if (alignment == 0) alignment = 32;
     uint64_t current_pos = static_cast<uint64_t>(ptr - mmap_data_);
     uint64_t data_start = (current_pos + alignment - 1) & ~(static_cast<uint64_t>(alignment - 1));
 
+    if (data_start > file_size_) {
+        std::cerr << "⛔ Data start offset exceeds mapped file size\n";
+        return false;
+    }
+
+    auto get_tensor_data_size = [](QuantType type, const std::vector<uint64_t>& shape) -> size_t {
+        if (shape.empty()) return 0;
+        uint64_t n_elems = 1;
+        for (uint64_t dim : shape) {
+            if (dim == 0) return 0;
+            n_elems *= dim;
+        }
+        switch (type) {
+            case QuantType::F32:  return static_cast<size_t>(n_elems * 4);
+            case QuantType::F16:
+            case QuantType::BF16: return static_cast<size_t>(n_elems * 2);
+            case QuantType::Q8_0: return static_cast<size_t>((n_elems + 31) / 32 * sizeof(block_q8_0));
+            case QuantType::Q4_0: return static_cast<size_t>((n_elems + 31) / 32 * sizeof(block_q4_0));
+            case QuantType::Q5_0: return static_cast<size_t>((n_elems + 31) / 32 * sizeof(block_q5_0));
+            case QuantType::Q4_K: return static_cast<size_t>((n_elems + 255) / 256 * sizeof(block_q4_K));
+            case QuantType::Q5_K: return static_cast<size_t>((n_elems + 255) / 256 * sizeof(block_q5_K));
+            case QuantType::Q6_K: return static_cast<size_t>((n_elems + 255) / 256 * sizeof(block_q6_K));
+            case QuantType::I8:   return static_cast<size_t>(n_elems);
+            case QuantType::I16:  return static_cast<size_t>(n_elems * 2);
+            case QuantType::I32:  return static_cast<size_t>(n_elems * 4);
+            case QuantType::I64:
+            case QuantType::F64:  return static_cast<size_t>(n_elems * 8);
+            default: return static_cast<size_t>(n_elems);
+        }
+    };
+
     for (auto& item : parsed_tensors) {
         TensorDesc& desc = item.second;
+        desc.size_bytes = get_tensor_data_size(desc.type, desc.shape);
+        if (desc.offset > file_size_ ||
+            data_start > file_size_ - desc.offset ||
+            desc.size_bytes > file_size_ - (data_start + desc.offset)) 
+        {
+            std::cerr << "⛔ Corrupted tensor offset/size for: " << desc.name << "\n";
+            return false;
+        }
         desc.data = mmap_data_ + data_start + desc.offset;
         tensors_[item.first] = desc;
     }

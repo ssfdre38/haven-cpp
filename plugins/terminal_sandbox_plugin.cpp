@@ -89,6 +89,14 @@ public:
             }
 
             // Destructive safety guardrail (cross-platform Windows & *nix)
+            const std::string forbidden_tokens[] = {"|", "&", ";", "`", "$(", "<", ">", "\n", "\r"};
+            for (const auto& token : forbidden_tokens) {
+                if (cmd.find(token) != std::string::npos) {
+                    output = "🐚 [Terminal] Blocked: Shell chaining, pipe, and redirection characters are disallowed in sovereign sandbox.";
+                    return true;
+                }
+            }
+
             std::string cmd_lower = cmd;
             for (char& c : cmd_lower) c = (char)tolower(c);
             if (cmd_lower.find("format ") != std::string::npos ||

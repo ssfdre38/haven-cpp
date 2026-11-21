@@ -5,6 +5,7 @@
 #include <memory>
 #include <cstdint>
 #include <unordered_map>
+#include <mutex>
 
 namespace haven {
 
@@ -53,11 +54,18 @@ public:
     // Clears all allocations
     void reset();
 
-    size_t get_num_free_blocks() const { return free_block_ids_.size(); }
-    size_t get_num_allocated_blocks() const { return total_blocks_ - free_block_ids_.size(); }
+    size_t get_num_free_blocks() const {
+        std::lock_guard<std::recursive_mutex> lock(paged_mutex_);
+        return free_block_ids_.size();
+    }
+    size_t get_num_allocated_blocks() const {
+        std::lock_guard<std::recursive_mutex> lock(paged_mutex_);
+        return total_blocks_ - free_block_ids_.size();
+    }
     const std::vector<int32_t>& get_block_table(uint64_t seq_id) const;
 
 private:
+    mutable std::recursive_mutex paged_mutex_;
     uint32_t num_layers_;
     uint32_t num_kv_heads_;
     uint32_t head_dim_;

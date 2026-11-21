@@ -8,6 +8,15 @@
 #include <algorithm>
 #include <cstdint>
 #include <chrono>
+#include <charconv>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <wincrypt.h>
+#endif
 
 namespace haven {
 
@@ -16,17 +25,30 @@ class HavenSecurity {
 public:
     // Generates a cryptographically secure 256-bit (32-byte) hex cluster token
     static std::string generate_cluster_token() {
-        std::random_device rd;
-        // Mix with high-resolution clock entropy
-        auto seed = static_cast<uint64_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count());
-        std::mt19937_64 gen(rd() ^ seed);
-        std::uniform_int_distribution<uint64_t> dist;
+        uint8_t bytes[32];
+        bool filled = false;
+#ifdef _WIN32
+        HCRYPTPROV hProv = 0;
+        if (CryptAcquireContextA(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT | CRYPT_SILENT)) {
+            if (CryptGenRandom(hProv, sizeof(bytes), bytes)) {
+                filled = true;
+            }
+            CryptReleaseContext(hProv, 0);
+        }
+#endif
+        if (!filled) {
+            std::random_device rd;
+            auto seed = static_cast<uint64_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count());
+            std::mt19937_64 gen(rd() ^ seed);
+            for (size_t i = 0; i < sizeof(bytes); ++i) {
+                bytes[i] = static_cast<uint8_t>(gen() & 0xFF);
+            }
+        }
 
         std::ostringstream ss;
         ss << std::hex << std::setfill('0');
-        for (int i = 0; i < 4; ++i) {
-            uint64_t part = (dist(gen) ^ (static_cast<uint64_t>(rd()) << 32) ^ rd());
-            ss << std::setw(16) << part;
+        for (size_t i = 0; i < sizeof(bytes); ++i) {
+            ss << std::setw(2) << static_cast<int>(bytes[i]);
         }
         return ss.str();
     }
@@ -55,7 +77,11 @@ public:
                     std::string key = param.substr(0, eq);
                     std::string val = param.substr(eq + 1);
                     if (key == "host") out_host = val;
-                    else if (key == "port") out_port = static_cast<uint16_t>(std::stoi(val));
+                    else if (key == "port") {
+                        uint32_t p = 0;
+                        auto [ptr, ec] = std::from_chars(val.data(), val.data() + val.size(), p);
+                        if (ec == std::errc() && p <= 65535) out_port = static_cast<uint16_t>(p);
+                    }
                     else if (key == "token") out_token = val;
                     else if (key == "name") out_name = val;
                 }

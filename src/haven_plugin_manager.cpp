@@ -55,7 +55,8 @@ PluginManager::~PluginManager() {
 
 bool PluginManager::probe_plugin_metadata(const std::string& filepath, PluginMetadata& out_meta, std::vector<std::string>& out_actions) {
 #ifdef _WIN32
-    HMODULE hModule = LoadLibraryA(filepath.c_str());
+    std::filesystem::path canon_path = std::filesystem::weakly_canonical(filepath);
+    HMODULE hModule = LoadLibraryExA(canon_path.string().c_str(), NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!hModule) {
         return false;
     }
@@ -169,7 +170,8 @@ size_t PluginManager::discover_plugins(const std::string& plugins_directory, boo
 
 bool PluginManager::load_plugin_file(const std::string& filepath, PluginExecutionContext* ctx) {
 #ifdef _WIN32
-    HMODULE hModule = LoadLibraryA(filepath.c_str());
+    std::filesystem::path canon_path = std::filesystem::weakly_canonical(filepath);
+    HMODULE hModule = LoadLibraryExA(canon_path.string().c_str(), NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!hModule) {
         std::cerr << "⚠️ Failed to load plugin library: " << filepath << " (Error " << GetLastError() << ")\n";
         return false;
@@ -314,9 +316,10 @@ bool PluginManager::ensure_plugin_loaded(LoadedPluginRecord& record, PluginExecu
     PluginExecutionContext* actual_ctx = ctx ? ctx : execution_ctx_;
 
 #ifdef _WIN32
-    HMODULE hModule = LoadLibraryA(record.filepath.c_str());
+    std::filesystem::path canon_path = std::filesystem::weakly_canonical(record.filepath);
+    HMODULE hModule = LoadLibraryExA(canon_path.string().c_str(), NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!hModule) {
-        std::cerr << "⚠️ [Hot-Load Error] Failed to LoadLibraryA: " << record.filepath << " (Error " << GetLastError() << ")\n";
+        std::cerr << "⚠️ [Hot-Load Error] Failed to LoadLibraryExA: " << record.filepath << " (Error " << GetLastError() << ")\n";
         return false;
     }
     auto create_func = reinterpret_cast<CreatePluginFunc>(GetProcAddress(hModule, "create_haven_plugin"));

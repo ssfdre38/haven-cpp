@@ -454,10 +454,14 @@ void ClusterTransportRing::client_recv_loop(uint64_t socket_handle, uint32_t pee
         }
 
         // 2. Read contiguous raw float data payload
-        if (frame.header.payload_bytes > 0 && frame.header.element_count > 0) {
+        if (frame.header.payload_bytes > 0 || frame.header.element_count > 0) {
             constexpr uint32_t MAX_FRAME_BYTES = 256 * 1024 * 1024;
-            if (frame.header.payload_bytes > MAX_FRAME_BYTES) {
-                std::cerr << "⚠️ [ClusterTransportRing] Frame payload exceeds 256MB limit on socket " << socket_handle << "\n";
+            if (frame.header.element_count > MAX_FRAME_BYTES / sizeof(float) ||
+                frame.header.payload_bytes > MAX_FRAME_BYTES ||
+                frame.header.payload_bytes != frame.header.element_count * sizeof(float)) 
+            {
+                std::cerr << "⛔ [ClusterTransportRing] Frame header invariant violation (payload_bytes=" 
+                          << frame.header.payload_bytes << ", element_count=" << frame.header.element_count << ")\n";
                 break;
             }
             frame.data.resize(frame.header.element_count);

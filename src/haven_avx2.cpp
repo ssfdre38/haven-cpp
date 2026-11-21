@@ -886,20 +886,20 @@ void Avx2Math::dequantize_row(float* out, const TensorDesc& weight, int row, int
         }
     }
     else if (weight.type == QuantType::BF16) {
-        const auto* w = reinterpret_cast<const uint16_t*>(weight.data) + row * cols;
+        const auto* w = reinterpret_cast<const uint16_t*>(weight.data) + static_cast<size_t>(row) * static_cast<size_t>(cols);
         for (int c = 0; c < cols; ++c) {
             out[c] = bf16_to_fp32(w[c]);
         }
     }
     else if (weight.type == QuantType::F16) {
-        const auto* w = reinterpret_cast<const uint16_t*>(weight.data) + row * cols;
+        const auto* w = reinterpret_cast<const uint16_t*>(weight.data) + static_cast<size_t>(row) * static_cast<size_t>(cols);
         for (int c = 0; c < cols; ++c) {
             out[c] = fp16_to_fp32(w[c]);
         }
     }
     else if (weight.type == QuantType::F32) {
-        const auto* w = reinterpret_cast<const float*>(weight.data) + row * cols;
-        std::memcpy(out, w, cols * sizeof(float));
+        const auto* w = reinterpret_cast<const float*>(weight.data) + static_cast<size_t>(row) * static_cast<size_t>(cols);
+        std::memcpy(out, w, static_cast<size_t>(cols) * sizeof(float));
     }
 }
 
@@ -988,6 +988,9 @@ void Avx2Math::gemv(float* y, const TensorDesc& weight, const float* x, int rows
 // Fast AVX2 In-Place Bias Addition: out[i] += bias[i] (supports F32 and F16)
 void Avx2Math::add_bias(float* out, const TensorDesc& bias_tensor, int size) {
     if (!out || !bias_tensor.data || size <= 0) return;
+    if (!bias_tensor.shape.empty() && bias_tensor.shape[0] < static_cast<uint64_t>(size)) {
+        size = static_cast<int>(bias_tensor.shape[0]);
+    }
 
     if (bias_tensor.type == QuantType::F32) {
         const float* b = reinterpret_cast<const float*>(bias_tensor.data);

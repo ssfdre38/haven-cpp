@@ -33,6 +33,7 @@ PagedAttentionManager::PagedAttentionManager(
 PagedAttentionManager::~PagedAttentionManager() = default;
 
 int32_t PagedAttentionManager::allocate_block() {
+    std::lock_guard<std::recursive_mutex> lock(paged_mutex_);
     if (free_block_ids_.empty()) {
         return -1; // Out of memory blocks
     }
@@ -48,6 +49,7 @@ int32_t PagedAttentionManager::allocate_block() {
 }
 
 KVPagedBlock* PagedAttentionManager::get_block(int32_t block_id) {
+    std::lock_guard<std::recursive_mutex> lock(paged_mutex_);
     if (block_id >= 0 && (size_t)block_id < block_pool_.size()) {
         return &block_pool_[block_id];
     }
@@ -61,6 +63,7 @@ void PagedAttentionManager::append_token_kv(
     const float* k_vec,
     const float* v_vec)
 {
+    std::lock_guard<std::recursive_mutex> lock(paged_mutex_);
     auto& table = sequence_block_tables_[seq_id];
     size_t block_idx = token_pos / PAGE_BLOCK_SIZE;
     size_t offset_in_block = token_pos % PAGE_BLOCK_SIZE;
@@ -110,6 +113,7 @@ void PagedAttentionManager::append_token_kv(
 }
 
 uint64_t PagedAttentionManager::fork_sequence(uint64_t parent_seq_id, uint64_t child_seq_id) {
+    std::lock_guard<std::recursive_mutex> lock(paged_mutex_);
     auto parent_it = sequence_block_tables_.find(parent_seq_id);
     if (parent_it == sequence_block_tables_.end()) return parent_seq_id;
 
@@ -125,6 +129,7 @@ uint64_t PagedAttentionManager::fork_sequence(uint64_t parent_seq_id, uint64_t c
 }
 
 void PagedAttentionManager::free_sequence(uint64_t seq_id) {
+    std::lock_guard<std::recursive_mutex> lock(paged_mutex_);
     auto it = sequence_block_tables_.find(seq_id);
     if (it == sequence_block_tables_.end()) return;
 
@@ -140,6 +145,7 @@ void PagedAttentionManager::free_sequence(uint64_t seq_id) {
 }
 
 void PagedAttentionManager::reset() {
+    std::lock_guard<std::recursive_mutex> lock(paged_mutex_);
     free_block_ids_.clear();
     sequence_block_tables_.clear();
     for (size_t i = 0; i < total_blocks_; ++i) {
@@ -150,6 +156,7 @@ void PagedAttentionManager::reset() {
 }
 
 const std::vector<int32_t>& PagedAttentionManager::get_block_table(uint64_t seq_id) const {
+    std::lock_guard<std::recursive_mutex> lock(paged_mutex_);
     auto it = sequence_block_tables_.find(seq_id);
     if (it != sequence_block_tables_.end()) {
         return it->second;

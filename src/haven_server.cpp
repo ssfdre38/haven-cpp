@@ -9,6 +9,7 @@
 #include <sstream>
 #include <chrono>
 #include <filesystem>
+#include <charconv>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -16,11 +17,16 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <psapi.h>
+typedef SOCKET socket_t;
+#define HAVEN_INVALID_SOCKET INVALID_SOCKET
 #else
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+typedef int socket_t;
+#define HAVEN_INVALID_SOCKET (-1)
+#define closesocket close
 #endif
 
 namespace haven {
@@ -120,6 +126,7 @@ private:
     int server_fd_ = -1;
 #endif
     std::atomic<bool> running_{false};
+    std::atomic<size_t> active_clients_{0};
     std::thread server_thread_;
     HavenEngine haven_engine_;
     HavenClusterNode cluster_node_;
@@ -474,7 +481,7 @@ private:
         }
     }
 
-    static bool send_all(int sock, const char* data, int len) {
+    static bool send_all(socket_t sock, const char* data, int len) {
         int total = 0;
         while (total < len) {
             int sent = send(sock, data + total, len - total, 0);
@@ -482,6 +489,24 @@ private:
             total += sent;
         }
         return true;
+    }
+
+    static std::string url_decode(const std::string& in) {
+        std::string out;
+        out.reserve(in.size());
+        for (size_t i = 0; i < in.size(); ++i) {
+            if (in[i] == '%' && i + 2 < in.size()) {
+                int hex_val = 0;
+                auto [ptr, ec] = std::from_chars(in.data() + i + 1, in.data() + i + 3, hex_val, 16);
+                if (ec == std::errc()) {
+                    out += static_cast<char>(hex_val);
+                    i += 2;
+                    continue;
+                }
+            }
+            out += in[i];
+        }
+        return out;
     }
 
     static std::string extract_json_string(const std::string& json, const std::string& key) {
@@ -612,13 +637,32 @@ private:
             sockaddr_in client_addr{};
             int addrlen = sizeof(client_addr);
 #ifdef _WIN32
-            int client_sock = accept(server_fd_, (struct sockaddr*)&client_addr, &addrlen);
+            socket_t client_sock = accept(server_fd_, (struct sockaddr*)&client_addr, &addrlen);
+            if (client_sock == INVALID_SOCKET) continue;
 #else
-            int client_sock = accept(server_fd_, (struct sockaddr*)&client_addr, (socklen_t*)&addrlen);
-#endif
+            socket_t client_sock = accept(server_fd_, (struct sockaddr*)&client_addr, (socklen_t*)&addrlen);
             if (client_sock < 0) continue;
+#endif
 
+            static constexpr size_t MAX_CONCURRENT_CLIENTS = 64;
+            if (active_clients_.load(std::memory_order_relaxed) >= MAX_CONCURRENT_CLIENTS) {
+                const char* busy_resp = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 5\r\nConnection: close\r\nContent-Length: 28\r\n\r\nServer Thread Pool Saturated";
+                send(client_sock, busy_resp, (int)strlen(busy_resp), 0);
+#ifdef _WIN32
+                closesocket(client_sock);
+#else
+                close(client_sock);
+#endif
+                continue;
+            }
+
+            active_clients_.fetch_add(1, std::memory_order_relaxed);
             std::thread([this, client_sock]() {
+                struct ClientGuard {
+                    std::atomic<size_t>& counter;
+                    ~ClientGuard() { counter.fetch_sub(1, std::memory_order_relaxed); }
+                } guard{active_clients_};
+
                 handle_client(client_sock);
             }).detach();
         }
@@ -755,7 +799,7 @@ private:
         }
     }
 
-    void handle_native_chat_completions(int client_sock, const std::string& request) {
+    void handle_native_chat_completions(socket_t client_sock, const std::string& request) {
         std::lock_guard<std::mutex> lock(engine_mutex_);
         size_t body_pos = request.find("\r\n\r\n");
         std::string body = (body_pos != std::string::npos) ? request.substr(body_pos + 4) : request;
@@ -1190,7 +1234,7 @@ private:
         }
     }
 
-    void handle_client(int sock) {
+    void handle_client(socket_t sock) {
         std::string request;
         char buffer[16384] = {0};
         
@@ -1211,8 +1255,22 @@ private:
                 if (cl_pos == std::string::npos) cl_pos = request.find("content-length: ");
                 if (cl_pos != std::string::npos) {
                     size_t cl_end = request.find("\r\n", cl_pos);
-                    int content_len = std::stoi(request.substr(cl_pos + 16, cl_end - (cl_pos + 16)));
-                    size_t total_expected = header_end + 4 + content_len;
+                    if (cl_end == std::string::npos) break;
+                    std::string len_str = request.substr(cl_pos + 16, cl_end - (cl_pos + 16));
+                    size_t f = len_str.find_first_not_of(" \t");
+                    size_t l = len_str.find_last_not_of(" \t");
+                    if (f == std::string::npos) break;
+                    len_str = len_str.substr(f, l - f + 1);
+
+                    uint64_t parsed_len = 0;
+                    auto [ptr, ec] = std::from_chars(len_str.data(), len_str.data() + len_str.size(), parsed_len);
+                    constexpr uint64_t MAX_HTTP_PAYLOAD = 32ULL * 1024 * 1024;
+                    if (ec != std::errc() || ptr != len_str.data() + len_str.size() || parsed_len > MAX_HTTP_PAYLOAD) {
+                        const char* bad_req = "HTTP/1.1 400 Bad Request\r\nContent-Length: 22\r\n\r\nInvalid Content-Length";
+                        send_all(sock, bad_req, (int)strlen(bad_req));
+                        break;
+                    }
+                    size_t total_expected = header_end + 4 + static_cast<size_t>(parsed_len);
                     if (request.length() >= total_expected) {
                         break; // Fully received!
                     }
@@ -1261,6 +1319,7 @@ private:
         }
 
         if (path == "/api/memories/stats" || path == "/api/stats") {
+            std::lock_guard<std::mutex> lock(engine_mutex_);
             const auto& mems = haven_engine_.get_memory_engine().get_all_memories();
             size_t hmb_size = 0;
             try {
@@ -1277,6 +1336,7 @@ private:
             send(sock, resp.c_str(), (int)resp.length(), 0);
         }
         else if (path.starts_with("/api/memories/search")) {
+            std::lock_guard<std::mutex> lock(engine_mutex_);
             std::string query = "";
             size_t q_pos = request.find("\"query\":");
             if (q_pos != std::string::npos) {
@@ -1309,6 +1369,7 @@ private:
             send(sock, resp.c_str(), (int)resp.length(), 0);
         }
         else if (path.starts_with("/api/memories")) {
+            std::lock_guard<std::mutex> lock(engine_mutex_);
             if (method == "GET") {
                 const auto& mems = haven_engine_.get_memory_engine().get_all_memories();
                 std::string json = "{\"ok\":true,\"total\":" + std::to_string(mems.size()) + ",\"memories\":[";
@@ -1534,13 +1595,21 @@ private:
         }
         else if (path == "/api/save_image") {
             std::string b64 = extract_json_string(request, "b64_json");
-            std::string fname = extract_json_string(request, "filename");
-            if (fname.empty()) {
+            std::string raw_fname = extract_json_string(request, "filename");
+            std::string fname;
+            if (raw_fname.empty()) {
                 auto now = std::chrono::system_clock::now();
                 auto in_time_t = std::chrono::system_clock::to_time_t(now);
                 std::stringstream ss;
                 ss << "aura_artwork_" << in_time_t << ".png";
                 fname = ss.str();
+            } else {
+                fname = std::filesystem::path(raw_fname).filename().string();
+                if (fname.find("..") != std::string::npos || fname.find('/') != std::string::npos || 
+                    fname.find('\\') != std::string::npos || fname.find(':') != std::string::npos ||
+                    fname.find('\0') != std::string::npos) {
+                    fname = "aura_artwork_sanitized.png";
+                }
             }
             if (!fname.ends_with(".png") && !fname.ends_with(".jpg")) {
                 fname += ".png";
@@ -1968,8 +2037,9 @@ private:
         }
         else {
             // Check for static file in wwwroot
-            std::string rel_path = path;
-            if (rel_path.find("..") != std::string::npos || rel_path.find(':') != std::string::npos || rel_path.find('\\') != std::string::npos) {
+            std::string decoded_path = url_decode(path);
+            if (decoded_path.find("..") != std::string::npos || decoded_path.find(':') != std::string::npos || 
+                decoded_path.find('\\') != std::string::npos || decoded_path.find('\0') != std::string::npos) {
                 std::string forbidden = "HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\n\r\nForbidden";
                 send_all(sock, forbidden.c_str(), (int)forbidden.length());
 #ifdef _WIN32
@@ -1980,13 +2050,32 @@ private:
                 return;
             }
 
-            if (rel_path == "/" || rel_path.empty()) rel_path = "/index.html";
-            std::string local_path = "wwwroot" + rel_path;
+            if (decoded_path == "/" || decoded_path.empty()) decoded_path = "/index.html";
+
+            std::filesystem::path root_dir = std::filesystem::weakly_canonical("wwwroot");
+            std::string clean_rel = decoded_path.front() == '/' ? decoded_path.substr(1) : decoded_path;
+            std::string rel_path = clean_rel;
+            std::filesystem::path target_file = std::filesystem::weakly_canonical(root_dir / clean_rel);
+
+            std::string root_str = root_dir.string();
+            std::string target_str = target_file.string();
+            if (target_str.compare(0, root_str.size(), root_str) != 0) {
+                std::string forbidden = "HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\n\r\nForbidden";
+                send_all(sock, forbidden.c_str(), (int)forbidden.length());
+#ifdef _WIN32
+                closesocket(sock);
+#else
+                close(sock);
+#endif
+                return;
+            }
+
+            std::string local_path = target_str;
             FILE* f = fopen(local_path.c_str(), "rb");
             if (!f) {
-                local_path = "C:\\Users\\admin\\source\\haven-cpp\\wwwroot" + rel_path;
-                for (char& c : local_path) if (c == '/') c = '\\';
-                f = fopen(local_path.c_str(), "rb");
+                std::string fallback_path = "C:\\Users\\admin\\source\\haven-cpp\\wwwroot\\" + clean_rel;
+                for (char& c : fallback_path) if (c == '/') c = '\\';
+                f = fopen(fallback_path.c_str(), "rb");
             }
 
             if (f) {

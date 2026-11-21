@@ -240,6 +240,24 @@ bool MemoryAttentionEngine::load_from_hmb(const std::string& filepath) {
         return false;
     }
 
+    std::error_code ec;
+    uintmax_t disk_sz = std::filesystem::file_size(filepath, ec);
+    if (ec || disk_sz < sizeof(HmbHeader64)) return false;
+
+    if (hdr.total_anchors > 1000000 || hdr.embedding_dim > 8192 || hdr.string_table_size > 128ULL * 1024 * 1024) {
+        std::cerr << "[HMB] Error: Header parameters exceed sanity thresholds in " << filepath << "\n";
+        return false;
+    }
+
+    uint64_t vec_bytes = hdr.total_anchors * hdr.embedding_dim * sizeof(float);
+    uint64_t rec_bytes = hdr.total_anchors * sizeof(HmbRecord64);
+    if (hdr.vector_table_offset > disk_sz || vec_bytes > disk_sz - hdr.vector_table_offset ||
+        hdr.record_table_offset > disk_sz || rec_bytes > disk_sz - hdr.record_table_offset ||
+        hdr.string_table_offset > disk_sz || hdr.string_table_size > disk_sz - hdr.string_table_offset) {
+        std::cerr << "[HMB] Error: Vault file table boundaries violate physical file length in " << filepath << "\n";
+        return false;
+    }
+
     uint64_t total = hdr.total_anchors;
     uint32_t dim = hdr.embedding_dim;
 
