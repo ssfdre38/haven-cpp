@@ -487,23 +487,71 @@ void PipelineClusterScheduler::partition_layers(uint32_t total_layers, std::vect
     }
 
     size_t num_nodes = nodes_.size();
+    if (num_nodes == 1) {
+        nodes_[0].start_layer = 0;
+        nodes_[0].end_layer = total_layers_;
+        nodes = nodes_;
+        return;
+    }
 
-    // 1. Calculate weighted capacity based on memory footprint and TFLOPS
-    double total_weight = 0.0;
+    // 1. Detect if dedicated high-throughput accelerator workers exist
+    bool has_accelerator_workers = false;
+    float max_worker_tflops = 0.0f;
+    for (size_t i = 0; i < num_nodes; ++i) {
+        if (nodes_[i].role == ClusterRole::WORKER) {
+            if (nodes_[i].backend == DeviceBackend::TPU_PJRT || 
+                nodes_[i].backend == DeviceBackend::GPU_NUMA || 
+                nodes_[i].peak_tflops >= 100.0f) {
+                has_accelerator_workers = true;
+            }
+            if (nodes_[i].peak_tflops > max_worker_tflops) {
+                max_worker_tflops = nodes_[i].peak_tflops;
+            }
+        }
+    }
+
+    // 2. Compute dynamic compute weights
+    // If high-throughput accelerator workers are attached, a CPU host coordinator
+    // enters Thin Gateway Mode (0 compute layers) to prevent pipeline stall bubbles.
     std::vector<double> weights(num_nodes, 0.0);
+    double total_weight = 0.0;
 
     for (size_t i = 0; i < num_nodes; ++i) {
-        // Pure coordinator with 0 memory/flops does not take compute layers when workers exist
-        if (nodes_[i].role == ClusterRole::COORDINATOR && num_nodes > 1 && 
-            nodes_[i].total_memory_bytes == 0 && nodes_[i].peak_tflops == 0.0f) {
-            weights[i] = 0.0;
-            continue;
+        // Explicit pure coordinator or Thin Gateway when accelerator workers exist
+        if (nodes_[i].role == ClusterRole::COORDINATOR) {
+            if (has_accelerator_workers && (nodes_[i].backend == DeviceBackend::CPU_AVX2 || nodes_[i].peak_tflops < 0.2f * max_worker_tflops)) {
+                weights[i] = 0.0;
+                continue;
+            }
+            if (nodes_[i].total_memory_bytes == 0 && nodes_[i].peak_tflops == 0.0f) {
+                weights[i] = 0.0;
+                continue;
+            }
         }
 
-        double mem_weight = (nodes_[i].total_memory_bytes > 0) ? 
-                            (double)nodes_[i].total_memory_bytes / (1024.0 * 1024.0 * 1024.0) : 16.0;
-        double flops_weight = (nodes_[i].peak_tflops > 0.0f) ? (double)nodes_[i].peak_tflops : 10.0;
-        weights[i] = mem_weight * 0.7 + flops_weight * 0.3;
+        // Hardware backend multiplier
+        double backend_mult = 1.0;
+        switch (nodes_[i].backend) {
+            case DeviceBackend::TPU_PJRT:      backend_mult = 1.00; break;
+            case DeviceBackend::GPU_NUMA:      backend_mult = 0.95; break;
+            case DeviceBackend::FABRIC_REMOTE: backend_mult = 0.85; break;
+            case DeviceBackend::CPU_AVX2:      backend_mult = 0.25; break;
+            default:                           backend_mult = 0.50; break;
+        }
+
+        double flops = (nodes_[i].peak_tflops > 0.0f) ? (double)nodes_[i].peak_tflops : 10.0;
+        double mem_gb = (nodes_[i].total_memory_bytes > 0) ? 
+                        (double)nodes_[i].total_memory_bytes / (1024.0 * 1024.0 * 1024.0) : 16.0;
+
+        // Compute throughput dominates layer allocation (85% FLOPS capacity, 15% Memory capacity)
+        double compute_capacity = (flops * 0.85 + (mem_gb * 0.15)) * backend_mult;
+
+        // Latency penalty for high-latency WAN links: penalize intermediate hops across public internet
+        if (nodes_[i].interconnect_latency_ms > 2.0f) {
+            compute_capacity /= (1.0 + 0.05 * (double)nodes_[i].interconnect_latency_ms);
+        }
+
+        weights[i] = std::max(0.01, compute_capacity);
         total_weight += weights[i];
     }
 
@@ -512,28 +560,42 @@ void PipelineClusterScheduler::partition_layers(uint32_t total_layers, std::vect
         weights[0] = 1.0;
     }
 
-    // 2. Assign layer ranges proportionally
+    // 3. Assign layer spans strictly proportional to compute capacity
     uint32_t current_layer = 0;
+    size_t last_active_idx = 0;
+    for (size_t i = 0; i < num_nodes; ++i) {
+        if (weights[i] > 0.0) last_active_idx = i;
+    }
+
     for (size_t i = 0; i < num_nodes; ++i) {
         if (weights[i] <= 0.0) {
-            nodes_[i].start_layer = 0;
-            nodes_[i].end_layer = 0;
+            nodes_[i].start_layer = current_layer;
+            nodes_[i].end_layer = current_layer;
             continue;
         }
 
         uint32_t node_layers = 0;
-        if (i == num_nodes - 1 || current_layer >= total_layers_) {
-            // Last node takes all remaining layers to ensure exact coverage
+        if (i == last_active_idx || current_layer >= total_layers_) {
             node_layers = (total_layers_ > current_layer) ? (total_layers_ - current_layer) : 0;
         } else {
             double fraction = weights[i] / total_weight;
-            node_layers = static_cast<uint32_t>(fraction * total_layers_);
-            if (node_layers == 0 && current_layer < total_layers_) node_layers = 1;
+            node_layers = static_cast<uint32_t>(std::round(fraction * total_layers_));
+            if (node_layers == 0 && current_layer < total_layers_) {
+                node_layers = 1;
+            }
+            if (current_layer + node_layers > total_layers_) {
+                node_layers = total_layers_ - current_layer;
+            }
         }
 
         nodes_[i].start_layer = current_layer;
         nodes_[i].end_layer = current_layer + node_layers;
         current_layer = nodes_[i].end_layer;
+    }
+
+    // Ensure last active node closes out the remainder
+    if (current_layer < total_layers_ && weights[last_active_idx] > 0.0) {
+        nodes_[last_active_idx].end_layer = total_layers_;
     }
 
     nodes = nodes_; // update caller
@@ -596,9 +658,13 @@ std::string PipelineClusterScheduler::generate_partition_report() const {
         if (node.backend == DeviceBackend::TPU_PJRT) {
             ss << " | Torus Mesh: (" << node.torus_x << ", " << node.torus_y << ", " << node.torus_z << ")";
         }
-        ss << "\n"
-           << "║   Layers   : [" << node.start_layer << " .. " << (node.end_layer > 0 ? node.end_layer - 1 : 0) << "] (" << span << " layers)\n"
-           << "║   Memory   : " << (node.total_memory_bytes / (1024*1024*1024)) << " GB Total\n"
+        ss << "\n";
+        if (span == 0 && node.role == ClusterRole::COORDINATOR) {
+            ss << "║   Layers   : [Thin Gateway / Sensory Coordinator] (0 compute layers)\n";
+        } else {
+            ss << "║   Layers   : [" << node.start_layer << " .. " << (node.end_layer > 0 ? node.end_layer - 1 : 0) << "] (" << span << " layers)\n";
+        }
+        ss << "║   Memory   : " << (node.total_memory_bytes / (1024*1024*1024)) << " GB Total\n"
            << "║   Compute  : " << node.peak_tflops << " TFLOPS\n"
            << "╟──────────────────────────────────────────────────────────────────────╢\n";
     }

@@ -104,6 +104,71 @@ int main() {
     std::cout << "✅ [PASS] Pipeline parallel heterogeneous layer partitioning verified.\n";
 
     // ------------------------------------------------------------------------
+    // 3b. Verify Heterogeneous Accelerator Offload / Thin Gateway Mode
+    // ------------------------------------------------------------------------
+    std::cout << "\n[TEST] Verifying Heterogeneous Accelerator Offload (Thin Gateway CPU Host + 3 TPU Pods)...\n";
+    std::vector<haven::ClusterNodeInfo> hybrid_cluster;
+    
+    // Node 0: Windows Host Coordinator (CPU AVX2, 10 TFLOPS, 64 GB RAM)
+    haven::ClusterNodeInfo h0;
+    h0.node_id = 0;
+    h0.address = "127.0.0.1";
+    h0.port = 11750;
+    h0.role = haven::ClusterRole::COORDINATOR;
+    h0.backend = haven::DeviceBackend::CPU_AVX2;
+    h0.total_memory_bytes = 64ULL * 1024 * 1024 * 1024;
+    h0.peak_tflops = 10.0f;
+    hybrid_cluster.push_back(h0);
+
+    // Node 1: TPU Pod 1 (TPU PJRT, 275 TFLOPS, 32 GB HBM)
+    haven::ClusterNodeInfo h1;
+    h1.node_id = 1;
+    h1.address = "10.128.0.2";
+    h1.port = 11601;
+    h1.role = haven::ClusterRole::WORKER;
+    h1.backend = haven::DeviceBackend::TPU_PJRT;
+    h1.total_memory_bytes = 32ULL * 1024 * 1024 * 1024;
+    h1.peak_tflops = 275.0f;
+    hybrid_cluster.push_back(h1);
+
+    // Node 2: TPU Pod 2 (TPU PJRT, 275 TFLOPS, 32 GB HBM)
+    haven::ClusterNodeInfo h2;
+    h2.node_id = 2;
+    h2.address = "10.128.0.3";
+    h2.port = 11602;
+    h2.role = haven::ClusterRole::WORKER;
+    h2.backend = haven::DeviceBackend::TPU_PJRT;
+    h2.total_memory_bytes = 32ULL * 1024 * 1024 * 1024;
+    h2.peak_tflops = 275.0f;
+    hybrid_cluster.push_back(h2);
+
+    // Node 3: TPU Pod 3 (TPU PJRT, 275 TFLOPS, 32 GB HBM)
+    haven::ClusterNodeInfo h3;
+    h3.node_id = 3;
+    h3.address = "10.128.0.4";
+    h3.port = 11603;
+    h3.role = haven::ClusterRole::WORKER;
+    h3.backend = haven::DeviceBackend::TPU_PJRT;
+    h3.total_memory_bytes = 32ULL * 1024 * 1024 * 1024;
+    h3.peak_tflops = 275.0f;
+    hybrid_cluster.push_back(h3);
+
+    scheduler.partition_layers(32, hybrid_cluster);
+    std::cout << scheduler.generate_partition_report() << std::endl;
+
+    // Verify CPU coordinator entered Thin Gateway Mode (0 compute layers)
+    assert(hybrid_cluster[0].start_layer == 0 && hybrid_cluster[0].end_layer == 0 && "Coordinator must have 0 layers in Thin Gateway Mode");
+    assert(hybrid_cluster[1].start_layer == 0 && "TPU Worker 1 must start at layer 0");
+    assert(hybrid_cluster[1].end_layer == hybrid_cluster[2].start_layer && "TPU 1 and TPU 2 must be contiguous");
+    assert(hybrid_cluster[2].end_layer == hybrid_cluster[3].start_layer && "TPU 2 and TPU 3 must be contiguous");
+    assert(hybrid_cluster[3].end_layer == 32 && "TPU 3 must complete at layer 32");
+
+    // Verify routing: Layer 0 routes directly to TPU Pod 1, Layer 31 routes to TPU Pod 3
+    assert(scheduler.get_node_for_layer(0) == 1 && "Layer 0 must map to TPU Worker 1");
+    assert(scheduler.get_node_for_layer(31) == 3 && "Layer 31 must map to TPU Worker 3");
+    std::cout << "✅ [PASS] Heterogeneous Accelerator Offload (Thin Gateway Mode) verified.\n";
+
+    // ------------------------------------------------------------------------
     // 4. Verify Zero-Copy Network Transport Ring (Loopback Coordinator & Worker)
     // ------------------------------------------------------------------------
     std::cout << "[TEST] Launching loopback Coordinator and Worker nodes on local transport ring...\n";
