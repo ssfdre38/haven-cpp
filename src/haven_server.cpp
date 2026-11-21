@@ -1,6 +1,7 @@
 #include "haven/haven_engine.h"
 #include "haven/haven_mlx.h"
 #include "haven/haven_cluster.h"
+#include "haven/haven_json.h"
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -536,34 +537,17 @@ private:
             fclose(f);
             content.resize(got);
 
-            size_t pos = content.find("\"directories\"");
-            if (pos != std::string::npos) {
-                size_t arr_start = content.find("[", pos);
-                size_t arr_end = content.find("]", arr_start);
-                if (arr_start != std::string::npos && arr_end != std::string::npos) {
-                    std::string inside = content.substr(arr_start + 1, arr_end - arr_start - 1);
-                    std::stringstream ss(inside);
-                    std::string item;
-                    while (std::getline(ss, item, ',')) {
-                        size_t q1 = item.find('"');
-                        size_t q2 = item.rfind('"');
-                        if (q1 != std::string::npos && q2 != std::string::npos && q2 > q1) {
-                            std::string dir = item.substr(q1 + 1, q2 - q1 - 1);
-                            std::string unescaped;
-                            for (size_t i = 0; i < dir.length(); ++i) {
-                                if (dir[i] == '\\' && i + 1 < dir.length() && dir[i+1] == '\\') {
-                                    unescaped += '\\';
-                                    i++;
-                                } else {
-                                    unescaped += dir[i];
-                                }
-                            }
-                            std::error_code ec;
-                            if (std::filesystem::exists(unescaped, ec) && std::filesystem::is_directory(unescaped, ec)) {
-                                auto it = std::find(model_search_dirs_.begin(), model_search_dirs_.end(), unescaped);
-                                if (it == model_search_dirs_.end()) {
-                                    model_search_dirs_.insert(model_search_dirs_.begin(), unescaped);
-                                }
+            HavenJson root;
+            if (HavenJson::parse(content, root)) {
+                if (const HavenJson* dirs = root.find("directories"); dirs && dirs->is_array()) {
+                    for (const auto& elem : dirs->as_array()) {
+                        if (!elem.is_string()) continue;
+                        const std::string& dir = elem.as_string();
+                        std::error_code ec;
+                        if (std::filesystem::exists(dir, ec) && std::filesystem::is_directory(dir, ec)) {
+                            auto it = std::find(model_search_dirs_.begin(), model_search_dirs_.end(), dir);
+                            if (it == model_search_dirs_.end()) {
+                                model_search_dirs_.insert(model_search_dirs_.begin(), dir);
                             }
                         }
                     }
@@ -671,6 +655,11 @@ private:
     }
 
     static std::string extract_json_string(const std::string& json, const std::string& key) {
+        HavenJson parsed;
+        if (HavenJson::parse(json, parsed) && parsed.is_object()) {
+            return parsed.get_string(key);
+        }
+        // Fallback for non-JSON fragments (e.g., partial SSE lines)
         std::string search = "\"" + key + "\"";
         size_t pos = 0;
         while ((pos = json.find(search, pos)) != std::string::npos) {
@@ -687,7 +676,7 @@ private:
                 cur++;
             }
             if (cur >= json.length() || json[cur] != '"') {
-                return ""; // Key found, but value is not a JSON string (e.g. number/null/bool)
+                return "";
             }
             cur++;
             std::string out;
@@ -712,6 +701,10 @@ private:
     }
 
     static std::string extract_json_scalar(const std::string& json, const std::string& key) {
+        HavenJson parsed;
+        if (HavenJson::parse(json, parsed) && parsed.is_object()) {
+            return parsed.get_scalar_string(key);
+        }
         std::string s = extract_json_string(json, key);
         if (!s.empty()) return s;
         std::string search = "\"" + key + "\"";
@@ -1058,20 +1051,35 @@ private:
         std::string prompt = extract_json_string(body, "prompt");
         if (prompt.empty()) {
             std::string last_user_msg = "";
-            size_t msg_pos = 0;
-            while ((msg_pos = body.find("{\"role\":", msg_pos)) != std::string::npos) {
-                size_t end_msg = body.find("}", msg_pos);
-                if (end_msg == std::string::npos) break;
-                std::string msg_chunk = body.substr(msg_pos, end_msg - msg_pos + 1);
-
-                std::string role = extract_json_string(msg_chunk, "role");
-                std::string content = extract_json_string(msg_chunk, "content");
-
-                if (!role.empty() && !content.empty()) {
-                    prompt += "<|turn>" + role + "\n" + content + "<turn|>\n";
-                    if (role == "user") last_user_msg = content;
+            HavenJson req_json;
+            if (HavenJson::parse(body, req_json) && req_json.is_object()) {
+                if (const HavenJson* msgs = req_json.find("messages"); msgs && msgs->is_array()) {
+                    for (const auto& m : msgs->as_array()) {
+                        if (!m.is_object()) continue;
+                        std::string role = m.get_string("role");
+                        std::string content = m.get_string("content");
+                        if (!role.empty() && !content.empty()) {
+                            prompt += "<|turn>" + role + "\n" + content + "<turn|>\n";
+                            if (role == "user") last_user_msg = content;
+                        }
+                    }
                 }
-                msg_pos = end_msg + 1;
+            } else {
+                size_t msg_pos = 0;
+                while ((msg_pos = body.find("{\"role\":", msg_pos)) != std::string::npos) {
+                    size_t end_msg = body.find("}", msg_pos);
+                    if (end_msg == std::string::npos) break;
+                    std::string msg_chunk = body.substr(msg_pos, end_msg - msg_pos + 1);
+
+                    std::string role = extract_json_string(msg_chunk, "role");
+                    std::string content = extract_json_string(msg_chunk, "content");
+
+                    if (!role.empty() && !content.empty()) {
+                        prompt += "<|turn>" + role + "\n" + content + "<turn|>\n";
+                        if (role == "user") last_user_msg = content;
+                    }
+                    msg_pos = end_msg + 1;
+                }
             }
 
             if (prompt.empty()) {

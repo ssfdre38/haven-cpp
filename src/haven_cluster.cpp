@@ -240,7 +240,33 @@ bool ClusterTransportRing::start_server(uint16_t port) {
     return true;
 }
 
-bool ClusterTransportRing::connect_to_peer(uint32_t node_id, const std::string& address, uint16_t port) {
+static void build_aead_nonce(bool sender_is_initiator, uint64_t wire_counter, uint8_t nonce[12]) {
+    // Direction-separated 4-byte domain tag + 8-byte strictly monotonic LE counter
+    if (sender_is_initiator) {
+        nonce[0] = 'C'; nonce[1] = 'T'; nonce[2] = 'W'; nonce[3] = '1';
+    } else {
+        nonce[0] = 'R'; nonce[1] = 'T'; nonce[2] = 'C'; nonce[3] = '1';
+    }
+    for (int i = 0; i < 8; ++i) {
+        nonce[4 + i] = static_cast<uint8_t>((wire_counter >> (i * 8)) & 0xFFU);
+    }
+}
+
+static uint64_t load_le64_bytes(const uint8_t p[8]) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) {
+        v |= (static_cast<uint64_t>(p[i]) << (i * 8));
+    }
+    return v;
+}
+
+static void store_le64_bytes(uint8_t p[8], uint64_t v) {
+    for (int i = 0; i < 8; ++i) {
+        p[i] = static_cast<uint8_t>((v >> (i * 8)) & 0xFFU);
+    }
+}
+
+bool ClusterTransportRing::connect_to_peer(uint32_t node_id, const std::string& address, uint16_t port, uint32_t local_node_id) {
     socket_t client_fd = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (client_fd == HAVEN_INVALID_SOCKET) {
         return false;
@@ -261,20 +287,120 @@ bool ClusterTransportRing::connect_to_peer(uint32_t node_id, const std::string& 
         return false;
     }
 
+    std::string active_token = get_cluster_token();
+    PeerSession session{};
+    session.socket_handle = static_cast<uint64_t>(client_fd);
+    session.is_initiator = true;
+    session.is_authenticated = true;
+    std::vector<uint8_t> init_key_vec;
+
+    // SHCP v2 Zero-Secret-On-Wire Mutual Challenge-Response Handshake
+    if (!active_token.empty()) {
+        std::atomic<bool> hs_alive{true};
+
+        // 1. Receive server challenge nonce (36-byte header + 32-byte server_nonce)
+        HavenActivationFrameHeader chal_hdr{};
+        if (!recv_all(client_fd, &chal_hdr, sizeof(chal_hdr), hs_alive, 5000) ||
+            chal_hdr.magic != HAVEN_CLUSTER_MAGIC ||
+            chal_hdr.protocol_ver != HAVEN_CLUSTER_VERSION ||
+            !(chal_hdr.flags & FRAME_FLAG_CHALLENGE) ||
+            chal_hdr.payload_bytes != 32)
+        {
+            std::cerr << "⛔ [ClusterSecurity] Peer failed to issue valid SHCP v2 challenge.\n";
+            closesocket(client_fd);
+            return false;
+        }
+        uint8_t server_nonce[32] = {0};
+        if (!recv_all(client_fd, server_nonce, sizeof(server_nonce), hs_alive, 5000)) {
+            closesocket(client_fd);
+            return false;
+        }
+
+        // 2. Generate 256-bit client nonce & compute HMAC-SHA256 client proof (token never leaves host)
+        uint8_t client_nonce[32] = {0};
+        uint8_t client_proof[32] = {0};
+        HavenSecurity::generate_random_bytes(client_nonce, sizeof(client_nonce));
+        HavenSecurity::derive_shcp_client_proof(active_token, server_nonce, client_nonce,
+                                                static_cast<uint16_t>(local_node_id), client_proof);
+
+        HavenActivationFrameHeader hs_hdr{};
+        hs_hdr.magic = HAVEN_CLUSTER_MAGIC;
+        hs_hdr.protocol_ver = HAVEN_CLUSTER_VERSION;
+        hs_hdr.flags = FRAME_FLAG_HANDSHAKE;
+        hs_hdr.from_node_id = static_cast<uint16_t>(local_node_id);
+        hs_hdr.to_node_id = static_cast<uint16_t>(node_id);
+        hs_hdr.element_count = 16; // 64 bytes / 4
+        hs_hdr.payload_bytes = 64;
+
+        uint8_t hs_payload[64];
+        std::memcpy(hs_payload, client_nonce, 32);
+        std::memcpy(hs_payload + 32, client_proof, 32);
+
+        if (!send_all(client_fd, &hs_hdr, sizeof(hs_hdr)) ||
+            !send_all(client_fd, hs_payload, sizeof(hs_payload)))
+        {
+            HavenSecurity::secure_zero(client_proof, sizeof(client_proof));
+            closesocket(client_fd);
+            return false;
+        }
+
+        // 3. Receive and verify server mutual authentication proof (FRAME_FLAG_HANDSHAKE_ACK)
+        HavenActivationFrameHeader ack_hdr{};
+        if (!recv_all(client_fd, &ack_hdr, sizeof(ack_hdr), hs_alive, 5000) ||
+            ack_hdr.magic != HAVEN_CLUSTER_MAGIC ||
+            ack_hdr.protocol_ver != HAVEN_CLUSTER_VERSION ||
+            (ack_hdr.flags & FRAME_FLAG_AUTH_REJECT) ||
+            !(ack_hdr.flags & FRAME_FLAG_HANDSHAKE_ACK) ||
+            ack_hdr.payload_bytes != 32)
+        {
+            std::cerr << "⛔ [ClusterSecurity] Peer rejected SHCP v2 authentication handshake.\n";
+            HavenSecurity::secure_zero(client_proof, sizeof(client_proof));
+            closesocket(client_fd);
+            return false;
+        }
+        uint8_t server_proof[32] = {0};
+        if (!recv_all(client_fd, server_proof, sizeof(server_proof), hs_alive, 5000)) {
+            HavenSecurity::secure_zero(client_proof, sizeof(client_proof));
+            closesocket(client_fd);
+            return false;
+        }
+
+        uint8_t expected_server_proof[32] = {0};
+        HavenSecurity::derive_shcp_server_proof(active_token, server_nonce, client_nonce,
+                                                static_cast<uint16_t>(local_node_id), expected_server_proof);
+        bool server_ok = HavenSecurity::constant_time_memeq(server_proof, expected_server_proof, 32);
+        HavenSecurity::secure_zero(expected_server_proof, sizeof(expected_server_proof));
+        HavenSecurity::secure_zero(client_proof, sizeof(client_proof));
+        if (!server_ok) {
+            std::cerr << "⛔ [ClusterSecurity] Server mutual authentication proof FAILED! Possible MitM.\n";
+            closesocket(client_fd);
+            return false;
+        }
+
+        // 4. Derive unique per-session 256-bit ChaCha20-Poly1305 AEAD key
+        HavenSecurity::derive_shcp_session_key(active_token, server_nonce, client_nonce, session.session_key);
+        session.has_session_key = true;
+        init_key_vec.assign(session.session_key, session.session_key + 32);
+        HavenSecurity::secure_zero(server_nonce, sizeof(server_nonce));
+        HavenSecurity::secure_zero(client_nonce, sizeof(client_nonce));
+    }
+
     uint64_t sock_val = static_cast<uint64_t>(client_fd);
     {
         std::lock_guard<std::mutex> lock(peers_mutex_);
-        peer_sockets_[node_id] = sock_val;
+        peer_sessions_[node_id] = session;
     }
 
     // Launch background receiver thread for this peer connection (outbound)
     {
         std::lock_guard<std::mutex> lock(threads_mutex_);
-        client_threads_.emplace_back(&ClusterTransportRing::client_recv_loop, this, sock_val, node_id, false);
+        client_threads_.emplace_back(&ClusterTransportRing::client_recv_loop, this,
+                                     sock_val, node_id, false, session.has_session_key, true, init_key_vec);
     }
 
     std::cout << "🔗 [ClusterTransportRing] Connected to peer Node " << node_id 
-              << " (" << address << ":" << port << ")\n";
+              << " (" << address << ":" << port << ")"
+              << (session.has_session_key ? " [SHCP v2 AEAD Mutual Auth]" : "") << "\n";
     return true;
 }
 
@@ -288,8 +414,8 @@ void ClusterTransportRing::stop() {
     // 1. Shutdown all peer sockets to immediately unblock any blocking recv calls
     {
         std::lock_guard<std::mutex> lock(peers_mutex_);
-        for (auto& [id, s_val] : peer_sockets_) {
-            socket_t s = static_cast<socket_t>(s_val);
+        for (auto& [id, sess] : peer_sessions_) {
+            socket_t s = static_cast<socket_t>(sess.socket_handle);
 #if defined(_WIN32)
             ::shutdown(s, SD_BOTH);
 #else
@@ -322,62 +448,90 @@ void ClusterTransportRing::stop() {
         }
     }
 
-    // 4. Ensure any remaining peer sockets are closed
+    // 4. Close remaining sockets and securely zero all session keys
     {
         std::lock_guard<std::mutex> lock(peers_mutex_);
-        for (auto& [id, s_val] : peer_sockets_) {
-            closesocket(static_cast<socket_t>(s_val));
+        for (auto& [id, sess] : peer_sessions_) {
+            closesocket(static_cast<socket_t>(sess.socket_handle));
+            HavenSecurity::secure_zero(sess.session_key, sizeof(sess.session_key));
         }
-        peer_sockets_.clear();
+        peer_sessions_.clear();
     }
 }
 
 bool ClusterTransportRing::send_activation(uint32_t target_node_id, const HavenActivationFrame& frame) {
+    // Lock ordering: ALWAYS send_mutex_ -> peers_mutex_ to preserve strictly monotonic AEAD TX counters
+    std::lock_guard<std::mutex> send_lock(send_mutex_);
+
     socket_t sock = HAVEN_INVALID_SOCKET;
+    bool has_key = false;
+    bool is_initiator = false;
+    uint8_t session_key[32] = {0};
+    uint64_t wire_ctr = 0;
+
     {
         std::lock_guard<std::mutex> lock(peers_mutex_);
-        auto it = peer_sockets_.find(target_node_id);
-        if (it != peer_sockets_.end()) {
-            sock = static_cast<socket_t>(it->second);
+        auto it = peer_sessions_.find(target_node_id);
+        if (it == peer_sessions_.end() || !it->second.is_authenticated) {
+            return false;
+        }
+        sock = static_cast<socket_t>(it->second.socket_handle);
+        has_key = it->second.has_session_key;
+        is_initiator = it->second.is_initiator;
+        if (has_key) {
+            std::memcpy(session_key, it->second.session_key, 32);
+            wire_ctr = ++it->second.tx_counter;
         }
     }
 
     if (sock == HAVEN_INVALID_SOCKET) {
+        HavenSecurity::secure_zero(session_key, sizeof(session_key));
         return false;
     }
 
-    std::string active_token = get_cluster_token();
-    std::lock_guard<std::mutex> send_lock(send_mutex_);
+    const bool is_protected_data =
+        (frame.header.flags & (FRAME_FLAG_ACTIVATION | FRAME_FLAG_KV_SYNC | FRAME_FLAG_LOGITS)) != 0;
 
-    // Encrypt payload if token is active and frame is an activation tensor
-    if (!active_token.empty() && (frame.header.flags & FRAME_FLAG_ACTIVATION) && !frame.data.empty()) {
-        HavenActivationFrame enc_frame = frame;
-        enc_frame.header.flags |= FRAME_FLAG_ENCRYPTED;
-        HavenSecurity::mask_activation_payload(enc_frame.data.data(), enc_frame.data.size(), 
-                                              active_token, enc_frame.header.sequence_id, enc_frame.header.step_pos);
-        if (!send_all(sock, &enc_frame.header, sizeof(enc_frame.header))) {
+    if (has_key && is_protected_data) {
+        HavenActivationFrameHeader wire_hdr = frame.header;
+        wire_hdr.flags |= FRAME_FLAG_ENCRYPTED;
+        const size_t pt_bytes = frame.data.size() * sizeof(float);
+        wire_hdr.element_count = static_cast<uint32_t>(frame.data.size());
+        // Wire payload = ciphertext (pt_bytes) + wire_counter (8B) + Poly1305 tag (16B)
+        wire_hdr.payload_bytes = static_cast<uint32_t>(pt_bytes + 24);
+
+        uint8_t nonce[12];
+        build_aead_nonce(is_initiator, wire_ctr, nonce);
+
+        std::vector<uint8_t> wire_payload(pt_bytes + 24, 0);
+        uint8_t tag[16] = {0};
+        HavenSecurity::aead_encrypt(
+            session_key, nonce,
+            reinterpret_cast<const uint8_t*>(&wire_hdr), sizeof(wire_hdr),
+            pt_bytes > 0 ? reinterpret_cast<const uint8_t*>(frame.data.data()) : nullptr, pt_bytes,
+            pt_bytes > 0 ? wire_payload.data() : nullptr, tag
+        );
+        store_le64_bytes(wire_payload.data() + pt_bytes, wire_ctr);
+        std::memcpy(wire_payload.data() + pt_bytes + 8, tag, 16);
+        HavenSecurity::secure_zero(session_key, sizeof(session_key));
+
+        if (!send_all(sock, &wire_hdr, sizeof(wire_hdr))) {
             return false;
         }
-        if (enc_frame.header.payload_bytes > 0 && !enc_frame.data.empty()) {
-            if (!send_all(sock, enc_frame.data.data(), enc_frame.header.payload_bytes)) {
-                return false;
-            }
-        }
-        return true;
+        return send_all(sock, wire_payload.data(), wire_payload.size());
     }
 
-    // 1. Send fixed 36-byte header
+    HavenSecurity::secure_zero(session_key, sizeof(session_key));
+
+    // Unauthenticated local benchmark mode or control frame
     if (!send_all(sock, &frame.header, sizeof(frame.header))) {
         return false;
     }
-
-    // 2. Send contiguous raw float data payload with zero copy
     if (frame.header.payload_bytes > 0 && !frame.data.empty()) {
         if (!send_all(sock, frame.data.data(), frame.header.payload_bytes)) {
             return false;
         }
     }
-
     return true;
 }
 
@@ -398,15 +552,18 @@ bool ClusterTransportRing::receive_activation(HavenActivationFrame& out_frame, i
 
 bool ClusterTransportRing::is_peer_connected(uint32_t node_id) const {
     std::lock_guard<std::mutex> lock(peers_mutex_);
-    return peer_sockets_.find(node_id) != peer_sockets_.end();
+    auto it = peer_sessions_.find(node_id);
+    return it != peer_sessions_.end() && it->second.is_authenticated;
 }
 
 std::vector<uint32_t> ClusterTransportRing::get_connected_peer_ids() const {
     std::lock_guard<std::mutex> lock(peers_mutex_);
     std::vector<uint32_t> ids;
-    ids.reserve(peer_sockets_.size());
-    for (const auto& [id, _] : peer_sockets_) {
-        ids.push_back(id);
+    ids.reserve(peer_sessions_.size());
+    for (const auto& [id, sess] : peer_sessions_) {
+        if (sess.is_authenticated) {
+            ids.push_back(id);
+        }
     }
     return ids;
 }
@@ -428,7 +585,7 @@ void ClusterTransportRing::server_listen_loop() {
 
         int sel = ::select(0, &read_fds, nullptr, nullptr, &tv);
         if (sel <= 0) {
-            continue; // Timeout or interrupted; re-check is_running_
+            continue;
         }
 #else
         struct pollfd pfd{};
@@ -458,21 +615,30 @@ void ClusterTransportRing::server_listen_loop() {
         configure_cluster_socket(client_fd);
         uint32_t assigned_id = incoming_node_counter++;
         uint64_t sock_val = static_cast<uint64_t>(client_fd);
+        const bool token_required = !get_cluster_token().empty();
 
         {
             std::lock_guard<std::mutex> lock(peers_mutex_);
-            peer_sockets_[assigned_id] = sock_val;
+            PeerSession pending{};
+            pending.socket_handle = sock_val;
+            pending.is_authenticated = !token_required;
+            pending.is_initiator = false;
+            pending.has_session_key = false;
+            peer_sessions_[assigned_id] = pending;
         }
 
         active_peer_threads_.fetch_add(1, std::memory_order_relaxed);
         {
             std::lock_guard<std::mutex> lock(threads_mutex_);
-            client_threads_.emplace_back(&ClusterTransportRing::client_recv_loop, this, sock_val, assigned_id, true);
+            client_threads_.emplace_back(&ClusterTransportRing::client_recv_loop, this,
+                                         sock_val, assigned_id, true, false, false, std::vector<uint8_t>{});
         }
     }
 }
 
-void ClusterTransportRing::client_recv_loop(uint64_t socket_handle, uint32_t peer_node_id, bool require_auth) {
+void ClusterTransportRing::client_recv_loop(uint64_t socket_handle, uint32_t peer_node_id, bool require_auth,
+                                            bool pre_auth_aead, bool local_is_initiator,
+                                            const std::vector<uint8_t>& initial_session_key) {
     struct PeerThreadGuard {
         std::atomic<size_t>& counter;
         bool tracked;
@@ -482,129 +648,274 @@ void ClusterTransportRing::client_recv_loop(uint64_t socket_handle, uint32_t pee
     } thread_guard{active_peer_threads_, require_auth};
 
     socket_t sock = static_cast<socket_t>(socket_handle);
-    bool is_authenticated = !require_auth || get_cluster_token().empty();
+    std::string init_token = get_cluster_token();
+    bool is_authenticated = !require_auth || init_token.empty();
+    bool has_aead_session = pre_auth_aead && initial_session_key.size() == 32;
+    uint8_t session_key[32] = {0};
+    if (has_aead_session) {
+        std::memcpy(session_key, initial_session_key.data(), 32);
+    }
+    uint64_t rx_last_counter = 0;
 
-    while (is_running_) {
+    uint8_t server_nonce[32] = {0};
+    bool challenge_issued = false;
+
+    // Immediately issue 256-bit random challenge nonce to inbound peers when cluster token is active
+    if (require_auth && !init_token.empty()) {
+        HavenSecurity::generate_random_bytes(server_nonce, sizeof(server_nonce));
+        HavenActivationFrameHeader chal_hdr{};
+        chal_hdr.magic = HAVEN_CLUSTER_MAGIC;
+        chal_hdr.protocol_ver = HAVEN_CLUSTER_VERSION;
+        chal_hdr.flags = FRAME_FLAG_CHALLENGE;
+        chal_hdr.element_count = 8; // 32 bytes / 4
+        chal_hdr.payload_bytes = 32;
+        if (!send_all(sock, &chal_hdr, sizeof(chal_hdr)) ||
+            !send_all(sock, server_nonce, sizeof(server_nonce)))
+        {
+            closesocket(sock);
+            sock = HAVEN_INVALID_SOCKET;
+        } else {
+            challenge_issued = true;
+        }
+    }
+
+    auto send_reject_and_close = [&]() {
+        if (sock != HAVEN_INVALID_SOCKET) {
+            HavenActivationFrameHeader reject_hdr{};
+            reject_hdr.magic = HAVEN_CLUSTER_MAGIC;
+            reject_hdr.protocol_ver = HAVEN_CLUSTER_VERSION;
+            reject_hdr.flags = FRAME_FLAG_AUTH_REJECT;
+            send_all(sock, &reject_hdr, sizeof(reject_hdr));
+#ifdef _WIN32
+            ::shutdown(sock, SD_SEND);
+#else
+            ::shutdown(sock, SHUT_WR);
+#endif
+            closesocket(sock);
+            sock = HAVEN_INVALID_SOCKET;
+        }
+    };
+
+    while (is_running_ && sock != HAVEN_INVALID_SOCKET) {
         HavenActivationFrame frame;
-        // 1. Read fixed 36-byte header (5s deadline if still unauthenticated to prevent port-scanner stalls)
         int hdr_deadline = is_authenticated ? 0 : 5000;
         if (!recv_all(sock, &frame.header, sizeof(frame.header), is_running_, hdr_deadline)) {
-            break; // Connection terminated or handshake timed out
+            break;
         }
 
-        // Validate protocol header
         if (frame.header.magic != HAVEN_CLUSTER_MAGIC || frame.header.protocol_ver != HAVEN_CLUSTER_VERSION) {
             std::cerr << "⚠️ [ClusterTransportRing] Corrupted packet header received from peer Node " << peer_node_id << "\n";
             break;
         }
 
         const bool is_handshake = (frame.header.flags & FRAME_FLAG_HANDSHAKE) != 0;
+        const bool is_encrypted = (frame.header.flags & FRAME_FLAG_ENCRYPTED) != 0;
 
-        // 2. Read contiguous raw data payload with strict header invariant checks
-        if (frame.header.payload_bytes > 0 || frame.header.element_count > 0) {
-            constexpr uint32_t MAX_FRAME_BYTES = 256 * 1024 * 1024;
-            constexpr uint32_t MAX_HANDSHAKE_BYTES = 256;
-
-            if (is_handshake) {
-                uint32_t expected_elems = (frame.header.payload_bytes + sizeof(float) - 1) / sizeof(float);
-                if (frame.header.payload_bytes > MAX_HANDSHAKE_BYTES ||
-                    frame.header.element_count != expected_elems)
-                {
-                    std::cerr << "⛔ [ClusterTransportRing] Invalid handshake payload size (payload_bytes="
-                              << frame.header.payload_bytes << ", element_count=" << frame.header.element_count << ")\n";
-                    break;
-                }
-            } else {
-                if (frame.header.element_count > MAX_FRAME_BYTES / sizeof(float) ||
-                    frame.header.payload_bytes > MAX_FRAME_BYTES ||
-                    frame.header.payload_bytes != frame.header.element_count * sizeof(float))
-                {
-                    std::cerr << "⛔ [ClusterTransportRing] Frame header invariant violation (payload_bytes="
-                              << frame.header.payload_bytes << ", element_count=" << frame.header.element_count << ")\n";
-                    break;
-                }
-            }
-
-            frame.data.resize(frame.header.element_count, 0.0f);
-            if (frame.header.payload_bytes > 0) {
-                if (!recv_all(sock, frame.data.data(), frame.header.payload_bytes, is_running_, is_authenticated ? 0 : 5000)) {
-                    break;
-                }
-            }
+        // Enforce authentication gate BEFORE accepting any non-handshake frame
+        if (!is_authenticated && !is_handshake) {
+            std::cerr << "⛔ [ClusterSecurity] Unauthenticated frame (flags=0x" << std::hex << frame.header.flags
+                      << std::dec << ") rejected on socket " << socket_handle << ". Handshake required.\n";
+            send_reject_and_close();
+            break;
         }
 
-        // Handle Handshake: authenticate peer if cluster token is configured
+        constexpr uint32_t MAX_FRAME_BYTES = 256U * 1024U * 1024U;
+        constexpr uint32_t MAX_HANDSHAKE_BYTES = 256U;
+
+        // Handle Handshake (SHCP v2 Challenge-Response when token active; legacy node-id announce when token empty)
         if (is_handshake) {
             uint32_t real_node_id = frame.header.from_node_id;
             std::string active_token = get_cluster_token();
 
-            if (!active_token.empty()) {
-                std::string received_token;
-                if (!frame.data.empty() && frame.header.payload_bytes > 0) {
-                    const char* bytes = reinterpret_cast<const char*>(frame.data.data());
-                    received_token.assign(bytes, frame.header.payload_bytes);
-                }
-
-                if (!HavenSecurity::constant_time_verify(received_token, active_token)) {
-                    std::cerr << "⛔ [ClusterSecurity] Unauthorized peer rejected on socket "
-                              << socket_handle << " (Invalid Cluster Token). Terminating connection.\n";
-                    HavenActivationFrame reject_frame;
-                    reject_frame.header.magic = HAVEN_CLUSTER_MAGIC;
-                    reject_frame.header.protocol_ver = HAVEN_CLUSTER_VERSION;
-                    reject_frame.header.flags = FRAME_FLAG_AUTH_REJECT;
-                    send_all(sock, &reject_frame.header, sizeof(reject_frame.header));
-                    closesocket(sock);
-                    sock = HAVEN_INVALID_SOCKET;
+            if (challenge_issued || !active_token.empty()) {
+                if (!challenge_issued || frame.header.payload_bytes != 64 || frame.header.element_count != 16) {
+                    std::cerr << "⛔ [ClusterSecurity] Invalid SHCP v2 handshake size on socket " << socket_handle << "\n";
+                    send_reject_and_close();
                     break;
                 }
+                uint8_t hs_payload[64] = {0};
+                if (!recv_all(sock, hs_payload, sizeof(hs_payload), is_running_, 5000)) {
+                    break;
+                }
+                const uint8_t* client_nonce = hs_payload;
+                const uint8_t* client_proof = hs_payload + 32;
+
+                uint8_t expected_client_proof[32] = {0};
+                HavenSecurity::derive_shcp_client_proof(active_token, server_nonce, client_nonce,
+                                                        static_cast<uint16_t>(real_node_id), expected_client_proof);
+                bool verified = HavenSecurity::constant_time_memeq(client_proof, expected_client_proof, 32);
+                HavenSecurity::secure_zero(expected_client_proof, sizeof(expected_client_proof));
+
+                if (!verified) {
+                    std::cerr << "⛔ [ClusterSecurity] Unauthorized peer rejected on socket "
+                              << socket_handle << " (Invalid SHCP v2 HMAC proof). Terminating connection.\n";
+                    send_reject_and_close();
+                    break;
+                }
+
+                // Send mutual server proof (FRAME_FLAG_HANDSHAKE_ACK)
+                uint8_t server_proof[32] = {0};
+                HavenSecurity::derive_shcp_server_proof(active_token, server_nonce, client_nonce,
+                                                        static_cast<uint16_t>(real_node_id), server_proof);
+                HavenActivationFrameHeader ack_hdr{};
+                ack_hdr.magic = HAVEN_CLUSTER_MAGIC;
+                ack_hdr.protocol_ver = HAVEN_CLUSTER_VERSION;
+                ack_hdr.flags = FRAME_FLAG_HANDSHAKE_ACK;
+                ack_hdr.element_count = 8;
+                ack_hdr.payload_bytes = 32;
+                bool ack_sent = send_all(sock, &ack_hdr, sizeof(ack_hdr)) &&
+                                send_all(sock, server_proof, sizeof(server_proof));
+                HavenSecurity::secure_zero(server_proof, sizeof(server_proof));
+                if (!ack_sent) {
+                    break;
+                }
+
+                // Derive per-session 256-bit ChaCha20-Poly1305 AEAD key
+                HavenSecurity::derive_shcp_session_key(active_token, server_nonce, client_nonce, session_key);
+                has_aead_session = true;
+                is_authenticated = true;
+                HavenSecurity::secure_zero(server_nonce, sizeof(server_nonce));
+
+                {
+                    std::lock_guard<std::mutex> lock(peers_mutex_);
+                    peer_sessions_.erase(peer_node_id);
+                    PeerSession authed{};
+                    authed.socket_handle = socket_handle;
+                    authed.is_authenticated = true;
+                    authed.is_initiator = false;
+                    authed.has_session_key = true;
+                    std::memcpy(authed.session_key, session_key, 32);
+                    authed.tx_counter = 0;
+                    peer_sessions_[real_node_id] = authed;
+                    peer_node_id = real_node_id;
+                }
+
                 std::cout << "🔒 [ClusterSecurity] Peer Node " << real_node_id
-                          << " successfully authenticated with 256-bit cluster token.\n";
+                          << " mutually authenticated (SHCP v2 HMAC-SHA256 + ChaCha20-Poly1305 AEAD).\n";
+                continue;
+            } else {
+                // Unauthenticated local benchmark mode handshake
+                uint32_t expected_elems = (frame.header.payload_bytes + sizeof(float) - 1) / sizeof(float);
+                if (frame.header.payload_bytes > MAX_HANDSHAKE_BYTES || frame.header.element_count != expected_elems) {
+                    break;
+                }
+                if (frame.header.payload_bytes > 0) {
+                    std::vector<uint8_t> discard(frame.header.payload_bytes);
+                    if (!recv_all(sock, discard.data(), discard.size(), is_running_, 5000)) break;
+                }
+                is_authenticated = true;
+                if (real_node_id != peer_node_id) {
+                    std::lock_guard<std::mutex> lock(peers_mutex_);
+                    auto it = peer_sessions_.find(peer_node_id);
+                    PeerSession sess = (it != peer_sessions_.end()) ? it->second : PeerSession{};
+                    sess.socket_handle = socket_handle;
+                    sess.is_authenticated = true;
+                    peer_sessions_.erase(peer_node_id);
+                    peer_sessions_[real_node_id] = sess;
+                    peer_node_id = real_node_id;
+                }
+                continue;
             }
-
-            is_authenticated = true;
-
-            if (real_node_id != peer_node_id) {
-                std::lock_guard<std::mutex> lock(peers_mutex_);
-                peer_sockets_.erase(peer_node_id);
-                peer_sockets_[real_node_id] = socket_handle;
-                peer_node_id = real_node_id;
-            }
-            continue;
         }
 
-        // Reject ANY non-handshake frame if connection has not completed authentication
-        if (!is_authenticated) {
-            std::cerr << "⛔ [ClusterSecurity] Unauthenticated frame (flags=0x" << std::hex << frame.header.flags
-                      << std::dec << ") rejected on socket " << socket_handle << ". Handshake required.\n";
-            HavenActivationFrame reject_frame;
-            reject_frame.header.magic = HAVEN_CLUSTER_MAGIC;
-            reject_frame.header.protocol_ver = HAVEN_CLUSTER_VERSION;
-            reject_frame.header.flags = FRAME_FLAG_AUTH_REJECT;
-            send_all(sock, &reject_frame.header, sizeof(reject_frame.header));
-            closesocket(sock);
-            sock = HAVEN_INVALID_SOCKET;
+        const bool is_protected_data =
+            (frame.header.flags & (FRAME_FLAG_ACTIVATION | FRAME_FLAG_KV_SYNC | FRAME_FLAG_LOGITS)) != 0;
+
+        // Enforce zero plaintext downgrade when AEAD session is established
+        if (has_aead_session && is_protected_data && !is_encrypted) {
+            std::cerr << "⛔ [ClusterSecurity] Plaintext downgrade frame rejected on AEAD session (Node "
+                      << peer_node_id << "). Severing connection.\n";
+            send_reject_and_close();
             break;
         }
 
-        // Handle Wire Decryption if payload is encrypted
-        if (frame.header.flags & FRAME_FLAG_ENCRYPTED) {
-            std::string active_token = get_cluster_token();
-            if (!active_token.empty() && !frame.data.empty()) {
-                HavenSecurity::mask_activation_payload(frame.data.data(), frame.data.size(),
-                                                      active_token, frame.header.sequence_id, frame.header.step_pos);
+        if (has_aead_session && is_encrypted) {
+            // Wire format: [ciphertext (element_count * 4) || wire_counter (8B) || Poly1305 tag (16B)]
+            if (frame.header.element_count > (MAX_FRAME_BYTES - 24U) / sizeof(float) ||
+                frame.header.payload_bytes < 24U ||
+                frame.header.payload_bytes > MAX_FRAME_BYTES ||
+                frame.header.payload_bytes != frame.header.element_count * sizeof(float) + 24U)
+            {
+                std::cerr << "⛔ [ClusterSecurity] Invalid AEAD frame geometry from Node " << peer_node_id << "\n";
+                send_reject_and_close();
+                break;
+            }
+
+            std::vector<uint8_t> wire_buf(frame.header.payload_bytes);
+            if (!recv_all(sock, wire_buf.data(), wire_buf.size(), is_running_, 0)) {
+                break;
+            }
+
+            const size_t pt_bytes = static_cast<size_t>(frame.header.element_count) * sizeof(float);
+            uint64_t wire_ctr = load_le64_bytes(wire_buf.data() + pt_bytes);
+            const uint8_t* tag = wire_buf.data() + pt_bytes + 8;
+
+            // Strict monotonic anti-replay gate
+            if (wire_ctr == 0 || wire_ctr <= rx_last_counter) {
+                std::cerr << "⛔ [ClusterSecurity] Replay/out-of-order frame detected from Node "
+                          << peer_node_id << " (ctr=" << wire_ctr << ", last=" << rx_last_counter
+                          << "). Severing connection.\n";
+                send_reject_and_close();
+                break;
+            }
+
+            // Direction of sender is opposite of local side
+            uint8_t nonce[12];
+            build_aead_nonce(!local_is_initiator, wire_ctr, nonce);
+
+            frame.data.resize(frame.header.element_count, 0.0f);
+            bool aead_ok = HavenSecurity::aead_decrypt(
+                session_key, nonce,
+                reinterpret_cast<const uint8_t*>(&frame.header), sizeof(frame.header),
+                pt_bytes > 0 ? wire_buf.data() : nullptr, pt_bytes,
+                tag,
+                pt_bytes > 0 ? reinterpret_cast<uint8_t*>(frame.data.data()) : nullptr
+            );
+
+            if (!aead_ok) {
+                std::cerr << "⛔ [ClusterSecurity] Poly1305 AEAD authentication FAILED on frame from Node "
+                          << peer_node_id << " (Tampering detected). Severing connection.\n";
+                send_reject_and_close();
+                break;
+            }
+
+            rx_last_counter = wire_ctr;
+            frame.header.payload_bytes = static_cast<uint32_t>(pt_bytes);
+            inbound_ring_->push(std::move(frame));
+            continue;
+        }
+
+        // Unauthenticated local benchmark mode payload read
+        if (frame.header.payload_bytes > 0 || frame.header.element_count > 0) {
+            if (frame.header.element_count > MAX_FRAME_BYTES / sizeof(float) ||
+                frame.header.payload_bytes > MAX_FRAME_BYTES ||
+                frame.header.payload_bytes != frame.header.element_count * sizeof(float))
+            {
+                std::cerr << "⛔ [ClusterTransportRing] Frame header invariant violation (payload_bytes="
+                          << frame.header.payload_bytes << ", element_count=" << frame.header.element_count << ")\n";
+                break;
+            }
+            frame.data.resize(frame.header.element_count, 0.0f);
+            if (frame.header.payload_bytes > 0) {
+                if (!recv_all(sock, frame.data.data(), frame.header.payload_bytes, is_running_, 0)) {
+                    break;
+                }
             }
         }
 
-        // Push directly into inbound ring buffer
         inbound_ring_->push(std::move(frame));
     }
+
+    HavenSecurity::secure_zero(session_key, sizeof(session_key));
+    HavenSecurity::secure_zero(server_nonce, sizeof(server_nonce));
 
     // Peer disconnected: clean up under mutex
     if (is_running_) {
         std::lock_guard<std::mutex> lock(peers_mutex_);
-        auto it = peer_sockets_.find(peer_node_id);
-        if (it != peer_sockets_.end() && it->second == socket_handle) {
-            peer_sockets_.erase(it);
+        auto it = peer_sessions_.find(peer_node_id);
+        if (it != peer_sessions_.end() && it->second.socket_handle == socket_handle) {
+            HavenSecurity::secure_zero(it->second.session_key, sizeof(it->second.session_key));
+            peer_sessions_.erase(it);
         }
         if (sock != HAVEN_INVALID_SOCKET) {
             closesocket(sock);
@@ -865,33 +1176,26 @@ bool HavenClusterNode::init_worker(uint32_t local_node_id, uint16_t listen_port,
         return false;
     }
 
-    if (!transport_->connect_to_peer(0, coordinator_addr, coordinator_port)) {
+    if (!transport_->connect_to_peer(0, coordinator_addr, coordinator_port, local_node_id)) {
         std::cerr << "⚠️ [HavenClusterNode] Worker failed to connect to coordinator at " 
                   << coordinator_addr << ":" << coordinator_port << "\n";
         transport_->stop();
         return false;
     }
 
-    // Send handshake frame to coordinator
-    HavenActivationFrame handshake;
-    handshake.header.magic = HAVEN_CLUSTER_MAGIC;
-    handshake.header.protocol_ver = HAVEN_CLUSTER_VERSION;
-    handshake.header.flags = FRAME_FLAG_HANDSHAKE;
-    handshake.header.from_node_id = static_cast<uint16_t>(local_node_id);
-    handshake.header.to_node_id = 0;
-
-    std::string active_token = get_cluster_token();
-    if (!active_token.empty()) {
-        size_t token_bytes = active_token.size();
-        handshake.header.payload_bytes = static_cast<uint32_t>(token_bytes);
-        handshake.header.element_count = static_cast<uint32_t>((token_bytes + sizeof(float) - 1) / sizeof(float));
-        handshake.data.resize(handshake.header.element_count, 0.0f);
-        std::memcpy(handshake.data.data(), active_token.data(), token_bytes);
-    } else {
+    // In unauthenticated benchmark mode, send node-ID announce frame;
+    // when cluster token is active, connect_to_peer already completed SHCP v2 mutual HMAC handshake.
+    if (get_cluster_token().empty()) {
+        HavenActivationFrame handshake;
+        handshake.header.magic = HAVEN_CLUSTER_MAGIC;
+        handshake.header.protocol_ver = HAVEN_CLUSTER_VERSION;
+        handshake.header.flags = FRAME_FLAG_HANDSHAKE;
+        handshake.header.from_node_id = static_cast<uint16_t>(local_node_id);
+        handshake.header.to_node_id = 0;
         handshake.header.element_count = 0;
         handshake.header.payload_bytes = 0;
+        transport_->send_activation(0, handshake);
     }
-    transport_->send_activation(0, handshake);
 
     is_active_ = true;
     std::cout << "⚡ [HavenClusterNode] Worker Node " << local_node_id << " joined coordinator @ "
@@ -995,30 +1299,24 @@ bool HavenClusterNode::sync_cluster_partition() {
 }
 
 bool HavenClusterNode::connect_peer_node(uint32_t node_id, const std::string& address, uint16_t port) {
-    if (!transport_->connect_to_peer(node_id, address, port)) {
+    if (!transport_->connect_to_peer(node_id, address, port, local_node_id_)) {
         return false;
     }
 
-    // Send handshake frame so peer knows who connected
-    HavenActivationFrame handshake;
-    handshake.header.magic = HAVEN_CLUSTER_MAGIC;
-    handshake.header.protocol_ver = HAVEN_CLUSTER_VERSION;
-    handshake.header.flags = FRAME_FLAG_HANDSHAKE;
-    handshake.header.from_node_id = static_cast<uint16_t>(local_node_id_);
-    handshake.header.to_node_id = static_cast<uint16_t>(node_id);
-
-    std::string active_token = get_cluster_token();
-    if (!active_token.empty()) {
-        size_t token_bytes = active_token.size();
-        handshake.header.payload_bytes = static_cast<uint32_t>(token_bytes);
-        handshake.header.element_count = static_cast<uint32_t>((token_bytes + sizeof(float) - 1) / sizeof(float));
-        handshake.data.resize(handshake.header.element_count, 0.0f);
-        std::memcpy(handshake.data.data(), active_token.data(), token_bytes);
-    } else {
+    // In unauthenticated benchmark mode, announce node_id;
+    // when token is active, connect_to_peer already completed SHCP v2 mutual HMAC handshake.
+    if (get_cluster_token().empty()) {
+        HavenActivationFrame handshake;
+        handshake.header.magic = HAVEN_CLUSTER_MAGIC;
+        handshake.header.protocol_ver = HAVEN_CLUSTER_VERSION;
+        handshake.header.flags = FRAME_FLAG_HANDSHAKE;
+        handshake.header.from_node_id = static_cast<uint16_t>(local_node_id_);
+        handshake.header.to_node_id = static_cast<uint16_t>(node_id);
         handshake.header.element_count = 0;
         handshake.header.payload_bytes = 0;
+        return transport_->send_activation(node_id, handshake);
     }
-    return transport_->send_activation(node_id, handshake);
+    return true;
 }
 
 bool HavenClusterNode::send_activations_to_node(uint32_t target_node_id, uint64_t sequence_id, uint32_t step_pos,

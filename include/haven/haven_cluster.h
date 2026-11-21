@@ -30,15 +30,17 @@ constexpr uint32_t HAVEN_CLUSTER_MAGIC = 0x4841564E; // 'HAVN'
 constexpr uint16_t HAVEN_CLUSTER_VERSION = 1;
 
 enum ClusterFrameFlags : uint16_t {
-    FRAME_FLAG_NONE         = 0x0000,
-    FRAME_FLAG_ACTIVATION   = 0x0001,
-    FRAME_FLAG_KV_SYNC      = 0x0002,
-    FRAME_FLAG_EOS          = 0x0004,
-    FRAME_FLAG_LOGITS       = 0x0008,
-    FRAME_FLAG_HEARTBEAT    = 0x0010,
-    FRAME_FLAG_HANDSHAKE    = 0x0020,
-    FRAME_FLAG_AUTH_REJECT  = 0x0040,
-    FRAME_FLAG_ENCRYPTED    = 0x0080
+    FRAME_FLAG_NONE          = 0x0000,
+    FRAME_FLAG_ACTIVATION    = 0x0001,
+    FRAME_FLAG_KV_SYNC       = 0x0002,
+    FRAME_FLAG_EOS           = 0x0004,
+    FRAME_FLAG_LOGITS        = 0x0008,
+    FRAME_FLAG_HEARTBEAT     = 0x0010,
+    FRAME_FLAG_HANDSHAKE     = 0x0020,
+    FRAME_FLAG_AUTH_REJECT   = 0x0040,
+    FRAME_FLAG_ENCRYPTED     = 0x0080,
+    FRAME_FLAG_CHALLENGE     = 0x0100,
+    FRAME_FLAG_HANDSHAKE_ACK = 0x0200
 };
 
 // Fixed 36-byte wire header for zero-copy binary streaming
@@ -123,8 +125,8 @@ public:
     // Starts listening socket for incoming activation packets
     bool start_server(uint16_t port);
 
-    // Connects to a remote peer node
-    bool connect_to_peer(uint32_t node_id, const std::string& address, uint16_t port);
+    // Connects to a remote peer node (executes SHCP v2 mutual challenge-response when token active)
+    bool connect_to_peer(uint32_t node_id, const std::string& address, uint16_t port, uint32_t local_node_id = 0);
 
     // Closes all peer sockets and stops listener
     void stop();
@@ -152,8 +154,19 @@ public:
     }
 
 private:
+    struct PeerSession {
+        uint64_t socket_handle = ~0ULL;
+        bool is_authenticated = false;
+        bool is_initiator = false;
+        bool has_session_key = false;
+        uint8_t session_key[32] = {0};
+        uint64_t tx_counter = 0;
+    };
+
     void server_listen_loop();
-    void client_recv_loop(uint64_t socket_handle, uint32_t peer_node_id, bool require_auth);
+    void client_recv_loop(uint64_t socket_handle, uint32_t peer_node_id, bool require_auth,
+                          bool pre_auth_aead = false, bool is_initiator = false,
+                          const std::vector<uint8_t>& initial_session_key = {});
 
     uint16_t listen_port_ = 0;
     uint64_t server_socket_ = ~0ULL;
@@ -168,7 +181,7 @@ private:
 
     mutable std::mutex peers_mutex_;
     mutable std::mutex send_mutex_;
-    std::unordered_map<uint32_t, uint64_t> peer_sockets_; // node_id -> socket descriptor
+    std::unordered_map<uint32_t, PeerSession> peer_sessions_; // node_id -> authenticated session
 
     std::shared_ptr<ActivationRingBuffer> inbound_ring_;
 };

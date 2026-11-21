@@ -9,6 +9,8 @@
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <winhttp.h>
 #include <shellapi.h>
@@ -235,26 +237,90 @@ private:
         }
         if (port <= 0 || port > 65535 || host.empty()) return "";
 
-        // SSRF defense: block loopback, link-local, metadata, and private RFC1918 hosts
+        // Strict DNS-resolved SSRF defense: block loopback, link-local, metadata, CGNAT/VPN, and RFC1918 IPs
         std::string hlow = host;
-        for (char& c : hlow) c = (char)tolower((unsigned char)c);
+        for (char& c : hlow) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         if (hlow == "localhost" || hlow == "::1" || hlow == "[::1]" || hlow == "0.0.0.0" ||
-            hlow.starts_with("127.") || hlow.starts_with("10.") || hlow.starts_with("192.168.") ||
-            hlow.starts_with("169.254.") || hlow.starts_with("0.") ||
             hlow.ends_with(".local") || hlow.ends_with(".internal") ||
             hlow.find_first_of("\r\n \t@") != std::string::npos) {
             return "";
         }
-        if (hlow.starts_with("172.")) {
-            size_t dot2 = hlow.find('.', 4);
-            if (dot2 != std::string::npos) {
-                try {
-                    int octet2 = std::stoi(hlow.substr(4, dot2 - 4));
-                    if (octet2 >= 16 && octet2 <= 31) return "";
-                } catch (...) {}
+        if (path.find_first_of("\r\n") != std::string::npos) return "";
+
+        auto is_blocked_ipv4 = [](uint32_t ip_host_order) -> bool {
+            uint8_t a = static_cast<uint8_t>((ip_host_order >> 24) & 0xFF);
+            uint8_t b = static_cast<uint8_t>((ip_host_order >> 16) & 0xFF);
+            uint8_t c = static_cast<uint8_t>((ip_host_order >> 8) & 0xFF);
+            if (a == 0) return true;                                  // 0.0.0.0/8
+            if (a == 10) return true;                                 // 10.0.0.0/8 (RFC1918)
+            if (a == 100 && b >= 64 && b <= 127) return true;         // 100.64.0.0/10 (CGNAT / Tailscale / NetBird)
+            if (a == 127) return true;                                // 127.0.0.0/8 (Loopback)
+            if (a == 169 && b == 254) return true;                    // 169.254.0.0/16 (Link-local / Cloud Metadata)
+            if (a == 172 && b >= 16 && b <= 31) return true;          // 172.16.0.0/12 (RFC1918)
+            if (a == 192 && b == 0 && c == 0) return true;            // 192.0.0.0/24
+            if (a == 192 && b == 168) return true;                    // 192.168.0.0/16 (RFC1918)
+            if (a == 198 && (b == 18 || b == 19)) return true;        // 198.18.0.0/15 (Benchmark)
+            if (a >= 224) return true;                                // Multicast & Reserved (224.0.0.0/3)
+            return false;
+        };
+
+        auto is_blocked_ipv6 = [&](const uint8_t ip6[16]) -> bool {
+            bool all_zero = true;
+            for (int i = 0; i < 16; ++i) if (ip6[i] != 0) { all_zero = false; break; }
+            if (all_zero) return true; // ::/128
+            bool is_loopback = true;
+            for (int i = 0; i < 15; ++i) if (ip6[i] != 0) { is_loopback = false; break; }
+            if (is_loopback && ip6[15] == 1) return true; // ::1/128
+            if ((ip6[0] & 0xFE) == 0xFC) return true;     // fc00::/7 (Unique Local)
+            if (ip6[0] == 0xFE && (ip6[1] & 0xC0) == 0x80) return true; // fe80::/10 (Link-local)
+            if (ip6[0] == 0xFF) return true;              // ff00::/8 (Multicast)
+            // IPv4-mapped ::ffff:a.b.c.d
+            bool v4_mapped = true;
+            for (int i = 0; i < 10; ++i) if (ip6[i] != 0) { v4_mapped = false; break; }
+            if (v4_mapped && ip6[10] == 0xFF && ip6[11] == 0xFF) {
+                uint32_t v4 = (static_cast<uint32_t>(ip6[12]) << 24) |
+                              (static_cast<uint32_t>(ip6[13]) << 16) |
+                              (static_cast<uint32_t>(ip6[14]) << 8) |
+                              static_cast<uint32_t>(ip6[15]);
+                return is_blocked_ipv4(v4);
+            }
+            return false;
+        };
+
+        // Resolve DNS and inspect EVERY returned address before opening WinHTTP connection
+        WSADATA wsa_tmp{};
+        bool wsa_started = (WSAStartup(MAKEWORD(2, 2), &wsa_tmp) == 0);
+        struct addrinfo hints{};
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        struct addrinfo* res_list = nullptr;
+        std::string resolve_host = host;
+        if (resolve_host.size() >= 2 && resolve_host.front() == '[' && resolve_host.back() == ']') {
+            resolve_host = resolve_host.substr(1, resolve_host.size() - 2);
+        }
+        if (getaddrinfo(resolve_host.c_str(), nullptr, &hints, &res_list) != 0 || !res_list) {
+            if (wsa_started) WSACleanup();
+            return "";
+        }
+        bool has_safe_addr = false;
+        bool has_blocked_addr = false;
+        for (struct addrinfo* ai = res_list; ai != nullptr; ai = ai->ai_next) {
+            if (ai->ai_family == AF_INET) {
+                auto* sin = reinterpret_cast<sockaddr_in*>(ai->ai_addr);
+                uint32_t ip_h = ntohl(sin->sin_addr.s_addr);
+                if (is_blocked_ipv4(ip_h)) { has_blocked_addr = true; break; }
+                has_safe_addr = true;
+            } else if (ai->ai_family == AF_INET6) {
+                auto* sin6 = reinterpret_cast<sockaddr_in6*>(ai->ai_addr);
+                if (is_blocked_ipv6(reinterpret_cast<const uint8_t*>(&sin6->sin6_addr))) {
+                    has_blocked_addr = true; break;
+                }
+                has_safe_addr = true;
             }
         }
-        if (path.find_first_of("\r\n") != std::string::npos) return "";
+        freeaddrinfo(res_list);
+        if (wsa_started) WSACleanup();
+        if (has_blocked_addr || !has_safe_addr) return "";
 
         std::wstring whost(host.begin(), host.end());
         std::wstring wpath(path.begin(), path.end());
@@ -262,6 +328,8 @@ private:
         HINTERNET hSession = WinHttpOpen(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) HavenSovereignBrowser/2.0",
                                          WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
         if (!hSession) return "";
+
+        WinHttpSetTimeouts(hSession, 5000, 5000, 10000, 10000);
 
         HINTERNET hConnect = WinHttpConnect(hSession, whost.c_str(), (INTERNET_PORT)port, 0);
         if (!hConnect) {
@@ -276,6 +344,10 @@ private:
             WinHttpCloseHandle(hSession);
             return "";
         }
+
+        // Disable automatic redirects to prevent 302 -> http://127.0.0.1 SSRF redirect bypasses
+        DWORD redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+        WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirect_policy, sizeof(redirect_policy));
 
         // Strict TLS certificate validation enforced by default (CWE-295 compliance)
 

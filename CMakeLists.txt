@@ -146,6 +146,10 @@ target_link_libraries(test-tpu-live-generation PRIVATE haven_core)
 add_executable(test-secure-cluster tests/test_secure_cluster.cpp)
 target_link_libraries(test-secure-cluster PRIVATE haven_core)
 
+# Adversarial Security, Crypto KAT, & Binary/JSON Fuzz Test Suite
+add_executable(test-security-fuzz tests/test_security_fuzz.cpp)
+target_link_libraries(test-security-fuzz PRIVATE haven_core)
+
 # Autonomic Postural Sway Engine Targets
 add_executable(test-haven-sway tests/test_haven_sway.cpp)
 target_link_libraries(test-haven-sway PRIVATE haven_core)
@@ -297,7 +301,7 @@ if (WIN32)
     target_link_libraries(plugin_discord_bridge winhttp)
     target_link_libraries(plugin_sd_art winhttp)
     target_link_libraries(plugin_voice_synth winhttp)
-    target_link_libraries(plugin_browser winhttp shell32)
+    target_link_libraries(plugin_browser winhttp shell32 ws2_32)
     target_link_libraries(plugin_gaming psapi)
     target_link_libraries(plugin_whisper_ear winhttp)
     target_link_libraries(plugin_smart_home winhttp)

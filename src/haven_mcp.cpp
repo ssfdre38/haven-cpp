@@ -1,4 +1,5 @@
 #include "haven/haven_mcp.h"
+#include "haven/haven_json.h"
 #include <iostream>
 #include <sstream>
 #include <fstream>
@@ -59,25 +60,9 @@ static bool is_unescaped_quote(const std::string& s, size_t idx) {
 
 static bool is_balanced_json_object(const std::string& s) {
     if (s.size() < 2 || s.front() != '{' || s.back() != '}') return false;
-    int depth = 0;
-    bool in_str = false;
-    for (size_t i = 0; i < s.size(); ++i) {
-        char c = s[i];
-        if (c == '\r' || c == '\n') return false;
-        if (in_str) {
-            if (c == '\\') { ++i; continue; }
-            if (c == '"') in_str = false;
-        } else {
-            if (c == '"') in_str = true;
-            else if (c == '{') depth++;
-            else if (c == '}') {
-                depth--;
-                if (depth < 0) return false;
-                if (depth == 0 && i + 1 < s.size()) return false;
-            }
-        }
-    }
-    return !in_str && depth == 0;
+    if (s.find('\r') != std::string::npos || s.find('\n') != std::string::npos) return false;
+    HavenJson parsed;
+    return HavenJson::parse(s, parsed) && parsed.is_object();
 }
 
 static std::string mcp_extract_json_field(const std::string& json, const std::string& key) {
