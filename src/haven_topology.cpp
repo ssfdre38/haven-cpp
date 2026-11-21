@@ -105,11 +105,15 @@ void TopologyManager::detect_topology() {
             name_suffix = std::string(tpu_env);
         } else {
             char hostname[256] = {0};
-#ifndef _WIN32
-            if (gethostname(hostname, sizeof(hostname)) == 0) {
+#ifdef _WIN32
+            DWORD sz = sizeof(hostname);
+            GetComputerNameA(hostname, &sz);
+#else
+            gethostname(hostname, sizeof(hostname));
+#endif
+            if (hostname[0] != '\0') {
                 name_suffix = hostname;
             }
-#endif
             if (name_suffix.empty()) name_suffix = "haven-tpu-v6e";
         }
 

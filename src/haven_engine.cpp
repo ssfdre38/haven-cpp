@@ -119,6 +119,7 @@ bool HavenEngine::load_model(const std::string& gguf_filepath) {
     layer_gate_scratch_.resize(cfg.hidden_dim, 0.0f);
     per_layer_emb_scratch_.resize(pleias_dim, 0.0f);
     per_layer_proj_scratch_.resize(pleias_dim, 0.0f);
+    pleias_proj_scratch_.resize(cfg.embedding_dim, 0.0f);
     attn_scores_scratch_.resize(cfg.num_heads * cfg.max_context_length, 0.0f);
     attn_heads_out_scratch_.resize(cfg.num_heads * cfg.head_dim, 0.0f);
     attn_indices_scratch_.resize(cfg.max_context_length, 0);
@@ -223,6 +224,7 @@ size_t HavenEngine::prune_kv_cache() {
 }
 
 void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t active_cluster) {
+    (void)active_cluster;
     const auto& cfg = loader_.get_config();
 
     // 1. Token Embedding Lookup
@@ -465,7 +467,7 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
                 pleias_gate[i] *= layer_emb_slice[i];
             }
 
-            float pleias_proj[4096];
+            float* pleias_proj = pleias_proj_scratch_.data();
             Avx2Math::gemv(pleias_proj, *lt.proj, pleias_gate, cfg.embedding_dim, 256);
 
             if (lt.post_norm) {

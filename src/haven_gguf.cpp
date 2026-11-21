@@ -144,7 +144,7 @@ bool GgufLoader::parse_header() {
         return false;
     }
 
-    uint32_t version = *reinterpret_cast<const uint32_t*>(mmap_data_ + 4);
+    [[maybe_unused]] uint32_t version = *reinterpret_cast<const uint32_t*>(mmap_data_ + 4);
     uint64_t tensor_count = *reinterpret_cast<const uint64_t*>(mmap_data_ + 8);
     uint64_t kv_count = *reinterpret_cast<const uint64_t*>(mmap_data_ + 16);
 
@@ -245,7 +245,7 @@ bool GgufLoader::parse_header() {
             config_.attn_logit_softcapping = read_float_val(val_type, ptr, end);
         }
         else if (key == "tokenizer.ggml.tokens" && val_type == 9) {
-            uint32_t arr_type = *reinterpret_cast<const uint32_t*>(ptr);
+            [[maybe_unused]] uint32_t arr_type = *reinterpret_cast<const uint32_t*>(ptr);
             uint64_t arr_len = *reinterpret_cast<const uint64_t*>(ptr + 4);
             ptr += 12;
             config_.vocab_size = (uint32_t)arr_len;

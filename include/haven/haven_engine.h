@@ -205,6 +205,7 @@ private:
     std::vector<float> embedding_scratch_;
     std::vector<float> per_layer_emb_scratch_;
     std::vector<float> per_layer_proj_scratch_;
+    std::vector<float> pleias_proj_scratch_;
     std::vector<float> layer_gate_scratch_;
     std::vector<float> norm_scratch_;
     std::vector<float> q_scratch_;

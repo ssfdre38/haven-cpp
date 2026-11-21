@@ -19,7 +19,7 @@ DynamicKVCacheManager::DynamicKVCacheManager(
       pruning_threshold_(pruning_threshold),
       salience_decay_(salience_decay),
       current_length_(0),
-      capacity_(std::min(4096u, max_context_length))
+      capacity_(std::min(128u, max_context_length))
 {
     reinit(num_layers_, max_context_length_, num_kv_heads_, head_dim_);
 }
@@ -35,7 +35,7 @@ void DynamicKVCacheManager::reinit(
     num_kv_heads_ = num_kv_heads;
     head_dim_ = head_dim;
     current_length_ = 0;
-    capacity_ = std::min(4096u, max_context_length_);
+    capacity_ = std::min(128u, max_context_length_);
 
     layers_.clear();
     layers_.resize(num_layers_);

@@ -96,6 +96,17 @@ public:
 
     void stop() {
         running_ = false;
+#ifdef _WIN32
+        if (server_fd_ != INVALID_SOCKET) {
+            closesocket(server_fd_);
+            server_fd_ = INVALID_SOCKET;
+        }
+#else
+        if (server_fd_ >= 0) {
+            close(server_fd_);
+            server_fd_ = -1;
+        }
+#endif
         if (server_thread_.joinable()) {
             server_thread_.join();
         }
@@ -103,7 +114,12 @@ public:
 
 private:
     int port_;
-    bool running_;
+#ifdef _WIN32
+    SOCKET server_fd_ = INVALID_SOCKET;
+#else
+    int server_fd_ = -1;
+#endif
+    std::atomic<bool> running_{false};
     std::thread server_thread_;
     HavenEngine haven_engine_;
     HavenClusterNode cluster_node_;
@@ -545,14 +561,18 @@ private:
     }
 
     void run() {
-        int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (server_fd < 0) return;
+        server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+#ifdef _WIN32
+        if (server_fd_ == INVALID_SOCKET) return;
+#else
+        if (server_fd_ < 0) return;
+#endif
 
         int opt = 1;
 #ifdef _WIN32
-        setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+        setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
 #else
-        setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 #endif
 
         sockaddr_in address{};
@@ -560,12 +580,28 @@ private:
         address.sin_addr.s_addr = INADDR_ANY;
         address.sin_port = htons(port_);
 
-        if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
+        if (bind(server_fd_, (struct sockaddr*)&address, sizeof(address)) < 0) {
             std::cerr << "[HavenServer] Failed to bind port " << port_ << "\n";
+#ifdef _WIN32
+            closesocket(server_fd_);
+            server_fd_ = INVALID_SOCKET;
+#else
+            close(server_fd_);
+            server_fd_ = -1;
+#endif
             return;
         }
 
-        if (listen(server_fd, 10) < 0) return;
+        if (listen(server_fd_, 10) < 0) {
+#ifdef _WIN32
+            closesocket(server_fd_);
+            server_fd_ = INVALID_SOCKET;
+#else
+            close(server_fd_);
+            server_fd_ = -1;
+#endif
+            return;
+        }
         std::cout << "==================================================================\n";
         std::cout << "🌐 HAVEN-CPP SOVEREIGN STREAMING MICRO-SERVER ONLINE\n";
         std::cout << "   Listening on http://0.0.0.0:" << port_ << "\n";
@@ -576,9 +612,9 @@ private:
             sockaddr_in client_addr{};
             int addrlen = sizeof(client_addr);
 #ifdef _WIN32
-            int client_sock = accept(server_fd, (struct sockaddr*)&client_addr, &addrlen);
+            int client_sock = accept(server_fd_, (struct sockaddr*)&client_addr, &addrlen);
 #else
-            int client_sock = accept(server_fd, (struct sockaddr*)&client_addr, (socklen_t*)&addrlen);
+            int client_sock = accept(server_fd_, (struct sockaddr*)&client_addr, (socklen_t*)&addrlen);
 #endif
             if (client_sock < 0) continue;
 
@@ -588,9 +624,15 @@ private:
         }
 
 #ifdef _WIN32
-        closesocket(server_fd);
+        if (server_fd_ != INVALID_SOCKET) {
+            closesocket(server_fd_);
+            server_fd_ = INVALID_SOCKET;
+        }
 #else
-        close(server_fd);
+        if (server_fd_ >= 0) {
+            close(server_fd_);
+            server_fd_ = -1;
+        }
 #endif
     }
 
@@ -1927,6 +1969,17 @@ private:
         else {
             // Check for static file in wwwroot
             std::string rel_path = path;
+            if (rel_path.find("..") != std::string::npos || rel_path.find(':') != std::string::npos || rel_path.find('\\') != std::string::npos) {
+                std::string forbidden = "HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\n\r\nForbidden";
+                send_all(sock, forbidden.c_str(), (int)forbidden.length());
+#ifdef _WIN32
+                closesocket(sock);
+#else
+                close(sock);
+#endif
+                return;
+            }
+
             if (rel_path == "/" || rel_path.empty()) rel_path = "/index.html";
             std::string local_path = "wwwroot" + rel_path;
             FILE* f = fopen(local_path.c_str(), "rb");
@@ -1940,6 +1993,16 @@ private:
                 fseek(f, 0, SEEK_END);
                 long sz = ftell(f);
                 fseek(f, 0, SEEK_SET);
+
+                if (sz < 0 || sz > 100 * 1024 * 1024) {
+                    fclose(f);
+#ifdef _WIN32
+                    closesocket(sock);
+#else
+                    close(sock);
+#endif
+                    return;
+                }
 
                 std::vector<char> file_data(sz);
                 if (sz > 0) {

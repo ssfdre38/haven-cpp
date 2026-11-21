@@ -65,100 +65,93 @@ set(HAVEN_CORE_SRCS
     src/haven_cluster.cpp
 )
 
+# Core Static Engine Library (builds all core sources once for fast compilation)
+add_library(haven_core STATIC
+    ${HAVEN_CORE_SRCS}
+)
+
+if (WIN32)
+    target_link_libraries(haven_core PUBLIC ws2_32 psapi mlxc mlx openblas)
+else()
+    target_link_libraries(haven_core PUBLIC pthread dl)
+endif()
+
 # Shared Library (haven_engine.dll / libhaven.so) for C# Gemmi & Android JNI
 add_library(haven_engine SHARED
     ${HAVEN_CORE_SRCS}
 )
+if (WIN32)
+    target_link_libraries(haven_engine PUBLIC ws2_32 psapi mlxc mlx openblas)
+else()
+    target_link_libraries(haven_engine PUBLIC pthread dl)
+endif()
 
 # Standalone CLI Executable & Benchmark Runner
-add_executable(haven-cli
-    src/main.cpp
-    ${HAVEN_CORE_SRCS}
-)
+add_executable(haven-cli src/main.cpp)
+target_link_libraries(haven-cli PRIVATE haven_core)
 
 # Standalone Sovereign Streaming Micro-Server
-add_executable(haven-server
-    src/haven_server.cpp
-    ${HAVEN_CORE_SRCS}
-)
+add_executable(haven-server src/haven_server.cpp)
+target_link_libraries(haven-server PRIVATE haven_core)
 
 # Test Standalone Forward Logits Executable
-add_executable(test-standalone
-    tests/test_forward_logits.cpp
-    ${HAVEN_CORE_SRCS}
-)
+add_executable(test-standalone tests/test_forward_logits.cpp)
+target_link_libraries(test-standalone PRIVATE haven_core)
 
 # Test Quantization Precision Executable
-add_executable(test-quant
-    tests/test_quant_precision.cpp
-    ${HAVEN_CORE_SRCS}
-)
+add_executable(test-quant tests/test_quant_precision.cpp)
+target_link_libraries(test-quant PRIVATE haven_core)
 
 # Test Lazy Plugin Manager Executable
-add_executable(test-lazy-plugins
-    tests/test_lazy_plugins.cpp
-    ${HAVEN_CORE_SRCS}
-)
+add_executable(test-lazy-plugins tests/test_lazy_plugins.cpp)
+target_link_libraries(test-lazy-plugins PRIVATE haven_core)
 
 # Test Haven Topology Fabric & Clean-Room Pathways Engine
-add_executable(test-topology-pathways
-    tests/test_topology_pathways.cpp
-    ${HAVEN_CORE_SRCS}
-)
+add_executable(test-topology-pathways tests/test_topology_pathways.cpp)
+target_link_libraries(test-topology-pathways PRIVATE haven_core)
 
 # Test Haven Topology Fabric & Pathways End-to-End & C ABI Exports
-add_executable(test-pathways-e2e
-    tests/test_pathways_e2e.cpp
-    ${HAVEN_CORE_SRCS}
-)
+add_executable(test-pathways-e2e tests/test_pathways_e2e.cpp)
+target_link_libraries(test-pathways-e2e PRIVATE haven_core)
 
 # Test Multi-Model Architecture Support (Qwen 2.5, LLaMA 3, Phi-3, Gemma)
-add_executable(test-multi-model-arch
-    tests/test_multi_model_arch.cpp
-    ${HAVEN_CORE_SRCS}
-)
+add_executable(test-multi-model-arch tests/test_multi_model_arch.cpp)
+target_link_libraries(test-multi-model-arch PRIVATE haven_core)
 
 # Test Haven Sovereign Multi-Node Cluster & Pipeline Parallel Fabric
-add_executable(test-cluster-fabric
-    tests/test_cluster_fabric.cpp
-    ${HAVEN_CORE_SRCS}
-)
+add_executable(test-cluster-fabric tests/test_cluster_fabric.cpp)
+target_link_libraries(test-cluster-fabric PRIVATE haven_core)
 
 # Test Haven Cloud TPU v6e Trillium 8-Core Torus Mesh Cluster
-add_executable(test-tpu-cluster-mesh
-    tests/test_tpu_cluster_mesh.cpp
-    ${HAVEN_CORE_SRCS}
-)
+add_executable(test-tpu-cluster-mesh tests/test_tpu_cluster_mesh.cpp)
+target_link_libraries(test-tpu-cluster-mesh PRIVATE haven_core)
 
 # Cross-System Multi-Node Cluster Executable (Windows / Linux / Cloud)
-add_executable(test-cross-system-node
-    tests/test_cross_system_node.cpp
-    ${HAVEN_CORE_SRCS}
-)
+add_executable(test-cross-system-node tests/test_cross_system_node.cpp)
+target_link_libraries(test-cross-system-node PRIVATE haven_core)
 
 # Distributed Cluster + Pathways DAG Executable (Unified Multi-Node Engine)
-add_executable(test-pathways-distributed-cluster
-    tests/test_pathways_distributed_cluster.cpp
-    ${HAVEN_CORE_SRCS}
-)
+add_executable(test-pathways-distributed-cluster tests/test_pathways_distributed_cluster.cpp)
+target_link_libraries(test-pathways-distributed-cluster PRIVATE haven_core)
 
 # Live Multi-Node Cluster Execution Test (Real-time Token Generation across Nodes)
-add_executable(test-live-cluster-generation
-    tests/test_live_cluster_generation.cpp
-    ${HAVEN_CORE_SRCS}
-)
+add_executable(test-live-cluster-generation tests/test_live_cluster_generation.cpp)
+target_link_libraries(test-live-cluster-generation PRIVATE haven_core)
 
 # TPU Live Multi-Node Generation Test (Ava 4-Node Sovereign Cluster)
-add_executable(test-tpu-live-generation
-    tests/test_tpu_live_generation.cpp
-    ${HAVEN_CORE_SRCS}
-)
+add_executable(test-tpu-live-generation tests/test_tpu_live_generation.cpp)
+target_link_libraries(test-tpu-live-generation PRIVATE haven_core)
 
 # Secure Cluster Protocol Verification Test (SHCP Mutual Authentication & Crypto Handshake)
-add_executable(test-secure-cluster
-    tests/test_secure_cluster.cpp
-    ${HAVEN_CORE_SRCS}
-)
+add_executable(test-secure-cluster tests/test_secure_cluster.cpp)
+target_link_libraries(test-secure-cluster PRIVATE haven_core)
+
+# Autonomic Postural Sway Engine Targets
+add_executable(test-haven-sway tests/test_haven_sway.cpp)
+target_link_libraries(test-haven-sway PRIVATE haven_core)
+
+add_executable(quickstart-sway examples/quickstart_sway.cpp)
+target_link_libraries(quickstart-sway PRIVATE haven_core)
 
 # Native Sovereign Plugins
 add_library(plugin_yt_music SHARED
@@ -298,22 +291,6 @@ set_target_properties(plugin_smart_home PROPERTIES
 )
 
 if (WIN32)
-    target_link_libraries(haven_engine ws2_32 mlxc mlx openblas)
-    target_link_libraries(haven-cli ws2_32 mlxc mlx openblas)
-    target_link_libraries(haven-server ws2_32 psapi mlxc mlx openblas)
-    target_link_libraries(test-standalone ws2_32 mlxc mlx openblas)
-    target_link_libraries(test-quant ws2_32 mlxc mlx openblas)
-    target_link_libraries(test-lazy-plugins ws2_32 psapi mlxc mlx openblas)
-    target_link_libraries(test-topology-pathways ws2_32 mlxc mlx openblas)
-    target_link_libraries(test-pathways-e2e ws2_32 mlxc mlx openblas)
-    target_link_libraries(test-multi-model-arch ws2_32 mlxc mlx openblas)
-    target_link_libraries(test-cluster-fabric ws2_32 mlxc mlx openblas)
-    target_link_libraries(test-tpu-cluster-mesh ws2_32 mlxc mlx openblas)
-    target_link_libraries(test-cross-system-node ws2_32 mlxc mlx openblas)
-    target_link_libraries(test-pathways-distributed-cluster ws2_32 mlxc mlx openblas)
-    target_link_libraries(test-live-cluster-generation ws2_32 mlxc mlx openblas)
-    target_link_libraries(test-tpu-live-generation ws2_32 mlxc mlx openblas)
-    target_link_libraries(test-secure-cluster ws2_32 mlxc mlx openblas)
     target_link_libraries(plugin_system_sensory psapi)
     target_link_libraries(plugin_screen_vision psapi)
     target_link_libraries(plugin_web_research winhttp)
@@ -324,21 +301,4 @@ if (WIN32)
     target_link_libraries(plugin_gaming psapi)
     target_link_libraries(plugin_whisper_ear winhttp)
     target_link_libraries(plugin_smart_home winhttp)
-else()
-    target_link_libraries(haven_engine pthread dl)
-    target_link_libraries(haven-cli pthread dl)
-    target_link_libraries(haven-server pthread dl)
-    target_link_libraries(test-standalone pthread dl)
-    target_link_libraries(test-quant pthread dl)
-    target_link_libraries(test-lazy-plugins pthread dl)
-    target_link_libraries(test-topology-pathways pthread dl)
-    target_link_libraries(test-pathways-e2e pthread dl)
-    target_link_libraries(test-multi-model-arch pthread dl)
-    target_link_libraries(test-cluster-fabric pthread dl)
-    target_link_libraries(test-tpu-cluster-mesh pthread dl)
-    target_link_libraries(test-cross-system-node pthread dl)
-    target_link_libraries(test-pathways-distributed-cluster pthread dl)
-    target_link_libraries(test-live-cluster-generation pthread dl)
-    target_link_libraries(test-tpu-live-generation pthread dl)
-    target_link_libraries(test-secure-cluster pthread dl)
 endif()

@@ -41,7 +41,7 @@ public:
     );
 
 private:
-    uint32_t head_dim_;
+    [[maybe_unused]] uint32_t head_dim_;
     std::vector<float> scores_scratch_;
 };
 

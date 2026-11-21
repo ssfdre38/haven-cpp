@@ -113,7 +113,7 @@ void test_failsafe_recovery() {
     using namespace haven;
 
     AutonomicPosturalSwayEngine engine;
-    engine.update(0.016f);
+    (void)engine.update(0.016f);
 
     // Inject massive values
     engine.inject_lorenz_state(9999.0f, -8888.0f, 7777.0f);

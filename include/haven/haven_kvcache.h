@@ -61,7 +61,7 @@ private:
     float pruning_threshold_;
     float salience_decay_;
     int current_length_ = 0;
-    uint32_t capacity_ = 2048;
+    uint32_t capacity_ = 128;
 
     std::vector<GatedKVCacheLayer> layers_;
 };

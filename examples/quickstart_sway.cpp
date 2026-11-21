@@ -21,7 +21,7 @@ int main() {
 
     for (int frame = 0; frame <= 120; ++frame) {
         // Compute next posture step (82 nanoseconds per step)
-        haven::SwayOutput output = engine.step(delta_sec);
+        haven::SwayOutput output = engine.update(delta_sec);
 
         // Print telemetry every 10 frames (1/6th of a second)
         if (frame % 10 == 0) {

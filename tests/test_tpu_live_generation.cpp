@@ -142,7 +142,7 @@ int run_coordinator(uint16_t listen_port, uint32_t num_workers, const std::strin
 
         // Publish to Pathways stream
         pathways.publish_stream_token(char_code, piece);
-        fut.get();
+        (void)fut.get();
 
         auto step_end = std::chrono::high_resolution_clock::now();
         double ms = std::chrono::duration<double, std::milli>(step_end - step_start).count();

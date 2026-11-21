@@ -82,7 +82,7 @@ static uint32_t run_monolithic_reference(uint32_t token, std::vector<float>& out
     return best_tok;
 }
 
-int main(int argc, char* argv[]) {
+int main(int /*argc*/, char* /*argv*/[]) {
     std::cout << "\n==================================================================\n";
     std::cout << "👑 HAVEN DISTRIBUTED CLUSTER + PATHWAYS DAG VERIFICATION SUITE\n";
     std::cout << "==================================================================\n";

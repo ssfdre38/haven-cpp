@@ -45,15 +45,15 @@ public:
     virtual void on_unload() = 0;
 
     // Prompt & Token Hooks
-    virtual void on_prompt_prefill(std::string& prompt, std::vector<uint32_t>& tokens) {}
-    virtual void on_token_generated(uint32_t token_id, const std::string& piece) {}
+    virtual void on_prompt_prefill(std::string& /*prompt*/, std::vector<uint32_t>& /*tokens*/) {}
+    virtual void on_token_generated(uint32_t /*token_id*/, const std::string& /*piece*/) {}
 
     // Tool & Action Dispatcher (e.g. YouTube Music, System Control, Web Search)
-    virtual bool can_handle_tool(const std::string& action) const { return false; }
-    virtual bool execute_tool(const std::string& action, const std::string& payload, std::string& output) { return false; }
+    virtual bool can_handle_tool(const std::string& /*action*/) const { return false; }
+    virtual bool execute_tool(const std::string& /*action*/, const std::string& /*payload*/, std::string& /*output*/) { return false; }
 
     // Sensory Ingestion Hook
-    virtual void on_sensory_tick(std::vector<float>& vision_embedding, std::vector<float>& audio_embedding) {}
+    virtual void on_sensory_tick(std::vector<float>& /*vision_embedding*/, std::vector<float>& /*audio_embedding*/) {}
 };
 
 // Function signatures exported by native plugin dynamic libraries (.dll / .so)

@@ -25,7 +25,7 @@ PagedAttentionManager::PagedAttentionManager(
         block_pool_[i].block_id = (int32_t)i;
         block_pool_[i].num_tokens = 0;
         block_pool_[i].ref_count = 0;
-        block_pool_[i].data.resize(block_data_size_, 0.0f);
+        // Data is lazily allocated on first allocate_block() to avoid 8.0 GiB upfront memory bomb
         free_block_ids_.push_back((int32_t)i);
     }
 }
@@ -41,6 +41,9 @@ int32_t PagedAttentionManager::allocate_block() {
 
     block_pool_[block_id].ref_count = 1;
     block_pool_[block_id].num_tokens = 0;
+    if (block_pool_[block_id].data.size() != block_data_size_) {
+        block_pool_[block_id].data.assign(block_data_size_, 0.0f);
+    }
     return block_id;
 }
 
@@ -71,6 +74,22 @@ void PagedAttentionManager::append_token_kv(
     int32_t physical_block_id = table[block_idx];
     auto* block = get_block(physical_block_id);
     if (!block) return;
+
+    // Copy-on-Write (CoW) isolation: branch if block is shared by another sequence
+    if (block->ref_count > 1) {
+        int32_t new_block_id = allocate_block();
+        if (new_block_id >= 0) {
+            auto* new_block = get_block(new_block_id);
+            if (new_block) {
+                new_block->num_tokens = block->num_tokens;
+                new_block->data = block->data;
+                new_block->ref_count = 1;
+                block->ref_count--;
+                table[block_idx] = new_block_id;
+                block = new_block;
+            }
+        }
+    }
 
     if (offset_in_block >= block->num_tokens) {
         block->num_tokens = offset_in_block + 1;

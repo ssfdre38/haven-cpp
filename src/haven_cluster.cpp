@@ -455,6 +455,11 @@ void ClusterTransportRing::client_recv_loop(uint64_t socket_handle, uint32_t pee
 
         // 2. Read contiguous raw float data payload
         if (frame.header.payload_bytes > 0 && frame.header.element_count > 0) {
+            constexpr uint32_t MAX_FRAME_BYTES = 256 * 1024 * 1024;
+            if (frame.header.payload_bytes > MAX_FRAME_BYTES) {
+                std::cerr << "⚠️ [ClusterTransportRing] Frame payload exceeds 256MB limit on socket " << socket_handle << "\n";
+                break;
+            }
             frame.data.resize(frame.header.element_count);
             if (!recv_all(sock, frame.data.data(), frame.header.payload_bytes, is_running_)) {
                 break;
@@ -482,6 +487,7 @@ void ClusterTransportRing::client_recv_loop(uint64_t socket_handle, uint32_t pee
                     reject_frame.header.flags = FRAME_FLAG_AUTH_REJECT;
                     send_all(sock, &reject_frame.header, sizeof(reject_frame.header));
                     closesocket(sock);
+                    sock = -1;
                     break;
                 }
                 std::cout << "🔒 [ClusterSecurity] Peer Node " << real_node_id 
@@ -515,6 +521,8 @@ void ClusterTransportRing::client_recv_loop(uint64_t socket_handle, uint32_t pee
         auto it = peer_sockets_.find(peer_node_id);
         if (it != peer_sockets_.end() && it->second == socket_handle) {
             peer_sockets_.erase(it);
+        }
+        if (sock != INVALID_SOCKET) {
             closesocket(sock);
         }
     }
@@ -737,10 +745,6 @@ bool HavenClusterNode::init_coordinator(uint16_t listen_port, uint32_t total_mod
     local_node_id_ = 0;
     listen_port_ = listen_port;
 
-    if (cluster_token_.empty()) {
-        set_cluster_token(HavenSecurity::generate_cluster_token());
-    }
-
     if (!transport_->start_server(listen_port)) {
         return false;
     }
@@ -899,8 +903,17 @@ bool HavenClusterNode::connect_peer_node(uint32_t node_id, const std::string& ad
     handshake.header.flags = FRAME_FLAG_HANDSHAKE;
     handshake.header.from_node_id = static_cast<uint16_t>(local_node_id_);
     handshake.header.to_node_id = static_cast<uint16_t>(node_id);
-    handshake.header.element_count = 0;
-    handshake.header.payload_bytes = 0;
+
+    if (!cluster_token_.empty()) {
+        size_t token_bytes = cluster_token_.size();
+        handshake.header.payload_bytes = static_cast<uint32_t>(token_bytes);
+        handshake.header.element_count = static_cast<uint32_t>((token_bytes + sizeof(float) - 1) / sizeof(float));
+        handshake.data.resize(handshake.header.element_count, 0.0f);
+        std::memcpy(handshake.data.data(), cluster_token_.data(), token_bytes);
+    } else {
+        handshake.header.element_count = 0;
+        handshake.header.payload_bytes = 0;
+    }
     return transport_->send_activation(node_id, handshake);
 }
 
@@ -969,7 +982,7 @@ std::string HavenClusterNode::generate_cluster_report() const {
                                 (role_ == ClusterRole::WORKER ? "PIPELINE WORKER NODE" : "STANDALONE")) << "\n";
     ss << "║ Listen Port   : " << listen_port_ << "\n";
     ss << "║ Status        : " << (is_active_ ? "ONLINE (Transport Active)" : "OFFLINE") << "\n";
-    ss << "║ Connected Pees: " << transport_->get_connected_peer_ids().size() << " peer node(s)\n";
+    ss << "║ Connected Peers: " << transport_->get_connected_peer_ids().size() << " peer node(s)\n";
     ss << "╚══════════════════════════════════════════════════════════════════════╝\n";
     ss << scheduler_.generate_partition_report();
     return ss.str();

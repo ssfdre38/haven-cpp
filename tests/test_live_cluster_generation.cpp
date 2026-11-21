@@ -13,7 +13,7 @@
 #include <algorithm>
 
 static const size_t HIDDEN_DIM = 2048;
-static const size_t VOCAB_SIZE = 128; // ASCII token vocabulary for readable text generation
+[[maybe_unused]] static const size_t VOCAB_SIZE = 128; // ASCII token vocabulary for readable text generation
 static const uint32_t TOTAL_LAYERS = 32;
 
 // Vocabulary map for readable streamed output
@@ -42,7 +42,7 @@ static void execute_transformer_layer(float* hidden_state, size_t dim, uint32_t 
     }
 }
 
-int main(int argc, char* argv[]) {
+int main(int /*argc*/, char* /*argv*/[]) {
     std::cout << "\n==================================================================\n";
     std::cout << "👑 HAVEN LIVE MULTI-NODE DISTRIBUTED CLUSTER EXECUTION TEST\n";
     std::cout << "==================================================================\n";
@@ -123,7 +123,7 @@ int main(int argc, char* argv[]) {
     pathways.start();
 
     std::string full_streamed_output = "";
-    pathways.set_token_stream_listener([&](uint32_t tok, const std::string& piece) {
+    pathways.set_token_stream_listener([&](uint32_t /*tok*/, const std::string& piece) {
         full_streamed_output += piece;
         std::cout << piece << std::flush;
     });
@@ -225,6 +225,11 @@ int main(int argc, char* argv[]) {
     worker1.shutdown();
     worker2.shutdown();
     coordinator.shutdown();
+
+    if (latencies_ms.empty()) {
+        std::cerr << "❌ FAILED: Zero tokens were generated across cluster fabric!\n";
+        return 1;
+    }
 
     // Summary Statistics
     double avg_latency = 0.0;

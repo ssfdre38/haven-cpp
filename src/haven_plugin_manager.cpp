@@ -542,6 +542,7 @@ void PluginManager::dispatch_sensory_tick(std::vector<float>& vision_emb, std::v
 }
 
 size_t PluginManager::reload_all(const std::string& plugins_directory, PluginExecutionContext* ctx) {
+    (void)ctx;
     plugins_dir_ = plugins_directory;
     unload_all();
     return discover_plugins(plugins_dir_, lazy_load_enabled_);
