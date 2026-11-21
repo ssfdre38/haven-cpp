@@ -5,6 +5,7 @@
 #include <vector>
 #include <array>
 #include <memory>
+#include <chrono>
 
 #ifdef _WIN32
 #include <stdio.h>
