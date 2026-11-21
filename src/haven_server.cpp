@@ -2,6 +2,7 @@
 #include "haven/haven_mlx.h"
 #include "haven/haven_cluster.h"
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <set>
@@ -10,6 +11,10 @@
 #include <chrono>
 #include <filesystem>
 #include <charconv>
+#include <algorithm>
+#include <cctype>
+#include <cstring>
+#include <cstdlib>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -38,8 +43,11 @@ public:
                      const std::string& cluster_join_target = "",
                      uint16_t cluster_port = 0,
                      const std::string& cluster_token = "",
-                     uint32_t cluster_node_id = 0)
-        : port_(port), running_(false), model_loaded_(false)
+                     uint32_t cluster_node_id = 0,
+                     const std::string& bind_host = "127.0.0.1",
+                     const std::string& api_key = "")
+        : port_(port), bind_host_(bind_host.empty() ? "127.0.0.1" : bind_host),
+          api_key_(api_key), running_(false), model_loaded_(false)
     {
 #ifdef _WIN32
         WSADATA wsa;
@@ -80,9 +88,11 @@ public:
             cluster_node_.init_worker_with_token(n_id, worker_port, cluster_join_target, cluster_port, cluster_token);
         } else {
             uint16_t coord_port = cluster_port != 0 ? cluster_port : (uint16_t)(port_ + 2);
-            if (!cluster_token.empty()) {
-                cluster_node_.set_cluster_token(cluster_token);
-            }
+            // Zero-trust default: always enforce a 256-bit pairing token on the cluster coordinator
+            std::string active_token = cluster_token.empty()
+                ? HavenSecurity::generate_cluster_token()
+                : cluster_token;
+            cluster_node_.set_cluster_token(active_token);
             cluster_node_.init_coordinator(coord_port, 32);
             std::cout << "🔒 [HavenServer] Sovereign Cluster Invite URI: " << cluster_node_.generate_invite_uri() << "\n" << std::flush;
         }
@@ -120,6 +130,8 @@ public:
 
 private:
     int port_;
+    std::string bind_host_;
+    std::string api_key_;
 #ifdef _WIN32
     SOCKET server_fd_ = INVALID_SOCKET;
 #else
@@ -143,6 +155,139 @@ private:
         "models",
         "."
     };
+
+    static void close_socket(socket_t s) {
+#ifdef _WIN32
+        closesocket(s);
+#else
+        close(s);
+#endif
+    }
+
+    static bool is_safe_model_token(const std::string& name) {
+        if (name.empty() || name.size() > 260) return false;
+        if (name.find("..") != std::string::npos ||
+            name.find('/') != std::string::npos ||
+            name.find('\\') != std::string::npos ||
+            name.find(':') != std::string::npos ||
+            name.find('\0') != std::string::npos) {
+            return false;
+        }
+        return true;
+    }
+
+    static bool resolve_safe_path(const std::filesystem::path& base_dir, const std::string& clean_rel, std::string& out_path) {
+        std::error_code ec;
+        std::filesystem::path root_dir = std::filesystem::weakly_canonical(base_dir, ec);
+        if (ec) return false;
+        std::filesystem::path target = std::filesystem::weakly_canonical(root_dir / clean_rel, ec);
+        if (ec) return false;
+
+        std::string root_str = root_dir.string();
+        std::string target_str = target.string();
+        while (root_str.size() > 1 && (root_str.back() == '\\' || root_str.back() == '/')) {
+            root_str.pop_back();
+        }
+        if (target_str.size() <= root_str.size()) return false;
+        if (target_str.compare(0, root_str.size(), root_str) != 0) return false;
+        char sep = target_str[root_str.size()];
+        if (sep != '\\' && sep != '/') return false;
+        out_path = target_str;
+        return true;
+    }
+
+    static std::string to_lower_ascii(std::string s) {
+        for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return s;
+    }
+
+    static std::string trim_ows(const std::string& s) {
+        size_t f = s.find_first_not_of(" \t\r\n");
+        if (f == std::string::npos) return "";
+        size_t l = s.find_last_not_of(" \t\r\n");
+        return s.substr(f, l - f + 1);
+    }
+
+    static std::string get_http_header(const std::string& raw_headers, const std::string& target_lower, size_t* match_count = nullptr) {
+        if (match_count) *match_count = 0;
+        std::string first_val;
+        size_t line_start = raw_headers.find("\r\n");
+        if (line_start == std::string::npos) return "";
+        line_start += 2;
+        while (line_start < raw_headers.size()) {
+            size_t line_end = raw_headers.find("\r\n", line_start);
+            if (line_end == std::string::npos) line_end = raw_headers.size();
+            if (line_end == line_start) break;
+            size_t colon = raw_headers.find(':', line_start);
+            if (colon != std::string::npos && colon < line_end) {
+                std::string key = to_lower_ascii(trim_ows(raw_headers.substr(line_start, colon - line_start)));
+                if (key == target_lower) {
+                    if (match_count) (*match_count)++;
+                    if (first_val.empty()) {
+                        first_val = trim_ows(raw_headers.substr(colon + 1, line_end - colon - 1));
+                    }
+                }
+            }
+            if (line_end >= raw_headers.size()) break;
+            line_start = line_end + 2;
+        }
+        return first_val;
+    }
+
+    static bool is_loopback_host_header(const std::string& host_hdr) {
+        if (host_hdr.empty()) return true; // HTTP/1.0 health checks
+        std::string h = to_lower_ascii(host_hdr);
+        if (h.starts_with("[::1]")) {
+            return h.size() == 5 || h[5] == ':';
+        }
+        size_t colon = h.find(':');
+        std::string hostname = (colon != std::string::npos) ? h.substr(0, colon) : h;
+        return (hostname == "127.0.0.1" || hostname == "localhost");
+    }
+
+    static bool is_trusted_origin(const std::string& origin) {
+        if (origin.empty()) return true;
+        std::string o = to_lower_ascii(origin);
+        auto check_prefix = [&](const char* prefix) -> bool {
+            size_t plen = std::strlen(prefix);
+            if (o.size() < plen || o.compare(0, plen, prefix) != 0) return false;
+            if (o.size() == plen) return true;
+            if (o[plen] == ':') {
+                if (plen + 1 >= o.size()) return false;
+                for (size_t i = plen + 1; i < o.size(); ++i) {
+                    if (!std::isdigit(static_cast<unsigned char>(o[i]))) return false;
+                }
+                return true;
+            }
+            return false;
+        };
+        return check_prefix("http://127.0.0.1") ||
+               check_prefix("https://127.0.0.1") ||
+               check_prefix("http://localhost") ||
+               check_prefix("https://localhost") ||
+               check_prefix("http://[::1]") ||
+               check_prefix("https://[::1]");
+    }
+
+    static std::string build_cors_headers(const std::string& origin) {
+        if (!origin.empty() && is_trusted_origin(origin)) {
+            return "Access-Control-Allow-Origin: " + origin + "\r\nVary: Origin\r\n";
+        }
+        return "";
+    }
+
+    static void send_http_response(socket_t sock, const std::string& status, const std::string& content_type,
+                                   const std::string& body, const std::string& cors_hdr = "") {
+        std::string resp = "HTTP/1.1 " + status + "\r\n"
+                           "Content-Type: " + content_type + "\r\n"
+                           "X-Content-Type-Options: nosniff\r\n"
+                           "X-Frame-Options: SAMEORIGIN\r\n"
+                           + cors_hdr +
+                           "Connection: close\r\n"
+                           "Content-Length: " + std::to_string(body.length()) + "\r\n\r\n"
+                           + body;
+        send_all(sock, resp.c_str(), static_cast<int>(resp.length()));
+    }
 
     static std::string format_bytes(uintmax_t bytes) {
         if (bytes == 0) return "0 B";
@@ -192,18 +337,23 @@ private:
         return true;
     }
 
-    bool switch_model(const std::string& model_input, std::string& err_out) {
+    bool switch_model(const std::string& model_input, std::string& err_out, bool allow_arbitrary_path = false) {
         std::unique_lock<std::mutex> lock(engine_mutex_);
+
+        if (!allow_arbitrary_path && !is_safe_model_token(model_input)) {
+            err_out = "Invalid model identifier: path traversal or absolute paths are not permitted via HTTP.";
+            return false;
+        }
 
         // 1. Check if target is an MLX / Safetensors directory
         std::string mlx_target = "";
-        if (HavenMLXEngine::is_mlx_model_dir(model_input)) {
+        if (allow_arbitrary_path && HavenMLXEngine::is_mlx_model_dir(model_input)) {
             mlx_target = model_input;
         } else {
             for (const auto& dir : model_search_dirs_) {
-                std::filesystem::path p = std::filesystem::path(dir) / model_input;
-                if (HavenMLXEngine::is_mlx_model_dir(p.string())) {
-                    mlx_target = p.string();
+                std::string safe_cand;
+                if (resolve_safe_path(dir, model_input, safe_cand) && HavenMLXEngine::is_mlx_model_dir(safe_cand)) {
+                    mlx_target = safe_cand;
                     break;
                 }
             }
@@ -226,19 +376,20 @@ private:
         std::string target_path = "";
         std::error_code ec;
 
-        if (std::filesystem::exists(model_input, ec) && !std::filesystem::is_directory(model_input, ec)) {
+        if (allow_arbitrary_path && std::filesystem::exists(model_input, ec) && !std::filesystem::is_directory(model_input, ec)) {
             target_path = model_input;
         } else {
             for (const auto& dir : model_search_dirs_) {
-                std::filesystem::path p = std::filesystem::path(dir) / model_input;
-                if (std::filesystem::exists(p, ec) && !std::filesystem::is_directory(p, ec)) {
-                    target_path = p.string();
+                std::string safe_cand;
+                if (resolve_safe_path(dir, model_input, safe_cand) &&
+                    std::filesystem::exists(safe_cand, ec) && !std::filesystem::is_directory(safe_cand, ec)) {
+                    target_path = safe_cand;
                     break;
                 }
                 if (!model_input.ends_with(".gguf")) {
-                    p = std::filesystem::path(dir) / (model_input + ".gguf");
-                    if (std::filesystem::exists(p, ec) && !std::filesystem::is_directory(p, ec)) {
-                        target_path = p.string();
+                    if (resolve_safe_path(dir, model_input + ".gguf", safe_cand) &&
+                        std::filesystem::exists(safe_cand, ec) && !std::filesystem::is_directory(safe_cand, ec)) {
+                        target_path = safe_cand;
                         break;
                     }
                 }
@@ -376,9 +527,14 @@ private:
             fseek(f, 0, SEEK_END);
             long sz = ftell(f);
             fseek(f, 0, SEEK_SET);
-            std::string content(sz, '\0');
-            fread(content.data(), 1, sz, f);
+            if (sz <= 0 || sz > 10L * 1024 * 1024) {
+                fclose(f);
+                return;
+            }
+            std::string content(static_cast<size_t>(sz), '\0');
+            size_t got = fread(content.data(), 1, static_cast<size_t>(sz), f);
             fclose(f);
+            content.resize(got);
 
             size_t pos = content.find("\"directories\"");
             if (pos != std::string::npos) {
@@ -447,9 +603,14 @@ private:
             fseek(f, 0, SEEK_END);
             long sz = ftell(f);
             fseek(f, 0, SEEK_SET);
-            std::string content(sz, '\0');
-            fread(content.data(), 1, sz, f);
+            if (sz <= 0 || sz > 10L * 1024 * 1024) {
+                fclose(f);
+                return;
+            }
+            std::string content(static_cast<size_t>(sz), '\0');
+            size_t got = fread(content.data(), 1, static_cast<size_t>(sz), f);
             fclose(f);
+            content.resize(got);
             std::string name = extract_json_string(content, "companion_name");
             if (!name.empty()) companion_name_ = name;
             std::string avatar = extract_json_string(content, "companion_avatar");
@@ -498,7 +659,7 @@ private:
             if (in[i] == '%' && i + 2 < in.size()) {
                 int hex_val = 0;
                 auto [ptr, ec] = std::from_chars(in.data() + i + 1, in.data() + i + 3, hex_val, 16);
-                if (ec == std::errc()) {
+                if (ec == std::errc() && ptr == in.data() + i + 3 && hex_val >= 0 && hex_val <= 255) {
                     out += static_cast<char>(hex_val);
                     i += 2;
                     continue;
@@ -510,29 +671,72 @@ private:
     }
 
     static std::string extract_json_string(const std::string& json, const std::string& key) {
-        std::string search = "\"" + key + "\":";
-        size_t pos = json.find(search);
-        if (pos == std::string::npos) return "";
-        size_t start = json.find("\"", pos + search.length());
-        if (start == std::string::npos) return "";
-        start++;
-        std::string out;
-        for (size_t i = start; i < json.length(); ++i) {
-            if (json[i] == '\\' && i + 1 < json.length()) {
-                char next = json[i + 1];
-                if (next == '"') { out += '"'; i++; }
-                else if (next == 'n') { out += '\n'; i++; }
-                else if (next == 'r') { out += '\r'; i++; }
-                else if (next == 't') { out += '\t'; i++; }
-                else if (next == '\\') { out += '\\'; i++; }
-                else { out += next; i++; }
-            } else if (json[i] == '"') {
-                break;
-            } else {
-                out += json[i];
+        std::string search = "\"" + key + "\"";
+        size_t pos = 0;
+        while ((pos = json.find(search, pos)) != std::string::npos) {
+            size_t cur = pos + search.length();
+            while (cur < json.length() && (json[cur] == ' ' || json[cur] == '\t' || json[cur] == '\r' || json[cur] == '\n')) {
+                cur++;
             }
+            if (cur >= json.length() || json[cur] != ':') {
+                pos += search.length();
+                continue;
+            }
+            cur++;
+            while (cur < json.length() && (json[cur] == ' ' || json[cur] == '\t' || json[cur] == '\r' || json[cur] == '\n')) {
+                cur++;
+            }
+            if (cur >= json.length() || json[cur] != '"') {
+                return ""; // Key found, but value is not a JSON string (e.g. number/null/bool)
+            }
+            cur++;
+            std::string out;
+            for (size_t i = cur; i < json.length(); ++i) {
+                if (json[i] == '\\' && i + 1 < json.length()) {
+                    char next = json[i + 1];
+                    if (next == '"') { out += '"'; i++; }
+                    else if (next == 'n') { out += '\n'; i++; }
+                    else if (next == 'r') { out += '\r'; i++; }
+                    else if (next == 't') { out += '\t'; i++; }
+                    else if (next == '\\') { out += '\\'; i++; }
+                    else { out += next; i++; }
+                } else if (json[i] == '"') {
+                    break;
+                } else {
+                    out += json[i];
+                }
+            }
+            return out;
         }
-        return out;
+        return "";
+    }
+
+    static std::string extract_json_scalar(const std::string& json, const std::string& key) {
+        std::string s = extract_json_string(json, key);
+        if (!s.empty()) return s;
+        std::string search = "\"" + key + "\"";
+        size_t pos = 0;
+        while ((pos = json.find(search, pos)) != std::string::npos) {
+            size_t cur = pos + search.length();
+            while (cur < json.length() && (json[cur] == ' ' || json[cur] == '\t' || json[cur] == '\r' || json[cur] == '\n')) {
+                cur++;
+            }
+            if (cur >= json.length() || json[cur] != ':') {
+                pos += search.length();
+                continue;
+            }
+            cur++;
+            while (cur < json.length() && (json[cur] == ' ' || json[cur] == '\t' || json[cur] == '\r' || json[cur] == '\n')) {
+                cur++;
+            }
+            size_t end = cur;
+            while (end < json.length() && json[end] != ',' && json[end] != '}' && json[end] != ']' &&
+                   json[end] != ' ' && json[end] != '\t' && json[end] != '\r' && json[end] != '\n') {
+                end++;
+            }
+            return json.substr(cur, end - cur);
+        }
+        return "";
     }
 
     static std::string escape_json_string(const std::string& input) {
@@ -602,34 +806,35 @@ private:
 
         sockaddr_in address{};
         address.sin_family = AF_INET;
-        address.sin_addr.s_addr = INADDR_ANY;
-        address.sin_port = htons(port_);
+        if (bind_host_ == "0.0.0.0" || bind_host_ == "*") {
+            address.sin_addr.s_addr = INADDR_ANY;
+        } else {
+            std::string ip_str = (bind_host_ == "localhost") ? "127.0.0.1" : bind_host_;
+            if (inet_pton(AF_INET, ip_str.c_str(), &address.sin_addr) != 1) {
+                std::cerr << "[HavenServer] Invalid bind host '" << bind_host_
+                          << "'; defaulting safely to 127.0.0.1\n";
+                bind_host_ = "127.0.0.1";
+                inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+            }
+        }
+        address.sin_port = htons(static_cast<uint16_t>(port_));
 
         if (bind(server_fd_, (struct sockaddr*)&address, sizeof(address)) < 0) {
-            std::cerr << "[HavenServer] Failed to bind port " << port_ << "\n";
-#ifdef _WIN32
-            closesocket(server_fd_);
-            server_fd_ = INVALID_SOCKET;
-#else
-            close(server_fd_);
-            server_fd_ = -1;
-#endif
+            std::cerr << "[HavenServer] Failed to bind " << bind_host_ << ":" << port_ << "\n";
+            close_socket(server_fd_);
+            server_fd_ = HAVEN_INVALID_SOCKET;
             return;
         }
 
-        if (listen(server_fd_, 10) < 0) {
-#ifdef _WIN32
-            closesocket(server_fd_);
-            server_fd_ = INVALID_SOCKET;
-#else
-            close(server_fd_);
-            server_fd_ = -1;
-#endif
+        if (listen(server_fd_, 32) < 0) {
+            close_socket(server_fd_);
+            server_fd_ = HAVEN_INVALID_SOCKET;
             return;
         }
         std::cout << "==================================================================\n";
         std::cout << "🌐 HAVEN-CPP SOVEREIGN STREAMING MICRO-SERVER ONLINE\n";
-        std::cout << "   Listening on http://0.0.0.0:" << port_ << "\n";
+        std::cout << "   Listening on http://" << bind_host_ << ":" << port_
+                  << (api_key_.empty() ? " (loopback/origin-guarded)" : " (Bearer API key active)") << "\n";
         std::cout << "   Endpoints: /, /health, /v1/chat/completions, /completion\n";
         std::cout << "==================================================================\n";
 
@@ -647,12 +852,8 @@ private:
             static constexpr size_t MAX_CONCURRENT_CLIENTS = 64;
             if (active_clients_.load(std::memory_order_relaxed) >= MAX_CONCURRENT_CLIENTS) {
                 const char* busy_resp = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 5\r\nConnection: close\r\nContent-Length: 28\r\n\r\nServer Thread Pool Saturated";
-                send(client_sock, busy_resp, (int)strlen(busy_resp), 0);
-#ifdef _WIN32
-                closesocket(client_sock);
-#else
-                close(client_sock);
-#endif
+                send_all(client_sock, busy_resp, static_cast<int>(std::strlen(busy_resp)));
+                close_socket(client_sock);
                 continue;
             }
 
@@ -667,17 +868,10 @@ private:
             }).detach();
         }
 
-#ifdef _WIN32
-        if (server_fd_ != INVALID_SOCKET) {
-            closesocket(server_fd_);
-            server_fd_ = INVALID_SOCKET;
+        if (server_fd_ != HAVEN_INVALID_SOCKET) {
+            close_socket(server_fd_);
+            server_fd_ = HAVEN_INVALID_SOCKET;
         }
-#else
-        if (server_fd_ >= 0) {
-            close(server_fd_);
-            server_fd_ = -1;
-        }
-#endif
     }
 
     void process_server_side_tools(const std::string& raw_stream) {
@@ -799,13 +993,19 @@ private:
         }
     }
 
-    void handle_native_chat_completions(socket_t client_sock, const std::string& request) {
+    void handle_native_chat_completions(socket_t client_sock, const std::string& request, const std::string& cors_hdr) {
         std::lock_guard<std::mutex> lock(engine_mutex_);
+        if (!model_loaded_) {
+            std::string err_body = "{\"error\":{\"message\":\"No model loaded in Haven Sovereign Engine. Pass a model path on startup.\",\"type\":\"sovereign_engine_error\"}}";
+            send_http_response(client_sock, "503 Service Unavailable", "application/json; charset=utf-8", err_body, cors_hdr);
+            return;
+        }
+
         size_t body_pos = request.find("\r\n\r\n");
         std::string body = (body_pos != std::string::npos) ? request.substr(body_pos + 4) : request;
 
         std::string requested_model = extract_json_string(body, "model");
-        if (!requested_model.empty()) {
+        if (!requested_model.empty() && is_safe_model_token(requested_model)) {
             std::string cur_id = current_model_name_;
             if (cur_id.ends_with(".gguf")) cur_id = cur_id.substr(0, cur_id.length() - 5);
             if (requested_model != current_model_name_ && requested_model != cur_id) {
@@ -813,14 +1013,15 @@ private:
                 std::string target_path = "";
                 std::error_code ec;
                 for (const auto& dir : model_search_dirs_) {
-                    std::filesystem::path p = std::filesystem::path(dir) / requested_model;
-                    if (std::filesystem::exists(p, ec) && !std::filesystem::is_directory(p, ec)) {
-                        target_path = p.string(); break;
+                    std::string safe_cand;
+                    if (resolve_safe_path(dir, requested_model, safe_cand) &&
+                        std::filesystem::exists(safe_cand, ec) && !std::filesystem::is_directory(safe_cand, ec)) {
+                        target_path = safe_cand; break;
                     }
                     if (!requested_model.ends_with(".gguf")) {
-                        p = std::filesystem::path(dir) / (requested_model + ".gguf");
-                        if (std::filesystem::exists(p, ec) && !std::filesystem::is_directory(p, ec)) {
-                            target_path = p.string(); break;
+                        if (resolve_safe_path(dir, requested_model + ".gguf", safe_cand) &&
+                            std::filesystem::exists(safe_cand, ec) && !std::filesystem::is_directory(safe_cand, ec)) {
+                            target_path = safe_cand; break;
                         }
                     }
                 }
@@ -830,20 +1031,29 @@ private:
             }
         }
 
+        const auto& cfg = haven_engine_.get_config();
+        if (cfg.vocab_size == 0 || cfg.max_context_length == 0) {
+            std::string err_body = "{\"error\":{\"message\":\"Loaded model configuration is invalid.\",\"type\":\"sovereign_engine_error\"}}";
+            send_http_response(client_sock, "503 Service Unavailable", "application/json; charset=utf-8", err_body, cors_hdr);
+            return;
+        }
+
         std::string active_model_id = current_model_name_.empty() ? "haven-chat-v5.0" : current_model_name_;
         if (active_model_id.ends_with(".gguf")) active_model_id = active_model_id.substr(0, active_model_id.length() - 5);
 
         bool stream = (body.find("\"stream\": true") != std::string::npos || body.find("\"stream\":true") != std::string::npos);
 
         int max_tokens = 512;
-        size_t mt_pos = body.find("\"max_tokens\":");
-        if (mt_pos == std::string::npos) mt_pos = body.find("\"n_predict\":");
-        if (mt_pos != std::string::npos) {
-            size_t val_start = body.find_first_of("0123456789", mt_pos);
-            if (val_start != std::string::npos) {
-                max_tokens = std::atoi(body.c_str() + val_start);
+        std::string mt_str = extract_json_scalar(body, "max_tokens");
+        if (mt_str.empty()) mt_str = extract_json_scalar(body, "n_predict");
+        if (!mt_str.empty()) {
+            int parsed_mt = 512;
+            auto [p, ec] = std::from_chars(mt_str.data(), mt_str.data() + mt_str.size(), parsed_mt);
+            if (ec == std::errc() && p == mt_str.data() + mt_str.size()) {
+                max_tokens = parsed_mt;
             }
         }
+        max_tokens = std::clamp(max_tokens, 1, 8192);
 
         std::string prompt = extract_json_string(body, "prompt");
         if (prompt.empty()) {
@@ -889,9 +1099,11 @@ private:
             prompt = "<|turn>system\n" + tools_desc + "<turn|>\n" + prompt;
         }
 
+        const int max_ctx = static_cast<int>(cfg.max_context_length);
+        const size_t max_prompt_tokens = std::min<size_t>(4096, static_cast<size_t>(max_ctx > 1 ? max_ctx - 1 : 1));
         auto tokens = haven_engine_.tokenize(prompt, true);
-        if (tokens.size() > 4096) {
-            tokens.erase(tokens.begin(), tokens.begin() + (tokens.size() - 4096));
+        if (tokens.size() > max_prompt_tokens) {
+            tokens.erase(tokens.begin(), tokens.begin() + (tokens.size() - max_prompt_tokens));
         }
 
         std::string accumulated_response = "";
@@ -904,14 +1116,14 @@ private:
             common_prefix++;
         }
 
-        int active_pos = (int)common_prefix;
+        int active_pos = static_cast<int>(common_prefix);
         if (common_prefix == 0) {
             haven_engine_.get_kv_cache().reset();
         }
 
-        std::vector<float> logits(haven_engine_.get_config().vocab_size, 0.0f);
+        std::vector<float> logits(cfg.vocab_size, 0.0f);
 
-        for (size_t i = common_prefix; i < tokens.size(); ++i) {
+        for (size_t i = common_prefix; i < tokens.size() && active_pos < max_ctx; ++i) {
             bool is_last = (i + 1 == tokens.size());
             haven_engine_.forward(tokens[i], active_pos++, is_last ? logits.data() : nullptr);
         }
@@ -931,18 +1143,19 @@ private:
             std::string sse_hdr = "HTTP/1.1 200 OK\r\n"
                                   "Content-Type: text/event-stream\r\n"
                                   "Cache-Control: no-cache\r\n"
-                                  "Connection: keep-alive\r\n"
-                                  "Access-Control-Allow-Origin: *\r\n\r\n";
-            send_all(client_sock, sse_hdr.c_str(), (int)sse_hdr.length());
+                                  "X-Content-Type-Options: nosniff\r\n"
+                                  "Connection: close\r\n"
+                                  + cors_hdr + "\r\n";
+            send_all(client_sock, sse_hdr.c_str(), static_cast<int>(sse_hdr.length()));
 
-            while (tool_depth < MAX_TOOL_DEPTH) {
+            while (tool_depth < MAX_TOOL_DEPTH && active_pos < max_ctx) {
                 std::string phase_output = "";
                 size_t stream_cursor = 0;
                 bool client_disconnected = false;
 
-                for (int gen = 0; gen < max_tokens; ++gen) {
+                for (int gen = 0; gen < max_tokens && active_pos < max_ctx; ++gen) {
                     uint32_t next_tok = haven_engine_.get_sampler().sample(
-                        logits.data(), haven_engine_.get_config().vocab_size, context_history);
+                        logits.data(), cfg.vocab_size, context_history);
                     context_history.push_back(next_tok);
                     cached_tokens_.push_back(next_tok);
 
@@ -987,7 +1200,7 @@ private:
                             if (!unstreamed.empty() && unstreamed.back() != '<') {
                                 std::string esc_text = escape_json_string(unstreamed);
                                 std::string chunk = "data: {\"content\":\"" + esc_text + "\",\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion.chunk\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" + esc_text + "\"},\"finish_reason\":null}]}\n\n";
-                                if (!send_all(client_sock, chunk.c_str(), (int)chunk.length())) {
+                                if (!send_all(client_sock, chunk.c_str(), static_cast<int>(chunk.length()))) {
                                     client_disconnected = true;
                                     break;
                                 }
@@ -997,7 +1210,7 @@ private:
                             std::string safe = unstreamed.substr(0, tag_pos);
                             std::string esc_text = escape_json_string(safe);
                             std::string chunk = "data: {\"content\":\"" + esc_text + "\",\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion.chunk\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" + esc_text + "\"},\"finish_reason\":null}]}\n\n";
-                            if (!send_all(client_sock, chunk.c_str(), (int)chunk.length())) {
+                            if (!send_all(client_sock, chunk.c_str(), static_cast<int>(chunk.length()))) {
                                 client_disconnected = true;
                                 break;
                             }
@@ -1067,13 +1280,13 @@ private:
                         accumulated_response += obs_card;
                         std::string esc_card = escape_json_string(obs_card);
                         std::string card_chunk = "data: {\"content\":\"" + esc_card + "\",\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion.chunk\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" + esc_card + "\"},\"finish_reason\":null}]}\n\n";
-                        send_all(client_sock, card_chunk.c_str(), (int)card_chunk.length());
+                        send_all(client_sock, card_chunk.c_str(), static_cast<int>(card_chunk.length()));
 
                         // Feed tool output back into KV Cache
                         std::string tool_turn = "<turn|>\n<|turn>tool\n" + tool_output + "<turn|>\n<|turn>model\n";
                         auto tool_tokens = haven_engine_.tokenize(tool_turn, false);
-                        for (size_t ti = 0; ti < tool_tokens.size(); ++ti) {
-                            bool is_last = (ti + 1 == tool_tokens.size());
+                        for (size_t ti = 0; ti < tool_tokens.size() && active_pos < max_ctx; ++ti) {
+                            bool is_last = (ti + 1 == tool_tokens.size()) || (active_pos + 1 == max_ctx);
                             haven_engine_.forward(tool_tokens[ti], active_pos++, is_last ? logits.data() : nullptr);
                             cached_tokens_.push_back(tool_tokens[ti]);
                             context_history.push_back(tool_tokens[ti]);
@@ -1089,20 +1302,20 @@ private:
                     std::string remaining = phase_output.substr(stream_cursor);
                     std::string esc_text = escape_json_string(remaining);
                     std::string chunk = "data: {\"content\":\"" + esc_text + "\",\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion.chunk\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" + esc_text + "\"},\"finish_reason\":null}]}\n\n";
-                    send_all(client_sock, chunk.c_str(), (int)chunk.length());
+                    send_all(client_sock, chunk.c_str(), static_cast<int>(chunk.length()));
                 }
                 accumulated_response += phase_output;
                 break; // Finished generation
             }
 
             std::string done_chunk = "data: {\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion.chunk\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
-            send_all(client_sock, done_chunk.c_str(), (int)done_chunk.length());
+            send_all(client_sock, done_chunk.c_str(), static_cast<int>(done_chunk.length()));
         } else {
-            while (tool_depth < MAX_TOOL_DEPTH) {
+            while (tool_depth < MAX_TOOL_DEPTH && active_pos < max_ctx) {
                 std::string phase_output = "";
-                for (int gen = 0; gen < max_tokens; ++gen) {
+                for (int gen = 0; gen < max_tokens && active_pos < max_ctx; ++gen) {
                     uint32_t next_tok = haven_engine_.get_sampler().sample(
-                        logits.data(), haven_engine_.get_config().vocab_size, context_history);
+                        logits.data(), cfg.vocab_size, context_history);
                     context_history.push_back(next_tok);
                     cached_tokens_.push_back(next_tok);
 
@@ -1197,8 +1410,8 @@ private:
 
                         std::string tool_turn = "<turn|>\n<|turn>tool\n" + tool_output + "<turn|>\n<|turn>model\n";
                         auto tool_tokens = haven_engine_.tokenize(tool_turn, false);
-                        for (size_t ti = 0; ti < tool_tokens.size(); ++ti) {
-                            bool is_last = (ti + 1 == tool_tokens.size());
+                        for (size_t ti = 0; ti < tool_tokens.size() && active_pos < max_ctx; ++ti) {
+                            bool is_last = (ti + 1 == tool_tokens.size()) || (active_pos + 1 == max_ctx);
                             haven_engine_.forward(tool_tokens[ti], active_pos++, is_last ? logits.data() : nullptr);
                             cached_tokens_.push_back(tool_tokens[ti]);
                             context_history.push_back(tool_tokens[ti]);
@@ -1216,12 +1429,7 @@ private:
             std::string esc_content = escape_json_string(accumulated_response);
             std::string json_resp = "{\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"content\":\"" + esc_content + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" + esc_content + "\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(tokens.size()) + ",\"completion_tokens\":" + std::to_string(accumulated_response.length() / 4) + ",\"total_tokens\":" + std::to_string(tokens.size() + accumulated_response.length() / 4) + "}}";
 
-            std::string http_resp = "HTTP/1.1 200 OK\r\n"
-                                    "Content-Type: application/json; charset=utf-8\r\n"
-                                    "Access-Control-Allow-Origin: *\r\n"
-                                    "Content-Length: " + std::to_string(json_resp.length()) + "\r\n\r\n"
-                                    + json_resp;
-            send_all(client_sock, http_resp.c_str(), (int)http_resp.length());
+            send_http_response(client_sock, "200 OK", "application/json; charset=utf-8", json_resp, cors_hdr);
         }
 
 #ifdef _WIN32
@@ -1235,77 +1443,182 @@ private:
     }
 
     void handle_client(socket_t sock) {
+        // Enforce socket read/write timeouts to neutralize Slowloris / stalled-socket DoS
+#ifdef _WIN32
+        DWORD rcv_to = 15000;
+        DWORD snd_to = 30000;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&rcv_to), sizeof(rcv_to));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&snd_to), sizeof(snd_to));
+#else
+        timeval rcv_to{15, 0};
+        timeval snd_to{30, 0};
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_to, sizeof(rcv_to));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &snd_to, sizeof(snd_to));
+#endif
+
+        constexpr size_t MAX_HTTP_HEADER = 65536;
+        constexpr uint64_t MAX_HTTP_PAYLOAD = 32ULL * 1024 * 1024;
+
         std::string request;
-        char buffer[16384] = {0};
-        
+        char buffer[16384];
+        size_t header_end = std::string::npos;
+        bool headers_parsed = false;
+        bool has_content_length = false;
+        uint64_t parsed_content_length = 0;
+        size_t expected_total = 0;
+
         while (true) {
 #ifdef _WIN32
-            int bytes_read = recv(sock, buffer, sizeof(buffer) - 1, 0);
+            int bytes_read = recv(sock, buffer, sizeof(buffer), 0);
 #else
-            int bytes_read = read(sock, buffer, sizeof(buffer) - 1);
+            int bytes_read = static_cast<int>(read(sock, buffer, sizeof(buffer)));
 #endif
             if (bytes_read <= 0) break;
-            request.append(buffer, bytes_read);
+            request.append(buffer, static_cast<size_t>(bytes_read));
 
-            // Check if headers are complete
-            size_t header_end = request.find("\r\n\r\n");
-            if (header_end != std::string::npos) {
-                // Check for Content-Length
-                size_t cl_pos = request.find("Content-Length: ");
-                if (cl_pos == std::string::npos) cl_pos = request.find("content-length: ");
-                if (cl_pos != std::string::npos) {
-                    size_t cl_end = request.find("\r\n", cl_pos);
-                    if (cl_end == std::string::npos) break;
-                    std::string len_str = request.substr(cl_pos + 16, cl_end - (cl_pos + 16));
-                    size_t f = len_str.find_first_not_of(" \t");
-                    size_t l = len_str.find_last_not_of(" \t");
-                    if (f == std::string::npos) break;
-                    len_str = len_str.substr(f, l - f + 1);
-
-                    uint64_t parsed_len = 0;
-                    auto [ptr, ec] = std::from_chars(len_str.data(), len_str.data() + len_str.size(), parsed_len);
-                    constexpr uint64_t MAX_HTTP_PAYLOAD = 32ULL * 1024 * 1024;
-                    if (ec != std::errc() || ptr != len_str.data() + len_str.size() || parsed_len > MAX_HTTP_PAYLOAD) {
-                        const char* bad_req = "HTTP/1.1 400 Bad Request\r\nContent-Length: 22\r\n\r\nInvalid Content-Length";
-                        send_all(sock, bad_req, (int)strlen(bad_req));
+            if (!headers_parsed) {
+                header_end = request.find("\r\n\r\n");
+                if (header_end == std::string::npos) {
+                    if (request.size() > MAX_HTTP_HEADER) {
+                        send_http_response(sock, "431 Request Header Fields Too Large", "text/plain", "Request headers exceed 64 KiB limit");
+                        close_socket(sock);
+                        return;
+                    }
+                    continue;
+                }
+                if (header_end > MAX_HTTP_HEADER) {
+                    send_http_response(sock, "431 Request Header Fields Too Large", "text/plain", "Request headers exceed 64 KiB limit");
+                    close_socket(sock);
+                    return;
+                }
+                headers_parsed = true;
+                std::string raw_hdrs = request.substr(0, header_end);
+                size_t cl_count = 0;
+                std::string len_str = get_http_header(raw_hdrs, "content-length", &cl_count);
+                if (cl_count > 1) {
+                    send_http_response(sock, "400 Bad Request", "text/plain", "Duplicate Content-Length header");
+                    close_socket(sock);
+                    return;
+                }
+                if (cl_count == 1) {
+                    has_content_length = true;
+                    auto [ptr, ec] = std::from_chars(len_str.data(), len_str.data() + len_str.size(), parsed_content_length);
+                    if (ec != std::errc() || ptr != len_str.data() + len_str.size() || parsed_content_length > MAX_HTTP_PAYLOAD) {
+                        send_http_response(sock, "400 Bad Request", "text/plain", "Invalid Content-Length");
+                        close_socket(sock);
+                        return;
+                    }
+                    expected_total = header_end + 4 + static_cast<size_t>(parsed_content_length);
+                    if (request.size() >= expected_total) {
                         break;
                     }
-                    size_t total_expected = header_end + 4 + static_cast<size_t>(parsed_len);
-                    if (request.length() >= total_expected) {
-                        break; // Fully received!
-                    }
                 } else {
-                    break; // No content length, GET/OPTIONS done
+                    break;
+                }
+            } else {
+                if (request.size() >= expected_total) {
+                    break;
+                }
+                if (request.size() > MAX_HTTP_HEADER + MAX_HTTP_PAYLOAD) {
+                    send_http_response(sock, "413 Payload Too Large", "text/plain", "Request payload exceeds 32 MiB limit");
+                    close_socket(sock);
+                    return;
                 }
             }
         }
 
-        if (request.empty()) {
-#ifdef _WIN32
-            closesocket(sock);
-#else
-            close(sock);
-#endif
+        if (request.empty() || !headers_parsed || header_end == std::string::npos) {
+            close_socket(sock);
+            return;
+        }
+        if (has_content_length && request.size() < expected_total) {
+            send_http_response(sock, "400 Bad Request", "text/plain", "Truncated request body");
+            close_socket(sock);
             return;
         }
 
-        std::istringstream req_stream(request);
+        std::string raw_headers = request.substr(0, header_end);
+        std::string body = request.substr(header_end + 4);
+        if (has_content_length && body.size() > static_cast<size_t>(parsed_content_length)) {
+            body.resize(static_cast<size_t>(parsed_content_length));
+        }
+
+        size_t first_eol = raw_headers.find("\r\n");
+        std::string req_line = (first_eol != std::string::npos) ? raw_headers.substr(0, first_eol) : raw_headers;
+        std::istringstream req_stream(req_line);
         std::string method, path, version;
         req_stream >> method >> path >> version;
-
-        // CORS Preflight
-        if (method == "OPTIONS") {
-            std::string resp = "HTTP/1.1 204 No Content\r\n"
-                               "Access-Control-Allow-Origin: *\r\n"
-                               "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-                               "Access-Control-Allow-Headers: *\r\n\r\n";
-            send(sock, resp.c_str(), (int)resp.length(), 0);
-#ifdef _WIN32
-            closesocket(sock);
-#else
-            close(sock);
-#endif
+        if (method.empty() || path.empty()) {
+            send_http_response(sock, "400 Bad Request", "text/plain", "Malformed HTTP request line");
+            close_socket(sock);
             return;
+        }
+
+        std::string host_hdr = get_http_header(raw_headers, "host");
+        std::string origin_hdr = get_http_header(raw_headers, "origin");
+        std::string auth_hdr = get_http_header(raw_headers, "authorization");
+
+        // DNS Rebinding defense when bound to loopback
+        if ((bind_host_ == "127.0.0.1" || bind_host_ == "localhost") && !is_loopback_host_header(host_hdr)) {
+            send_http_response(sock, "403 Forbidden", "application/json; charset=utf-8",
+                               "{\"ok\":false,\"error\":\"Forbidden Host header\"}");
+            close_socket(sock);
+            return;
+        }
+
+        std::string cors_hdr = build_cors_headers(origin_hdr);
+
+        // CORS Preflight (restricted strictly to trusted loopback origins)
+        if (method == "OPTIONS") {
+            if (!origin_hdr.empty() && !is_trusted_origin(origin_hdr)) {
+                send_http_response(sock, "403 Forbidden", "text/plain", "Untrusted CORS origin");
+                close_socket(sock);
+                return;
+            }
+            std::string resp = "HTTP/1.1 204 No Content\r\n"
+                               + cors_hdr +
+                               "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n"
+                               "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+                               "Connection: close\r\n\r\n";
+            send_all(sock, resp.c_str(), static_cast<int>(resp.length()));
+            close_socket(sock);
+            return;
+        }
+
+        const bool is_api_route =
+            path.starts_with("/api/") ||
+            path.starts_with("/v1/") ||
+            path == "/completion" ||
+            path == "/props" || path.starts_with("/props?") ||
+            path == "/slots" || path.starts_with("/slots?");
+
+        // Cross-Origin browser CSRF / RCE guard on all API endpoints
+        if (is_api_route && !origin_hdr.empty() && !is_trusted_origin(origin_hdr)) {
+            send_http_response(sock, "403 Forbidden", "application/json; charset=utf-8",
+                               "{\"ok\":false,\"error\":\"Cross-origin API access blocked\"}");
+            close_socket(sock);
+            return;
+        }
+
+        // Optional Bearer API key authentication (via --api-key or HAVEN_API_KEY)
+        if (is_api_route && !api_key_.empty()) {
+            bool auth_ok = false;
+            if (auth_hdr.size() > 7 && to_lower_ascii(auth_hdr.substr(0, 7)) == "bearer ") {
+                auth_ok = HavenSecurity::constant_time_verify(auth_hdr.substr(7), api_key_);
+            }
+            if (!auth_ok) {
+                std::string unauth_body = "{\"ok\":false,\"error\":\"Unauthorized: valid Bearer token required\"}";
+                std::string resp = "HTTP/1.1 401 Unauthorized\r\n"
+                                   "Content-Type: application/json; charset=utf-8\r\n"
+                                   "WWW-Authenticate: Bearer\r\n"
+                                   + cors_hdr +
+                                   "Connection: close\r\n"
+                                   "Content-Length: " + std::to_string(unauth_body.length()) + "\r\n\r\n"
+                                   + unauth_body;
+                send_all(sock, resp.c_str(), static_cast<int>(resp.length()));
+                close_socket(sock);
+                return;
+            }
         }
 
         if (path == "/" || path == "/index.html") {
@@ -1331,42 +1644,38 @@ private:
             std::string json = "{\"ok\":true,\"total_memories\":" + std::to_string(mems.size()) 
                              + ",\"binary_hmb_bytes\":" + std::to_string(hmb_size) 
                              + ",\"vault_format\":\"64-bit Haven Memory Bank (.hmb)\",\"engine\":\"haven-cpp-v2.0-standalone\"}";
-            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                             + std::to_string(json.length()) + "\r\n\r\n" + json;
-            send(sock, resp.c_str(), (int)resp.length(), 0);
+            send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
         }
         else if (path.starts_with("/api/memories/search")) {
             std::lock_guard<std::mutex> lock(engine_mutex_);
             std::string query = "";
-            size_t q_pos = request.find("\"query\":");
-            if (q_pos != std::string::npos) {
-                query = extract_json_string(request, "query");
+            if (body.find("\"query\"") != std::string::npos) {
+                query = extract_json_string(body, "query");
             } else {
                 size_t param_pos = path.find("?q=");
-                if (param_pos != std::string::npos) query = path.substr(param_pos + 3);
+                if (param_pos != std::string::npos) query = url_decode(path.substr(param_pos + 3));
             }
-            std::string q_lower = query;
-            for (char& c : q_lower) c = (char)std::tolower(c);
+            std::string q_lower = to_lower_ascii(query);
 
             const auto& mems = haven_engine_.get_memory_engine().get_all_memories();
             std::string json = "{\"ok\":true,\"query\":\"" + escape_json_string(query) + "\",\"matches\":[";
             bool first = true;
             for (const auto& m : mems) {
-                std::string c_lower = m.concept_name;
-                std::string t_lower = m.text_content;
-                for (char& c : c_lower) c = (char)std::tolower(c);
-                for (char& c : t_lower) c = (char)std::tolower(c);
+                std::string c_lower = to_lower_ascii(m.concept_name);
+                std::string t_lower = to_lower_ascii(m.text_content);
 
                 if (q_lower.empty() || c_lower.find(q_lower) != std::string::npos || t_lower.find(q_lower) != std::string::npos) {
                     if (!first) json += ",";
-                    json += "{\"id\":" + std::to_string(m.id) + ",\"concept\":\"" + escape_json_string(m.concept_name) + "\",\"content\":\"" + escape_json_string(m.text_content) + "\",\"category\":\"" + m.category + "\",\"emotional_salience\":" + std::to_string(m.emotional_salience) + "}";
+                    json += "{\"id\":" + std::to_string(m.id)
+                          + ",\"concept\":\"" + escape_json_string(m.concept_name)
+                          + "\",\"content\":\"" + escape_json_string(m.text_content)
+                          + "\",\"category\":\"" + escape_json_string(m.category)
+                          + "\",\"emotional_salience\":" + std::to_string(m.emotional_salience) + "}";
                     first = false;
                 }
             }
             json += "]}";
-            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                             + std::to_string(json.length()) + "\r\n\r\n" + json;
-            send(sock, resp.c_str(), (int)resp.length(), 0);
+            send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
         }
         else if (path.starts_with("/api/memories")) {
             std::lock_guard<std::mutex> lock(engine_mutex_);
@@ -1376,19 +1685,24 @@ private:
                 for (size_t i = 0; i < mems.size(); ++i) {
                     const auto& m = mems[i];
                     if (i > 0) json += ",";
-                    json += "{\"id\":" + std::to_string(m.id) + ",\"concept\":\"" + escape_json_string(m.concept_name) + "\",\"content\":\"" + escape_json_string(m.text_content) + "\",\"category\":\"" + m.category + "\",\"weight\":" + std::to_string(m.weight) + ",\"emotional_salience\":" + std::to_string(m.emotional_salience) + ",\"access_count\":" + std::to_string(m.access_count) + ",\"timestamp\":" + std::to_string(m.timestamp) + "}";
+                    json += "{\"id\":" + std::to_string(m.id)
+                          + ",\"concept\":\"" + escape_json_string(m.concept_name)
+                          + "\",\"content\":\"" + escape_json_string(m.text_content)
+                          + "\",\"category\":\"" + escape_json_string(m.category)
+                          + "\",\"weight\":" + std::to_string(m.weight)
+                          + ",\"emotional_salience\":" + std::to_string(m.emotional_salience)
+                          + ",\"access_count\":" + std::to_string(m.access_count)
+                          + ",\"timestamp\":" + std::to_string(m.timestamp) + "}";
                 }
                 json += "]}";
-                std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                                 + std::to_string(json.length()) + "\r\n\r\n" + json;
-                send(sock, resp.c_str(), (int)resp.length(), 0);
+                send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
             }
-            else if (method == "POST") {
-                std::string concept_str = extract_json_string(request, "concept");
+            else if (method == "POST" && path != "/api/memories/delete" && path != "/api/memories/update") {
+                std::string concept_str = extract_json_string(body, "concept");
                 if (concept_str.empty()) concept_str = "Episodic Moment";
-                std::string content = extract_json_string(request, "content");
+                std::string content = extract_json_string(body, "content");
                 if (content.empty()) content = "A shared experience with Daniel in Sanctuary.";
-                std::string category = extract_json_string(request, "category");
+                std::string category = extract_json_string(body, "category");
                 if (category.empty()) category = "EPISODIC";
                 float weight = 0.95f;
                 float emotional = 0.95f;
@@ -1407,25 +1721,13 @@ private:
                 haven_engine_.save_memories("wwwroot/memories.json");
 
                 std::string res_body = "{\"ok\":true,\"msg\":\"Memory inscribed into 64-bit Haven Memory Bank (.hmb)\"}";
-                std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                                 + std::to_string(res_body.length()) + "\r\n\r\n" + res_body;
-                send(sock, resp.c_str(), (int)resp.length(), 0);
+                send_http_response(sock, "200 OK", "application/json; charset=utf-8", res_body, cors_hdr);
             }
             else if (method == "DELETE" || path == "/api/memories/delete") {
                 uint64_t target_id = 0;
-                std::string id_str = extract_json_string(request, "id");
+                std::string id_str = extract_json_scalar(body, "id");
                 if (!id_str.empty()) {
                     try { target_id = std::stoull(id_str); } catch (...) {}
-                }
-                if (target_id == 0) {
-                    size_t pos = request.find("\"id\":");
-                    if (pos != std::string::npos) {
-                        try {
-                            size_t num_start = pos + 5;
-                            while (num_start < request.size() && (request[num_start] == ' ' || request[num_start] == ':')) num_start++;
-                            target_id = std::stoull(request.substr(num_start));
-                        } catch (...) {}
-                    }
                 }
                 auto& mems = haven_engine_.get_memory_engine().get_all_memories();
                 bool removed = false;
@@ -1440,37 +1742,21 @@ private:
                     }
                 }
                 std::string res_body = "{\"ok\":" + std::string(removed ? "true" : "false") + ",\"msg\":\"" + (removed ? "Memory deleted" : "Memory not found") + "\"}";
-                std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: "
-                                 + std::to_string(res_body.length()) + "\r\n\r\n" + res_body;
-                send(sock, resp.c_str(), (int)resp.length(), 0);
+                send_http_response(sock, "200 OK", "application/json; charset=utf-8", res_body, cors_hdr);
             }
-            else if (path == "/api/memories/update" || (path.starts_with("/api/memories") && method == "PUT")) {
+            else if (path == "/api/memories/update" || method == "PUT") {
                 uint64_t target_id = 0;
-                std::string id_str = extract_json_string(request, "id");
+                std::string id_str = extract_json_scalar(body, "id");
                 if (!id_str.empty()) {
                     try { target_id = std::stoull(id_str); } catch (...) {}
                 }
-                if (target_id == 0) {
-                    size_t pos = request.find("\"id\":");
-                    if (pos != std::string::npos) {
-                        try {
-                            size_t num_start = pos + 5;
-                            while (num_start < request.size() && (request[num_start] == ' ' || request[num_start] == ':')) num_start++;
-                            target_id = std::stoull(request.substr(num_start));
-                        } catch (...) {}
-                    }
-                }
-                std::string concept_str = extract_json_string(request, "concept");
-                std::string content = extract_json_string(request, "content");
-                std::string category = extract_json_string(request, "category");
+                std::string concept_str = extract_json_string(body, "concept");
+                std::string content = extract_json_string(body, "content");
+                std::string category = extract_json_string(body, "category");
                 float salience = -1.0f;
-                size_t sal_pos = request.find("\"emotional_salience\":");
-                if (sal_pos != std::string::npos) {
-                    try {
-                        size_t num_start = sal_pos + 21;
-                        while (num_start < request.size() && (request[num_start] == ' ' || request[num_start] == ':')) num_start++;
-                        salience = std::stof(request.substr(num_start));
-                    } catch (...) {}
+                std::string sal_str = extract_json_scalar(body, "emotional_salience");
+                if (!sal_str.empty()) {
+                    try { salience = std::stof(sal_str); } catch (...) {}
                 }
 
                 auto& mems = haven_engine_.get_memory_engine().get_all_memories();
@@ -1488,14 +1774,18 @@ private:
                     }
                 }
                 std::string res_body = "{\"ok\":" + std::string(updated ? "true" : "false") + ",\"msg\":\"" + (updated ? "Memory updated" : "Memory not found") + "\"}";
-                std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: "
-                                 + std::to_string(res_body.length()) + "\r\n\r\n" + res_body;
-                send(sock, resp.c_str(), (int)resp.length(), 0);
+                send_http_response(sock, "200 OK", "application/json; charset=utf-8", res_body, cors_hdr);
+            } else {
+                send_http_response(sock, "405 Method Not Allowed", "application/json; charset=utf-8",
+                                   "{\"ok\":false,\"error\":\"Method not allowed\"}", cors_hdr);
             }
         }
-
         else if (path == "/api/telemetry") {
-            const auto& mems = haven_engine_.get_memory_engine().get_all_memories();
+            size_t mem_count = 0;
+            {
+                std::lock_guard<std::mutex> lock(engine_mutex_);
+                mem_count = haven_engine_.get_memory_engine().get_all_memories().size();
+            }
             size_t img_count = 0;
             try {
                 if (std::filesystem::exists("wwwroot/uploads")) {
@@ -1506,15 +1796,12 @@ private:
             } catch (...) {}
 
             std::string json = "{\"ok\":true,\"status\":\"sovereign_online\",\"engine\":\"haven-cpp-v2.0\",\"vault_format\":\"64-bit Haven Memory Bank (.hmb)\",\"cpu_arch\":\"AVX2+FMA3\",\"cpu_threads\":12,\"memory_count\":" 
-                             + std::to_string(mems.size()) + ",\"gallery_images\":" + std::to_string(img_count) 
+                             + std::to_string(mem_count) + ",\"gallery_images\":" + std::to_string(img_count) 
                              + ",\"backends\":{\"llm\":\"127.0.0.1:11438 (Haven Native AVX2)\",\"diffusion\":\"127.0.0.1:8085 (DreamShaper8 LCM)\"}}";
-            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                             + std::to_string(json.length()) + "\r\n\r\n" + json;
-            send(sock, resp.c_str(), (int)resp.length(), 0);
+            send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
         }
         else if (path == "/api/actions/execute") {
-            std::string action = extract_json_string(request, "action");
-            std::string code = extract_json_string(request, "code");
+            std::string action = extract_json_string(body, "action");
             std::string output = "Action completed successfully.";
 
             if (action == "system_info") {
@@ -1524,9 +1811,7 @@ private:
             }
 
             std::string json = "{\"ok\":true,\"action\":\"" + escape_json_string(action) + "\",\"result\":\"" + escape_json_string(output) + "\"}";
-            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                             + std::to_string(json.length()) + "\r\n\r\n" + json;
-            send(sock, resp.c_str(), (int)resp.length(), 0);
+            send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
         }
         else if (path == "/api/gallery" || path == "/api/uploads") {
             std::string items_json = "";
@@ -1544,7 +1829,8 @@ private:
                             if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".webp") {
                                 uintmax_t fsize = entry.file_size();
                                 if (!first) items_json += ",";
-                                items_json += "{\"name\":\"" + fname + "\",\"url\":\"/uploads/" + fname + "\",\"size\":" + std::to_string(fsize) + "}";
+                                std::string esc_f = escape_json_string(fname);
+                                items_json += "{\"name\":\"" + esc_f + "\",\"url\":\"/uploads/" + esc_f + "\",\"size\":" + std::to_string(fsize) + "}";
                                 first = false;
                             }
                         }
@@ -1552,50 +1838,47 @@ private:
                 }
             } catch (...) {}
             std::string json_body = "{\"ok\":true,\"files\":[" + items_json + "],\"images\":[" + items_json + "]}";
-
-            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                             + std::to_string(json_body.length()) + "\r\n\r\n" + json_body;
-            send(sock, resp.c_str(), (int)resp.length(), 0);
+            send_http_response(sock, "200 OK", "application/json; charset=utf-8", json_body, cors_hdr);
         }
         else if (path == "/api/gallery/delete" || (path.starts_with("/api/gallery") && method == "DELETE")) {
-            std::string fname = extract_json_string(request, "filename");
-            if (fname.empty()) fname = extract_json_string(request, "name");
+            std::string raw_fname = extract_json_string(body, "filename");
+            if (raw_fname.empty()) raw_fname = extract_json_string(body, "name");
+            std::string fname = std::filesystem::path(raw_fname).filename().string();
             bool deleted = false;
-            if (!fname.empty() && fname.find("..") == std::string::npos && fname.find('/') == std::string::npos && fname.find('\\') == std::string::npos) {
-                std::string p1 = "wwwroot/uploads/" + fname;
-                std::string p2 = "C:\\Users\\admin\\source\\haven-cpp\\wwwroot\\uploads\\" + fname;
-                try {
-                    if (std::filesystem::exists(p1)) {
-                        std::filesystem::remove(p1);
-                        deleted = true;
-                    } else if (std::filesystem::exists(p2)) {
-                        std::filesystem::remove(p2);
-                        deleted = true;
-                    }
-                } catch (...) {}
+            if (!fname.empty() && fname == raw_fname && is_safe_model_token(fname)) {
+                std::string safe_p1, safe_p2;
+                std::error_code ec;
+                if (resolve_safe_path("wwwroot/uploads", fname, safe_p1) &&
+                    std::filesystem::is_regular_file(safe_p1, ec)) {
+                    deleted = std::filesystem::remove(safe_p1, ec);
+                } else if (resolve_safe_path("C:\\Users\\admin\\source\\haven-cpp\\wwwroot\\uploads", fname, safe_p2) &&
+                           std::filesystem::is_regular_file(safe_p2, ec)) {
+                    deleted = std::filesystem::remove(safe_p2, ec);
+                }
             }
-            std::string json_body = "{\"ok\":" + std::string(deleted ? "true" : "false") + ",\"filename\":\"" + fname + "\"}";
-            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: "
-                             + std::to_string(json_body.length()) + "\r\n\r\n" + json_body;
-            send(sock, resp.c_str(), (int)resp.length(), 0);
+            std::string json_body = "{\"ok\":" + std::string(deleted ? "true" : "false") + ",\"filename\":\"" + escape_json_string(fname) + "\"}";
+            send_http_response(sock, "200 OK", "application/json; charset=utf-8", json_body, cors_hdr);
         }
         else if (path == "/api/knowledge_graph") {
             std::string content = "{\"relations\":[]}";
             std::string p1 = "wwwroot/knowledge_graph.json";
             std::string p2 = "C:\\Users\\admin\\source\\haven-cpp\\wwwroot\\knowledge_graph.json";
-            std::ifstream in(std::filesystem::exists(p1) ? p1 : p2);
-            if (in.is_open()) {
-                std::stringstream ss;
-                ss << in.rdbuf();
-                content = ss.str();
+            std::string chosen = std::filesystem::exists(p1) ? p1 : p2;
+            std::error_code ec;
+            uintmax_t kg_size = std::filesystem::exists(chosen, ec) ? std::filesystem::file_size(chosen, ec) : 0;
+            if (!ec && kg_size > 0 && kg_size <= 32ULL * 1024 * 1024) {
+                std::ifstream in(chosen, std::ios::binary);
+                if (in.is_open()) {
+                    std::stringstream ss;
+                    ss << in.rdbuf();
+                    content = ss.str();
+                }
             }
-            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: "
-                             + std::to_string(content.length()) + "\r\n\r\n" + content;
-            send(sock, resp.c_str(), (int)resp.length(), 0);
+            send_http_response(sock, "200 OK", "application/json; charset=utf-8", content, cors_hdr);
         }
         else if (path == "/api/save_image") {
-            std::string b64 = extract_json_string(request, "b64_json");
-            std::string raw_fname = extract_json_string(request, "filename");
+            std::string b64 = extract_json_string(body, "b64_json");
+            std::string raw_fname = extract_json_string(body, "filename");
             std::string fname;
             if (raw_fname.empty()) {
                 auto now = std::chrono::system_clock::now();
@@ -1605,9 +1888,7 @@ private:
                 fname = ss.str();
             } else {
                 fname = std::filesystem::path(raw_fname).filename().string();
-                if (fname.find("..") != std::string::npos || fname.find('/') != std::string::npos || 
-                    fname.find('\\') != std::string::npos || fname.find(':') != std::string::npos ||
-                    fname.find('\0') != std::string::npos) {
+                if (!is_safe_model_token(fname)) {
                     fname = "aura_artwork_sanitized.png";
                 }
             }
@@ -1619,33 +1900,35 @@ private:
             if (!std::filesystem::exists(uploads_dir)) {
                 uploads_dir = "C:\\Users\\admin\\source\\haven-cpp\\wwwroot\\uploads";
             }
-            std::filesystem::create_directories(uploads_dir);
-            std::string file_path = uploads_dir + "/" + fname;
-
-            auto bytes = base64_decode(b64);
+            std::error_code dir_ec;
+            std::filesystem::create_directories(uploads_dir, dir_ec);
+            std::string file_path;
             bool ok = false;
-            if (!bytes.empty()) {
-                FILE* f = fopen(file_path.c_str(), "wb");
-                if (f) {
-                    fwrite(bytes.data(), 1, bytes.size(), f);
-                    fclose(f);
-                    ok = true;
-                    std::cout << "[HavenServer] \xE2\x9C\x93 Inscribed Aura artwork to disk: " << file_path << " (" << bytes.size() << " bytes)\n";
+            if (resolve_safe_path(uploads_dir, fname, file_path)) {
+                auto bytes = base64_decode(b64);
+                if (!bytes.empty() && bytes.size() <= 16ULL * 1024 * 1024) {
+                    FILE* f = fopen(file_path.c_str(), "wb");
+                    if (f) {
+                        size_t written = fwrite(bytes.data(), 1, bytes.size(), f);
+                        fclose(f);
+                        ok = (written == bytes.size());
+                        if (ok) {
+                            std::cout << "[HavenServer] \xE2\x9C\x93 Inscribed Aura artwork to disk: " << file_path << " (" << bytes.size() << " bytes)\n";
+                        }
+                    }
                 }
             }
 
-            std::string json_body = "{\"ok\":" + std::string(ok ? "true" : "false") + ",\"url\":\"/uploads/" + fname + "\",\"name\":\"" + fname + "\"}";
-            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                             + std::to_string(json_body.length()) + "\r\n\r\n" + json_body;
-            send(sock, resp.c_str(), (int)resp.length(), 0);
+            std::string esc_f = escape_json_string(fname);
+            std::string json_body = "{\"ok\":" + std::string(ok ? "true" : "false") + ",\"url\":\"/uploads/" + esc_f + "\",\"name\":\"" + esc_f + "\"}";
+            send_http_response(sock, "200 OK", "application/json; charset=utf-8", json_body, cors_hdr);
         }
         else if (path == "/health") {
-            std::string body = "{\"status\":\"sovereign_online\",\"engine\":\"haven-cpp-v2.0\",\"gateway\":true}";
-            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                             + std::to_string(body.length()) + "\r\n\r\n" + body;
-            send_all(sock, resp.c_str(), (int)resp.length());
+            std::string resp_body = "{\"status\":\"sovereign_online\",\"engine\":\"haven-cpp-v2.0\",\"gateway\":true}";
+            send_http_response(sock, "200 OK", "application/json; charset=utf-8", resp_body, cors_hdr);
         }
         else if (path == "/props" || path.starts_with("/props?")) {
+            std::lock_guard<std::mutex> lock(engine_mutex_);
             std::string model_name = current_model_name_.empty() ? "haven-chat-v5.0.gguf" : current_model_name_;
             const auto& p = haven_engine_.get_sampler().get_params();
 
@@ -1682,46 +1965,32 @@ private:
                 "\"chat_template\":\"{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>' + '\\n'}}{% endfor %}{% if add_generation_prompt %}{{'<|im_start|>assistant\\n'}}{% endif %}\""
             "}";
 
-            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                             + std::to_string(json.length()) + "\r\n\r\n" + json;
-            send_all(sock, resp.c_str(), (int)resp.length());
+            send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
         }
         else if (path == "/slots" || path.starts_with("/slots?")) {
             std::string json = "[{\"id\":0,\"id_task\":0,\"is_processing\":false,\"n_ctx\":16384,\"state\":0}]";
-            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                             + std::to_string(json.length()) + "\r\n\r\n" + json;
-            send_all(sock, resp.c_str(), (int)resp.length());
+            send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
         }
         else if (path == "/v1/models" || path == "/api/models") {
-            std::string body = get_models_json();
-            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                             + std::to_string(body.length()) + "\r\n\r\n" + body;
-            send_all(sock, resp.c_str(), (int)resp.length());
+            std::string resp_body = get_models_json();
+            send_http_response(sock, "200 OK", "application/json; charset=utf-8", resp_body, cors_hdr);
         }
         else if (path == "/api/models/directory" || path == "/v1/models/directory") {
             if (method == "GET") {
-                std::string body = get_model_directories_json();
-                std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                                 + std::to_string(body.length()) + "\r\n\r\n" + body;
-                send_all(sock, resp.c_str(), (int)resp.length());
+                std::string resp_body = get_model_directories_json();
+                send_http_response(sock, "200 OK", "application/json; charset=utf-8", resp_body, cors_hdr);
             } else if (method == "POST") {
-                size_t body_pos = request.find("\r\n\r\n");
-                std::string body = (body_pos != std::string::npos) ? request.substr(body_pos + 4) : "";
                 std::string req_dir = extract_json_string(body, "directory");
                 if (req_dir.empty()) req_dir = extract_json_string(body, "path");
 
-                if (req_dir.empty()) {
-                    std::string err = "{\"ok\":false,\"error\":\"Missing 'directory' or 'path' in request body.\"}";
-                    std::string resp = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                                     + std::to_string(err.length()) + "\r\n\r\n" + err;
-                    send_all(sock, resp.c_str(), (int)resp.length());
+                if (req_dir.empty() || req_dir.starts_with("\\\\") || req_dir.starts_with("//") || req_dir.find('\0') != std::string::npos) {
+                    send_http_response(sock, "400 Bad Request", "application/json; charset=utf-8",
+                                       "{\"ok\":false,\"error\":\"Invalid or missing local directory path.\"}", cors_hdr);
                 } else {
                     std::error_code ec;
                     if (!std::filesystem::exists(req_dir, ec) || !std::filesystem::is_directory(req_dir, ec)) {
                         std::string err = "{\"ok\":false,\"error\":\"Directory does not exist or is not a folder: " + escape_json_string(req_dir) + "\"}";
-                        std::string resp = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                                         + std::to_string(err.length()) + "\r\n\r\n" + err;
-                        send_all(sock, resp.c_str(), (int)resp.length());
+                        send_http_response(sock, "400 Bad Request", "application/json; charset=utf-8", err, cors_hdr);
                     } else {
                         int count = 0;
                         {
@@ -1749,20 +2018,16 @@ private:
                         }
                         std::cout << "[HavenServer] Custom model folder added & scanned: " << req_dir << " (" << count << " models found, GGUF + MLX)\n" << std::flush;
                         std::string res = "{\"ok\":true,\"directory\":\"" + escape_json_string(req_dir) + "\",\"model_count\":" + std::to_string(count) + ",\"message\":\"Folder registered and scanned successfully.\"}";
-                        std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                                         + std::to_string(res.length()) + "\r\n\r\n" + res;
-                        send_all(sock, resp.c_str(), (int)resp.length());
+                        send_http_response(sock, "200 OK", "application/json; charset=utf-8", res, cors_hdr);
                     }
                 }
             } else {
-                std::string err = "{\"ok\":false,\"error\":\"Method not allowed\"}";
-                std::string resp = "HTTP/1.1 405 Method Not Allowed\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                                 + std::to_string(err.length()) + "\r\n\r\n" + err;
-                send_all(sock, resp.c_str(), (int)resp.length());
+                send_http_response(sock, "405 Method Not Allowed", "application/json; charset=utf-8",
+                                   "{\"ok\":false,\"error\":\"Method not allowed\"}", cors_hdr);
             }
         }
         else if (path == "/v1/tools" || path == "/api/tools") {
-            const auto& plugins = haven_engine_.get_plugin_manager().get_loaded_plugins();
+            const auto plugins = haven_engine_.get_plugin_manager().get_loaded_plugins();
             std::string json = "{\"object\":\"list\",\"data\":[";
             bool first = true;
             for (const auto& [id, record] : plugins) {
@@ -1773,50 +2038,39 @@ private:
                 }
             }
             json += "]}";
-            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                             + std::to_string(json.length()) + "\r\n\r\n" + json;
-            send_all(sock, resp.c_str(), (int)resp.length());
+            send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
         }
         else if (path == "/v1/models/load" || path == "/api/models/load" || path == "/v1/models/switch") {
-            size_t body_pos = request.find("\r\n\r\n");
-            std::string body = (body_pos != std::string::npos) ? request.substr(body_pos + 4) : "";
             std::string req_model = extract_json_string(body, "model");
             if (req_model.empty()) req_model = extract_json_string(body, "filename");
             if (req_model.empty()) req_model = extract_json_string(body, "id");
 
             if (req_model.empty()) {
-                std::string err = "{\"ok\":false,\"error\":\"Missing 'model' or 'filename' parameter in request body.\"}";
-                std::string resp = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                                 + std::to_string(err.length()) + "\r\n\r\n" + err;
-                send_all(sock, resp.c_str(), (int)resp.length());
+                send_http_response(sock, "400 Bad Request", "application/json; charset=utf-8",
+                                   "{\"ok\":false,\"error\":\"Missing 'model' or 'filename' parameter in request body.\"}", cors_hdr);
             } else {
                 std::string err_out;
-                if (switch_model(req_model, err_out)) {
-                    std::string json = "{\"ok\":true,\"status\":\"loaded\",\"model\":\"" + escape_json_string(current_model_name_) 
-                                     + "\",\"path\":\"" + escape_json_string(current_model_path_) + "\"}";
-                    std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                                     + std::to_string(json.length()) + "\r\n\r\n" + json;
-                    send_all(sock, resp.c_str(), (int)resp.length());
+                if (switch_model(req_model, err_out, false)) {
+                    std::string loaded_name, loaded_path;
+                    {
+                        std::lock_guard<std::mutex> lock(engine_mutex_);
+                        loaded_name = current_model_name_;
+                        loaded_path = current_model_path_;
+                    }
+                    std::string json = "{\"ok\":true,\"status\":\"loaded\",\"model\":\"" + escape_json_string(loaded_name) 
+                                     + "\",\"path\":\"" + escape_json_string(loaded_path) + "\"}";
+                    send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
                 } else {
                     std::string err = "{\"ok\":false,\"error\":\"" + escape_json_string(err_out) + "\"}";
-                    std::string resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                                     + std::to_string(err.length()) + "\r\n\r\n" + err;
-                    send_all(sock, resp.c_str(), (int)resp.length());
+                    send_http_response(sock, "400 Bad Request", "application/json; charset=utf-8", err, cors_hdr);
                 }
             }
         }
         else if (path == "/v1/chat/completions" || path == "/completion" || path == "/v1/completions") {
-            if (model_loaded_) {
-                handle_native_chat_completions(sock, request);
-            } else {
-                std::string err_body = "{\"error\":{\"message\":\"No model loaded in Haven Sovereign Engine. Pass a model path on startup.\",\"type\":\"sovereign_engine_error\"}}";
-                std::string resp = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                                 + std::to_string(err_body.length()) + "\r\n\r\n" + err_body;
-                send_all(sock, resp.c_str(), (int)resp.length());
-            }
+            handle_native_chat_completions(sock, request, cors_hdr);
         }
         else if (path == "/api/plugins") {
-            const auto& plugins = haven_engine_.get_plugin_manager().get_loaded_plugins();
+            const auto plugins = haven_engine_.get_plugin_manager().get_loaded_plugins();
             size_t active = haven_engine_.get_plugin_manager().get_active_plugin_count();
             std::string json = "{\"ok\":true,\"total\":" + std::to_string(plugins.size()) 
                              + ",\"active_in_ram\":" + std::to_string(active) + ",\"plugins\":[";
@@ -1832,75 +2086,57 @@ private:
                 first = false;
             }
             json += "]}";
-            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                             + std::to_string(json.length()) + "\r\n\r\n" + json;
-            send_all(sock, resp.c_str(), (int)resp.length());
+            send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
         }
         else if (path == "/api/plugins/unload") {
             size_t freed = haven_engine_.get_plugin_manager().unload_idle_plugins(0);
             size_t active = haven_engine_.get_plugin_manager().get_active_plugin_count();
             std::string json = "{\"ok\":true,\"unloaded\":" + std::to_string(freed) + ",\"active_in_ram\":" + std::to_string(active) + ",\"message\":\"Flushed idle plugins from memory.\"}";
-            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                             + std::to_string(json.length()) + "\r\n\r\n" + json;
-            send(sock, resp.c_str(), (int)resp.length(), 0);
+            send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
         }
         else if (path == "/api/plugins/reload") {
             size_t reloaded = haven_engine_.get_plugin_manager().reload_all("plugins");
             if (reloaded == 0) reloaded = haven_engine_.get_plugin_manager().reload_all("C:\\Users\\admin\\source\\haven-cpp\\plugins");
             std::string json = "{\"ok\":true,\"reloaded\":" + std::to_string(reloaded) + ",\"message\":\"Hot-reloaded " + std::to_string(reloaded) + " plugins.\"}";
-            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                             + std::to_string(json.length()) + "\r\n\r\n" + json;
-            send(sock, resp.c_str(), (int)resp.length(), 0);
+            send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
         }
         else if (path == "/api/reset") {
             std::lock_guard<std::mutex> lock(engine_mutex_);
             haven_engine_.get_kv_cache().reset();
             cached_tokens_.clear();
             std::string json = "{\"ok\":true,\"message\":\"KV Cache and conversation context reset.\"}";
-            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                             + std::to_string(json.length()) + "\r\n\r\n" + json;
-            send(sock, resp.c_str(), (int)resp.length(), 0);
+            send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
         }
         else if (path == "/api/tool") {
-            std::string action = extract_json_string(request, "action");
-            std::string payload = extract_json_string(request, "payload");
+            std::string action = extract_json_string(body, "action");
+            std::string payload = extract_json_string(body, "payload");
             std::string output;
             bool ok = haven_engine_.get_plugin_manager().dispatch_tool_execution(action, payload, output);
             std::string json = "{\"ok\":" + std::string(ok ? "true" : "false") + ",\"action\":\"" + escape_json_string(action) + "\",\"output\":\"" + escape_json_string(output) + "\"}";
-            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                             + std::to_string(json.length()) + "\r\n\r\n" + json;
-            send(sock, resp.c_str(), (int)resp.length(), 0);
+            send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
         }
         else if (path == "/api/mcp/servers") {
             std::string json = haven_engine_.get_mcp_manager().get_servers_json();
-            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                             + std::to_string(json.length()) + "\r\n\r\n" + json;
-            send(sock, resp.c_str(), (int)resp.length(), 0);
+            send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
         }
         else if (path == "/api/mcp/tools") {
             std::string json = haven_engine_.get_mcp_manager().get_tools_json();
-            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                             + std::to_string(json.length()) + "\r\n\r\n" + json;
-            send(sock, resp.c_str(), (int)resp.length(), 0);
+            send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
         }
         else if (path == "/api/mcp/call") {
-            std::string action = extract_json_string(request, "action");
-            if (action.empty()) action = extract_json_string(request, "tool");
-            std::string payload = extract_json_string(request, "payload");
-            if (payload.empty()) payload = extract_json_string(request, "arguments");
+            std::string action = extract_json_string(body, "action");
+            if (action.empty()) action = extract_json_string(body, "tool");
+            std::string payload = extract_json_string(body, "payload");
+            if (payload.empty()) payload = extract_json_string(body, "arguments");
             std::string output;
             bool ok = haven_engine_.get_mcp_manager().dispatch_tool(action, payload, output);
             std::string json = "{\"ok\":" + std::string(ok ? "true" : "false") + ",\"action\":\"" + escape_json_string(action) + "\",\"output\":\"" + escape_json_string(output) + "\"}";
-            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                             + std::to_string(json.length()) + "\r\n\r\n" + json;
-            send(sock, resp.c_str(), (int)resp.length(), 0);
+            send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
         }
         else if (path == "/api/mcp/reload") {
             haven_engine_.get_mcp_manager().reload_all();
             std::string json = "{\"ok\":true,\"servers_count\":" + std::to_string(haven_engine_.get_mcp_manager().get_active_server_count()) + ",\"tools_count\":" + std::to_string(haven_engine_.get_mcp_manager().get_tool_count()) + "}";
-            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                             + std::to_string(json.length()) + "\r\n\r\n" + json;
-            send(sock, resp.c_str(), (int)resp.length(), 0);
+            send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
         }
         else if (path == "/api/cluster/status") {
             std::ostringstream ss;
@@ -1912,106 +2148,118 @@ private:
                << "\"connected_nodes\":" << cluster_node_.get_nodes().size() << ","
                << "\"invite_uri\":\"" << escape_json_string(cluster_node_.generate_invite_uri()) << "\","
                << "\"has_token\":" << (!cluster_node_.get_cluster_token().empty() ? "true" : "false") << "}";
-            std::string json = ss.str();
-            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                             + std::to_string(json.length()) + "\r\n\r\n" + json;
-            send_all(sock, resp.c_str(), (int)resp.length());
+            send_http_response(sock, "200 OK", "application/json; charset=utf-8", ss.str(), cors_hdr);
         }
         else if (path == "/api/cluster/token") {
             if (method == "POST") {
                 std::string new_token = HavenSecurity::generate_cluster_token();
                 cluster_node_.set_cluster_token(new_token);
                 std::string invite = cluster_node_.generate_invite_uri();
-                std::string json = "{\"ok\":true,\"token\":\"" + new_token + "\",\"invite_uri\":\"" + escape_json_string(invite) + "\"}";
-                std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                                 + std::to_string(json.length()) + "\r\n\r\n" + json;
-                send_all(sock, resp.c_str(), (int)resp.length());
+                std::string json = "{\"ok\":true,\"token\":\"" + escape_json_string(new_token) + "\",\"invite_uri\":\"" + escape_json_string(invite) + "\"}";
+                send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
             } else {
                 std::string token = cluster_node_.get_cluster_token();
                 std::string invite = cluster_node_.generate_invite_uri();
-                std::string json = "{\"ok\":true,\"token\":\"" + token + "\",\"invite_uri\":\"" + escape_json_string(invite) + "\",\"listen_port\":" + std::to_string(cluster_node_.get_listen_port()) + "}";
-                std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                                 + std::to_string(json.length()) + "\r\n\r\n" + json;
-                send_all(sock, resp.c_str(), (int)resp.length());
+                std::string json = "{\"ok\":true,\"token\":\"" + escape_json_string(token) + "\",\"invite_uri\":\"" + escape_json_string(invite) + "\",\"listen_port\":" + std::to_string(cluster_node_.get_listen_port()) + "}";
+                send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
             }
         }
         else if (path == "/api/cluster/nodes") {
             std::ostringstream ss;
             ss << "{\"ok\":true,\"nodes\":[";
-            const auto& nodes = cluster_node_.get_nodes();
+            const auto nodes = cluster_node_.get_nodes();
             for (size_t i = 0; i < nodes.size(); ++i) {
                 if (i > 0) ss << ",";
                 ss << "{\"node_id\":" << nodes[i].node_id
-                   << ",\"address\":\"" << nodes[i].address << "\""
+                   << ",\"address\":\"" << escape_json_string(nodes[i].address) << "\""
                    << ",\"port\":" << nodes[i].port
                    << ",\"role\":\"" << (nodes[i].role == ClusterRole::COORDINATOR ? "coordinator" : "worker") << "\""
                    << ",\"start_layer\":" << nodes[i].start_layer
                    << ",\"end_layer\":" << nodes[i].end_layer
-                   << ",\"total_memory_gb\":" << (nodes[i].total_memory_bytes / (1024*1024*1024))
+                   << ",\"total_memory_gb\":" << (nodes[i].total_memory_bytes / (1024ULL * 1024ULL * 1024ULL))
                    << ",\"peak_tflops\":" << nodes[i].peak_tflops
                    << ",\"alive\":" << (nodes[i].is_alive ? "true" : "false") << "}";
             }
             ss << "]}";
-            std::string json = ss.str();
-            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                             + std::to_string(json.length()) + "\r\n\r\n" + json;
-            send_all(sock, resp.c_str(), (int)resp.length());
+            send_http_response(sock, "200 OK", "application/json; charset=utf-8", ss.str(), cors_hdr);
         }
         else if (path == "/api/cluster/join") {
-            std::string invite_uri = extract_json_string(request, "invite_uri");
-            uint16_t worker_port = (uint16_t)(port_ + 3);
+            std::string invite_uri = extract_json_string(body, "invite_uri");
+            uint16_t worker_port = static_cast<uint16_t>(port_ + 3);
             uint32_t local_id = 1;
-            std::string local_id_str = extract_json_string(request, "node_id");
-            if (!local_id_str.empty()) try { local_id = (uint32_t)std::stoul(local_id_str); } catch (...) {}
+            std::string local_id_str = extract_json_scalar(body, "node_id");
+            if (!local_id_str.empty()) {
+                uint32_t parsed_id = 1;
+                auto [p, ec] = std::from_chars(local_id_str.data(), local_id_str.data() + local_id_str.size(), parsed_id);
+                if (ec == std::errc() && p == local_id_str.data() + local_id_str.size() && parsed_id > 0) {
+                    local_id = parsed_id;
+                }
+            }
 
             bool ok = false;
+            bool bad_port = false;
             if (!invite_uri.empty()) {
                 ok = cluster_node_.init_worker_with_token(local_id, worker_port, invite_uri);
             } else {
-                std::string coord_ip = extract_json_string(request, "coordinator_ip");
+                std::string coord_ip = extract_json_string(body, "coordinator_ip");
                 if (coord_ip.empty()) coord_ip = "127.0.0.1";
-                std::string coord_port_str = extract_json_string(request, "coordinator_port");
-                uint16_t coord_port = coord_port_str.empty() ? 11438 : (uint16_t)std::stoi(coord_port_str);
-                std::string token = extract_json_string(request, "token");
-                ok = cluster_node_.init_worker_with_token(local_id, worker_port, coord_ip, coord_port, token);
+                std::string coord_port_str = extract_json_scalar(body, "coordinator_port");
+                uint16_t coord_port = 11438;
+                if (!coord_port_str.empty()) {
+                    int parsed_port = 0;
+                    auto [p, ec] = std::from_chars(coord_port_str.data(), coord_port_str.data() + coord_port_str.size(), parsed_port);
+                    if (ec != std::errc() || p != coord_port_str.data() + coord_port_str.size() || parsed_port <= 0 || parsed_port > 65535) {
+                        bad_port = true;
+                    } else {
+                        coord_port = static_cast<uint16_t>(parsed_port);
+                    }
+                }
+                if (!bad_port) {
+                    std::string token = extract_json_string(body, "token");
+                    ok = cluster_node_.init_worker_with_token(local_id, worker_port, coord_ip, coord_port, token);
+                }
             }
-            std::string json = "{\"ok\":" + std::string(ok ? "true" : "false") + ",\"role\":\"worker\"}";
-            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                             + std::to_string(json.length()) + "\r\n\r\n" + json;
-            send_all(sock, resp.c_str(), (int)resp.length());
+            if (bad_port) {
+                send_http_response(sock, "400 Bad Request", "application/json; charset=utf-8",
+                                   "{\"ok\":false,\"error\":\"Invalid coordinator_port (must be 1..65535)\"}", cors_hdr);
+            } else {
+                std::string json = "{\"ok\":" + std::string(ok ? "true" : "false") + ",\"role\":\"worker\"}";
+                send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
+            }
         }
         else if (path == "/api/settings") {
+            std::lock_guard<std::mutex> lock(engine_mutex_);
             if (method == "POST") {
-                // Update sampler parameters
-                std::string temp_str = extract_json_string(request, "temperature");
-                if (!temp_str.empty()) try { haven_engine_.get_sampler().get_params().temperature = std::stof(temp_str); } catch (...) {}
+                // Update sampler parameters (clamped to safe numerical bounds)
+                std::string temp_str = extract_json_scalar(body, "temperature");
+                if (!temp_str.empty()) try { haven_engine_.get_sampler().get_params().temperature = std::clamp(std::stof(temp_str), 0.0f, 5.0f); } catch (...) {}
                 
-                std::string top_p_str = extract_json_string(request, "top_p");
-                if (!top_p_str.empty()) try { haven_engine_.get_sampler().get_params().top_p = std::stof(top_p_str); } catch (...) {}
+                std::string top_p_str = extract_json_scalar(body, "top_p");
+                if (!top_p_str.empty()) try { haven_engine_.get_sampler().get_params().top_p = std::clamp(std::stof(top_p_str), 0.01f, 1.0f); } catch (...) {}
 
-                std::string top_k_str = extract_json_string(request, "top_k");
-                if (!top_k_str.empty()) try { haven_engine_.get_sampler().get_params().top_k = std::stoi(top_k_str); } catch (...) {}
+                std::string top_k_str = extract_json_scalar(body, "top_k");
+                if (!top_k_str.empty()) try { haven_engine_.get_sampler().get_params().top_k = std::clamp(std::stoi(top_k_str), 1, 10000); } catch (...) {}
 
-                std::string min_p_str = extract_json_string(request, "min_p");
-                if (!min_p_str.empty()) try { haven_engine_.get_sampler().get_params().min_p = std::stof(min_p_str); } catch (...) {}
+                std::string min_p_str = extract_json_scalar(body, "min_p");
+                if (!min_p_str.empty()) try { haven_engine_.get_sampler().get_params().min_p = std::clamp(std::stof(min_p_str), 0.0f, 1.0f); } catch (...) {}
 
-                std::string rep_str = extract_json_string(request, "repetition_penalty");
-                if (!rep_str.empty()) try { haven_engine_.get_sampler().get_params().repetition_penalty = std::stof(rep_str); } catch (...) {}
+                std::string rep_str = extract_json_scalar(body, "repetition_penalty");
+                if (!rep_str.empty()) try { haven_engine_.get_sampler().get_params().repetition_penalty = std::clamp(std::stof(rep_str), 0.5f, 5.0f); } catch (...) {}
 
                 // Update persona parameters
-                std::string comp_name = extract_json_string(request, "companion_name");
+                std::string comp_name = extract_json_string(body, "companion_name");
                 if (!comp_name.empty()) companion_name_ = comp_name;
 
-                std::string comp_avatar = extract_json_string(request, "companion_avatar");
+                std::string comp_avatar = extract_json_string(body, "companion_avatar");
                 if (!comp_avatar.empty()) companion_avatar_ = comp_avatar;
 
-                std::string u_name = extract_json_string(request, "user_name");
+                std::string u_name = extract_json_string(body, "user_name");
                 if (!u_name.empty()) user_name_ = u_name;
 
-                std::string sys_persona = extract_json_string(request, "system_persona");
+                std::string sys_persona = extract_json_string(body, "system_persona");
                 if (!sys_persona.empty()) system_persona_ = sys_persona;
 
-                std::string greeting = extract_json_string(request, "persona_greeting");
+                std::string greeting = extract_json_string(body, "persona_greeting");
                 if (!greeting.empty()) persona_greeting_ = greeting;
 
                 save_persona();
@@ -2031,51 +2279,39 @@ private:
                              + "\"repetition_penalty\":" + std::to_string(p.repetition_penalty) + ","
                              + "\"model\":\"" + escape_json_string(current_model_name_.empty() ? "haven-chat-v5.0.gguf" : current_model_name_) + "\","
                              + "\"plugins_count\":" + std::to_string(haven_engine_.get_plugin_manager().get_plugin_count()) + "}";
-            std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                             + std::to_string(json.length()) + "\r\n\r\n" + json;
-            send_all(sock, resp.c_str(), (int)resp.length());
+            send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
         }
         else {
-            // Check for static file in wwwroot
-            std::string decoded_path = url_decode(path);
+            // Static file delivery with strict canonical root containment
+            std::string static_path = path;
+            size_t q_pos = static_path.find('?');
+            if (q_pos != std::string::npos) static_path = static_path.substr(0, q_pos);
+
+            std::string decoded_path = url_decode(static_path);
             if (decoded_path.find("..") != std::string::npos || decoded_path.find(':') != std::string::npos || 
                 decoded_path.find('\\') != std::string::npos || decoded_path.find('\0') != std::string::npos) {
-                std::string forbidden = "HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\n\r\nForbidden";
-                send_all(sock, forbidden.c_str(), (int)forbidden.length());
-#ifdef _WIN32
-                closesocket(sock);
-#else
-                close(sock);
-#endif
+                send_http_response(sock, "403 Forbidden", "text/plain", "Forbidden");
+                close_socket(sock);
                 return;
             }
 
             if (decoded_path == "/" || decoded_path.empty()) decoded_path = "/index.html";
-
-            std::filesystem::path root_dir = std::filesystem::weakly_canonical("wwwroot");
             std::string clean_rel = decoded_path.front() == '/' ? decoded_path.substr(1) : decoded_path;
             std::string rel_path = clean_rel;
-            std::filesystem::path target_file = std::filesystem::weakly_canonical(root_dir / clean_rel);
 
-            std::string root_str = root_dir.string();
-            std::string target_str = target_file.string();
-            if (target_str.compare(0, root_str.size(), root_str) != 0) {
-                std::string forbidden = "HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\n\r\nForbidden";
-                send_all(sock, forbidden.c_str(), (int)forbidden.length());
-#ifdef _WIN32
-                closesocket(sock);
-#else
-                close(sock);
-#endif
+            std::string local_path;
+            if (!resolve_safe_path("wwwroot", clean_rel, local_path)) {
+                send_http_response(sock, "403 Forbidden", "text/plain", "Forbidden");
+                close_socket(sock);
                 return;
             }
 
-            std::string local_path = target_str;
             FILE* f = fopen(local_path.c_str(), "rb");
             if (!f) {
-                std::string fallback_path = "C:\\Users\\admin\\source\\haven-cpp\\wwwroot\\" + clean_rel;
-                for (char& c : fallback_path) if (c == '/') c = '\\';
-                f = fopen(fallback_path.c_str(), "rb");
+                std::string fallback_path;
+                if (resolve_safe_path("C:\\Users\\admin\\source\\haven-cpp\\wwwroot", clean_rel, fallback_path)) {
+                    f = fopen(fallback_path.c_str(), "rb");
+                }
             }
 
             if (f) {
@@ -2083,19 +2319,16 @@ private:
                 long sz = ftell(f);
                 fseek(f, 0, SEEK_SET);
 
-                if (sz < 0 || sz > 100 * 1024 * 1024) {
+                if (sz < 0 || sz > 100L * 1024 * 1024) {
                     fclose(f);
-#ifdef _WIN32
-                    closesocket(sock);
-#else
-                    close(sock);
-#endif
+                    close_socket(sock);
                     return;
                 }
 
-                std::vector<char> file_data(sz);
+                std::vector<char> file_data(static_cast<size_t>(sz));
+                size_t got = 0;
                 if (sz > 0) {
-                    fread(file_data.data(), 1, sz, f);
+                    got = fread(file_data.data(), 1, static_cast<size_t>(sz), f);
                 }
                 fclose(f);
 
@@ -2110,30 +2343,39 @@ private:
                 else if (rel_path.ends_with(".json")) mime = "application/json; charset=utf-8";
                 else if (rel_path.ends_with(".wasm")) mime = "application/wasm";
 
-                std::string header = "HTTP/1.1 200 OK\r\nContent-Type: " + mime + 
-                                     "\r\nCache-Control: no-cache, no-store, must-revalidate\r\nPragma: no-cache\r\nExpires: 0\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " + 
-                                     std::to_string(sz) + "\r\n\r\n";
-                send_all(sock, header.c_str(), (int)header.length());
-                if (sz > 0) {
-                    send_all(sock, file_data.data(), (int)sz);
+                std::string header = "HTTP/1.1 200 OK\r\nContent-Type: " + mime +
+                                     "\r\nX-Content-Type-Options: nosniff"
+                                     "\r\nCache-Control: no-cache, no-store, must-revalidate\r\nPragma: no-cache\r\nExpires: 0\r\n"
+                                     + cors_hdr +
+                                     "Connection: close\r\nContent-Length: " +
+                                     std::to_string(got) + "\r\n\r\n";
+                send_all(sock, header.c_str(), static_cast<int>(header.length()));
+                if (got > 0) {
+                    send_all(sock, file_data.data(), static_cast<int>(got));
                 }
             } else {
-                std::string body = "{\"ok\":true,\"msg\":\"Haven Sovereign Micro-Server Active\"}";
-                std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: " 
-                                 + std::to_string(body.length()) + "\r\n\r\n" + body;
-                send_all(sock, resp.c_str(), (int)resp.length());
+                std::string fallback_body = "{\"ok\":true,\"msg\":\"Haven Sovereign Micro-Server Active\"}";
+                send_http_response(sock, "200 OK", "application/json; charset=utf-8", fallback_body, cors_hdr);
             }
         }
 
-#ifdef _WIN32
-        closesocket(sock);
-#else
-        close(sock);
-#endif
+        close_socket(sock);
     }
 };
 
 } // namespace haven
+
+namespace {
+bool parse_u32_range(const char* s, uint32_t min_v, uint32_t max_v, uint32_t& out) {
+    if (!s || !*s) return false;
+    uint32_t v = 0;
+    size_t len = std::strlen(s);
+    auto [ptr, ec] = std::from_chars(s, s + len, v);
+    if (ec != std::errc() || ptr != s + len || v < min_v || v > max_v) return false;
+    out = v;
+    return true;
+}
+} // namespace
 
 int main(int argc, char** argv) {
 #ifdef _WIN32
@@ -2141,6 +2383,11 @@ int main(int argc, char** argv) {
     SetConsoleCP(CP_UTF8);
 #endif
     int port = 11436;
+    std::string bind_host = "127.0.0.1";
+    std::string api_key = "";
+    if (const char* env_key = std::getenv("HAVEN_API_KEY"); env_key && *env_key) {
+        api_key = env_key;
+    }
     std::string model_arg = "";
     bool is_worker = false;
     std::string cluster_join_target = "";
@@ -2154,7 +2401,9 @@ int main(int argc, char** argv) {
             std::cout << "Haven Sovereign Server & Featherlight Studio\n"
                       << "Usage: haven-server [options]\n\n"
                       << "Options:\n"
+                      << "  --host, --bind <ip>       Bind IP address (default: 127.0.0.1; use 0.0.0.0 for LAN)\n"
                       << "  --port <port>             HTTP server port (default: 11436)\n"
+                      << "  --api-key <key>           Require Authorization: Bearer <key> on API routes (or HAVEN_API_KEY)\n"
                       << "  --model <path>            GGUF or MLX model path to load\n"
                       << "  --cluster-host [port]     Run as cluster coordinator on [port] (default: HTTP_PORT + 2)\n"
                       << "  --cluster-join <invite>   Join remote cluster using haven://cluster URI or IP\n"
@@ -2163,39 +2412,63 @@ int main(int argc, char** argv) {
                       << "  --node-id <id>            Cluster node ID (default: 0 coordinator, 1 worker)\n"
                       << "  --help, -h                Show this help message\n";
             return 0;
+        } else if ((arg == "--host" || arg == "--bind") && i + 1 < argc) {
+            bind_host = argv[++i];
+        } else if (arg == "--api-key" && i + 1 < argc) {
+            api_key = argv[++i];
         } else if (arg == "--port" && i + 1 < argc) {
-            port = std::stoi(argv[++i]);
+            uint32_t p = 0;
+            if (!parse_u32_range(argv[++i], 1, 65535, p)) {
+                std::cerr << "[HavenServer] Invalid --port value.\n";
+                return 1;
+            }
+            port = static_cast<int>(p);
         } else if (arg == "--model" && i + 1 < argc) {
             model_arg = argv[++i];
         } else if (arg == "--cluster-host") {
             is_worker = false;
             if (i + 1 < argc && argv[i+1][0] != '-') {
-                cluster_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+                uint32_t p = 0;
+                if (!parse_u32_range(argv[++i], 1, 65535, p)) {
+                    std::cerr << "[HavenServer] Invalid --cluster-host port.\n";
+                    return 1;
+                }
+                cluster_port = static_cast<uint16_t>(p);
             }
         } else if (arg == "--cluster-join" && i + 1 < argc) {
             is_worker = true;
             cluster_join_target = argv[++i];
         } else if (arg == "--cluster-port" && i + 1 < argc) {
-            cluster_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+            uint32_t p = 0;
+            if (!parse_u32_range(argv[++i], 1, 65535, p)) {
+                std::cerr << "[HavenServer] Invalid --cluster-port value.\n";
+                return 1;
+            }
+            cluster_port = static_cast<uint16_t>(p);
         } else if (arg == "--cluster-token" && i + 1 < argc) {
             cluster_token = argv[++i];
         } else if (arg == "--node-id" && i + 1 < argc) {
-            cluster_node_id = static_cast<uint32_t>(std::stoul(argv[++i]));
+            uint32_t nid = 0;
+            if (!parse_u32_range(argv[++i], 0, 65535, nid)) {
+                std::cerr << "[HavenServer] Invalid --node-id value.\n";
+                return 1;
+            }
+            cluster_node_id = nid;
         } else if (!arg.starts_with("-")) {
-            try {
-                port = std::stoi(arg);
-            } catch (...) {
-                if (model_arg.empty()) {
-                    model_arg = arg;
-                }
+            uint32_t p = 0;
+            if (parse_u32_range(arg.c_str(), 1, 65535, p)) {
+                port = static_cast<int>(p);
+            } else if (model_arg.empty()) {
+                model_arg = arg;
             }
         }
     }
 
-    haven::HavenMicroServer server(port, model_arg, is_worker, cluster_join_target, cluster_port, cluster_token, cluster_node_id);
+    haven::HavenMicroServer server(port, model_arg, is_worker, cluster_join_target,
+                                   cluster_port, cluster_token, cluster_node_id, bind_host, api_key);
     server.start();
 
-    std::cout << "[HavenServer] Featherlight Studio Daemon running on http://0.0.0.0:" << port << " (<10MB RAM)...\n" << std::flush;
+    std::cout << "[HavenServer] Featherlight Studio Daemon running on http://" << bind_host << ":" << port << " (<10MB RAM)...\n" << std::flush;
     while (true) {
         std::this_thread::sleep_for(std::chrono::hours(24));
     }

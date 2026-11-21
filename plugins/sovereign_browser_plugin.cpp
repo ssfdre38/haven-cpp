@@ -3,7 +3,8 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include <regex>
+#include <cstring>
+#include <cctype>
 #include <algorithm>
 
 #ifdef _WIN32
@@ -58,6 +59,17 @@ public:
             if (!url.starts_with("http://") && !url.starts_with("https://")) {
                 url = "https://" + url;
             }
+            bool safe_url = (url.starts_with("http://") || url.starts_with("https://")) && url.size() <= 2048;
+            for (unsigned char c : url) {
+                if (c <= 0x20 || c >= 0x7F || c == '"' || c == '\'' || c == '<' || c == '>' || c == '|' || c == '^' || c == '`') {
+                    safe_url = false;
+                    break;
+                }
+            }
+            if (!safe_url) {
+                output = "🌐 [Browser] Blocked: Malformed or unsafe URL rejected.";
+                return true;
+            }
             HINSTANCE res = ShellExecuteA(NULL, "open", url.c_str(), NULL, NULL, SW_SHOWNORMAL);
             if ((INT_PTR)res > 32) {
                 output = "🌐 Launched native desktop browser navigating to: " + url;
@@ -95,27 +107,51 @@ public:
 private:
 #ifdef _WIN32
     static std::string html_to_clean_markdown(const std::string& html) {
-        std::string text = html;
+        // Linear O(N) HTML-to-text scrubber (avoids std::regex backtracking/stack-overflow DoS)
+        std::string text;
+        text.reserve(html.size());
+        size_t i = 0;
+        const size_t n = html.size();
 
-        // Remove <script> ... </script>
-        static const std::regex script_regex("<script[\\s\\S]*?</script>", std::regex_constants::icase);
-        text = std::regex_replace(text, script_regex, " ");
+        auto starts_ci = [&](size_t pos, const char* tag) -> bool {
+            size_t len = std::strlen(tag);
+            if (pos + len > n) return false;
+            for (size_t k = 0; k < len; ++k) {
+                if (std::tolower(static_cast<unsigned char>(html[pos + k])) != tag[k]) return false;
+            }
+            return true;
+        };
 
-        // Remove <style> ... </style>
-        static const std::regex style_regex("<style[\\s\\S]*?</style>", std::regex_constants::icase);
-        text = std::regex_replace(text, style_regex, " ");
+        auto skip_block = [&](const char* close_tag) {
+            size_t len = std::strlen(close_tag);
+            while (i < n) {
+                if (html[i] == '<' && starts_ci(i, close_tag)) {
+                    i += len;
+                    while (i < n && html[i] != '>') ++i;
+                    if (i < n) ++i;
+                    return;
+                }
+                ++i;
+            }
+        };
 
-        // Remove <head> ... </head>
-        static const std::regex head_regex("<head[\\s\\S]*?</head>", std::regex_constants::icase);
-        text = std::regex_replace(text, head_regex, " ");
+        while (i < n) {
+            if (html[i] == '<') {
+                if (starts_ci(i, "<script")) { skip_block("</script"); text += ' '; continue; }
+                if (starts_ci(i, "<style"))  { skip_block("</style");  text += ' '; continue; }
+                if (starts_ci(i, "<head"))   { skip_block("</head");   text += ' '; continue; }
 
-        // Replace <br>, <p>, </div>, </h1>..</h6> with newlines
-        static const std::regex br_regex("<(br|/p|/div|/h[1-6]|/li|/tr)[^>]*>", std::regex_constants::icase);
-        text = std::regex_replace(text, br_regex, "\n");
-
-        // Strip remaining HTML tags
-        static const std::regex tag_regex("<[^>]+>");
-        text = std::regex_replace(text, tag_regex, " ");
+                bool newline_tag = starts_ci(i, "<br") || starts_ci(i, "</p") || starts_ci(i, "</div") ||
+                                   starts_ci(i, "</li") || starts_ci(i, "</tr") ||
+                                   (i + 3 < n && html[i + 1] == '/' && std::tolower((unsigned char)html[i + 2]) == 'h' &&
+                                    html[i + 3] >= '1' && html[i + 3] <= '6');
+                while (i < n && html[i] != '>') ++i;
+                if (i < n) ++i;
+                text += newline_tag ? '\n' : ' ';
+            } else {
+                text += html[i++];
+            }
+        }
 
         // Decode common HTML entities
         auto replace_all = [](std::string& str, const std::string& from, const std::string& to) {
@@ -194,9 +230,31 @@ private:
         if (colon_pos != std::string::npos) {
             try {
                 port = std::stoi(host.substr(colon_pos + 1));
-            } catch (...) {}
+            } catch (...) { return ""; }
             host = host.substr(0, colon_pos);
         }
+        if (port <= 0 || port > 65535 || host.empty()) return "";
+
+        // SSRF defense: block loopback, link-local, metadata, and private RFC1918 hosts
+        std::string hlow = host;
+        for (char& c : hlow) c = (char)tolower((unsigned char)c);
+        if (hlow == "localhost" || hlow == "::1" || hlow == "[::1]" || hlow == "0.0.0.0" ||
+            hlow.starts_with("127.") || hlow.starts_with("10.") || hlow.starts_with("192.168.") ||
+            hlow.starts_with("169.254.") || hlow.starts_with("0.") ||
+            hlow.ends_with(".local") || hlow.ends_with(".internal") ||
+            hlow.find_first_of("\r\n \t@") != std::string::npos) {
+            return "";
+        }
+        if (hlow.starts_with("172.")) {
+            size_t dot2 = hlow.find('.', 4);
+            if (dot2 != std::string::npos) {
+                try {
+                    int octet2 = std::stoi(hlow.substr(4, dot2 - 4));
+                    if (octet2 >= 16 && octet2 <= 31) return "";
+                } catch (...) {}
+            }
+        }
+        if (path.find_first_of("\r\n") != std::string::npos) return "";
 
         std::wstring whost(host.begin(), host.end());
         std::wstring wpath(path.begin(), path.end());
@@ -219,14 +277,7 @@ private:
             return "";
         }
 
-        // Set SSL options to ignore self-signed certs if testing local SSL
-        if (is_https) {
-            DWORD sec_flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
-                              SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
-                              SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
-                              SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
-            WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS, &sec_flags, sizeof(sec_flags));
-        }
+        // Strict TLS certificate validation enforced by default (CWE-295 compliance)
 
         std::string response;
         if (WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&

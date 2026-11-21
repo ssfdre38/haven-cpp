@@ -57,6 +57,8 @@ uint32_t PersonaSampler::sample(
     const float* token_embeddings,
     int embedding_dim)
 {
+    if (!logits || vocab_size == 0) return 0;
+
     // 0. Greedy Argmax path for deterministic generation
     if (params_.temperature <= 0.05f) {
         uint32_t best_token = 0;
@@ -174,10 +176,11 @@ uint32_t PersonaSampler::sample(
 
     // 3. Persona Fidelity Logit Bias Layer
     if (!persona_embedding_.empty() && token_embeddings != nullptr && embedding_dim > 0) {
+        const int safe_dim = std::min<int>(embedding_dim, static_cast<int>(persona_embedding_.size()));
         for (uint32_t t = 0; t < vocab_size; ++t) {
-            const float* t_emb = token_embeddings + t * embedding_dim;
+            const float* t_emb = token_embeddings + static_cast<size_t>(t) * static_cast<size_t>(embedding_dim);
             float dot = 0.0f, norm_t = 0.0f, norm_p = 0.0f;
-            for (int d = 0; d < embedding_dim; ++d) {
+            for (int d = 0; d < safe_dim; ++d) {
                 dot += t_emb[d] * persona_embedding_[d];
                 norm_t += t_emb[d] * t_emb[d];
                 norm_p += persona_embedding_[d] * persona_embedding_[d];
@@ -232,6 +235,8 @@ uint32_t PersonaSampler::sample(
         filtered_sum += item.first;
         if (filtered_sum >= params_.top_p && !candidates.empty()) break;
     }
+
+    if (candidates.empty()) return 0;
 
     // 6. Stochastic Categorical Sampling
     std::uniform_real_distribution<float> dist(0.0f, filtered_sum);

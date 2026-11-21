@@ -37,7 +37,8 @@ SpeculativeCandidate SpeculativeEngine::draft_candidates(
     for (uint32_t h = 0; h < num_draft_heads_; ++h) {
         float projection = 0.0f;
         if (last_hidden_state && !draft_head_weights_[h].empty()) {
-            for (size_t i = 0; i < embedding_dim; ++i) {
+            const size_t safe_dim = std::min<size_t>(embedding_dim, draft_head_weights_[h].size());
+            for (size_t i = 0; i < safe_dim; ++i) {
                 projection += last_hidden_state[i] * draft_head_weights_[h][i];
             }
         }

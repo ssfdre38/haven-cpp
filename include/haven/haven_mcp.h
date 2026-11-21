@@ -63,7 +63,7 @@ private:
     bool is_initialized_ = false;
     int next_req_id_ = 1;
     std::string read_buffer_;
-    std::mutex io_mutex_;
+    std::recursive_mutex io_mutex_;
 
 #ifdef _WIN32
     HANDLE h_child_stdin_wr_ = NULL;

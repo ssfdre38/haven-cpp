@@ -6,6 +6,7 @@
 #include <array>
 #include <memory>
 #include <chrono>
+#include <filesystem>
 
 #ifdef _WIN32
 #include <stdio.h>
@@ -79,6 +80,18 @@ public:
                     cmd = cmd.substr(close_bracket + 1);
                     while (!cmd.empty() && (cmd.front() == ' ' || cmd.front() == '\n' || cmd.front() == '\r')) cmd.erase(0, 1);
                     if (!cwd_path.empty()) {
+                        const std::string bad_cwd_tokens[] = {"\"", "'", "|", "&", ";", "`", "$", "<", ">", "\n", "\r", "%", "^", "!"};
+                        for (const auto& t : bad_cwd_tokens) {
+                            if (cwd_path.find(t) != std::string::npos || cwd_path.find('\0') != std::string::npos) {
+                                output = "🐚 [Terminal] Blocked: Invalid characters in working directory path.";
+                                return true;
+                            }
+                        }
+                        std::error_code ec;
+                        if (!std::filesystem::exists(cwd_path, ec) || !std::filesystem::is_directory(cwd_path, ec)) {
+                            output = "🐚 [Terminal] Blocked: Working directory does not exist: " + cwd_path;
+                            return true;
+                        }
 #ifdef _WIN32
                         cwd_prefix = "cd /d \"" + cwd_path + "\" && ";
 #else
@@ -88,31 +101,35 @@ public:
                 }
             }
 
-            // Destructive safety guardrail (cross-platform Windows & *nix)
-            const std::string forbidden_tokens[] = {"|", "&", ";", "`", "$(", "<", ">", "\n", "\r"};
+            if (cmd.empty()) {
+                output = "🐚 [Terminal] Please provide a command line to execute.";
+                return true;
+            }
+
+            // Destructive & injection safety guardrail (cross-platform Windows & *nix)
+            const std::string forbidden_tokens[] = {"|", "&", ";", "`", "$(", "<", ">", "\n", "\r", "%", "^", "!"};
             for (const auto& token : forbidden_tokens) {
-                if (cmd.find(token) != std::string::npos) {
-                    output = "🐚 [Terminal] Blocked: Shell chaining, pipe, and redirection characters are disallowed in sovereign sandbox.";
+                if (cmd.find(token) != std::string::npos || cmd.find('\0') != std::string::npos) {
+                    output = "🐚 [Terminal] Blocked: Shell chaining, pipe, redirection, and expansion characters are disallowed in sovereign sandbox.";
                     return true;
                 }
             }
 
             std::string cmd_lower = cmd;
-            for (char& c : cmd_lower) c = (char)tolower(c);
-            if (cmd_lower.find("format ") != std::string::npos ||
-                cmd_lower.find("rmdir /s /q c:\\") != std::string::npos ||
-                cmd_lower.find("del /s /q c:\\") != std::string::npos ||
-                cmd_lower.find("diskpart") != std::string::npos ||
-                cmd_lower.find("rm -rf /") != std::string::npos ||
-                cmd_lower.find("rm -rf /*") != std::string::npos ||
-                cmd_lower.find("rm -r /") != std::string::npos ||
-                cmd_lower.find("mkfs") != std::string::npos ||
-                cmd_lower.find("dd if=/dev/zero") != std::string::npos ||
-                cmd_lower.find("dd if=/dev/urandom") != std::string::npos ||
-                cmd_lower.find(":(){ :|:& };:") != std::string::npos ||
-                cmd_lower.find("chmod -r 777 /") != std::string::npos) {
-                output = "🐚 [Terminal] Blocked: Destructive system drive formatting or root wipe commands are disallowed.";
-                return true;
+            for (char& c : cmd_lower) c = (char)tolower((unsigned char)c);
+            const std::string blocked_subcmds[] = {
+                "format ", "rmdir /s", "del /s", "diskpart", "rm -rf /", "rm -rf /*",
+                "rm -r /", "mkfs", "dd if=/dev/zero", "dd if=/dev/urandom",
+                ":(){ :|:& };:", "chmod -r 777 /", "cmd /c", "cmd.exe", "powershell",
+                "pwsh", "wscript", "cscript", "mshta", "certutil", "bitsadmin",
+                "reg delete", "reg add", "net user", "shutdown", "bcdedit", "vssadmin",
+                "bash -c", "sh -c", "sudo ", "su "
+            };
+            for (const auto& bad : blocked_subcmds) {
+                if (cmd_lower.find(bad) != std::string::npos) {
+                    output = "🐚 [Terminal] Blocked: Destructive or sub-shell escalation commands are disallowed in sovereign sandbox.";
+                    return true;
+                }
             }
 
             auto start_time = std::chrono::high_resolution_clock::now();

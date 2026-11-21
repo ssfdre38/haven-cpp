@@ -262,22 +262,25 @@ bool MemoryAttentionEngine::load_from_hmb(const std::string& filepath) {
     uint32_t dim = hdr.embedding_dim;
 
     // Read Vectors
-    std::vector<float> vector_data(total * dim);
+    std::vector<float> vector_data(static_cast<size_t>(total) * dim);
     in.seekg((std::streamoff)hdr.vector_table_offset, std::ios::beg);
-    in.read(reinterpret_cast<char*>(vector_data.data()), total * dim * sizeof(float));
+    in.read(reinterpret_cast<char*>(vector_data.data()), static_cast<std::streamsize>(vec_bytes));
+    if (static_cast<uint64_t>(in.gcount()) != vec_bytes) return false;
 
     // Read Records
-    std::vector<HmbRecord64> records(total);
+    std::vector<HmbRecord64> records(static_cast<size_t>(total));
     in.seekg((std::streamoff)hdr.record_table_offset, std::ios::beg);
-    in.read(reinterpret_cast<char*>(records.data()), total * sizeof(HmbRecord64));
+    in.read(reinterpret_cast<char*>(records.data()), static_cast<std::streamsize>(rec_bytes));
+    if (static_cast<uint64_t>(in.gcount()) != rec_bytes) return false;
 
     // Read Strings
-    std::string string_table(hdr.string_table_size, '\0');
+    std::string string_table(static_cast<size_t>(hdr.string_table_size), '\0');
     in.seekg((std::streamoff)hdr.string_table_offset, std::ios::beg);
-    in.read(&string_table[0], hdr.string_table_size);
+    in.read(&string_table[0], static_cast<std::streamsize>(hdr.string_table_size));
+    if (static_cast<uint64_t>(in.gcount()) != hdr.string_table_size) return false;
 
     memories_.clear();
-    memories_.reserve(total);
+    memories_.reserve(static_cast<size_t>(total));
 
     for (size_t i = 0; i < total; ++i) {
         const auto& r = records[i];
@@ -288,19 +291,19 @@ bool MemoryAttentionEngine::load_from_hmb(const std::string& filepath) {
         m.timestamp = r.timestamp;
         m.access_count = r.access_count;
 
-        if (r.concept_offset + r.concept_len <= string_table.size()) {
-            m.concept_name = string_table.substr(r.concept_offset, r.concept_len);
+        if (r.concept_offset <= string_table.size() && r.concept_len <= string_table.size() - r.concept_offset) {
+            m.concept_name = string_table.substr(static_cast<size_t>(r.concept_offset), r.concept_len);
         }
-        if (r.content_offset + r.content_len <= string_table.size()) {
-            m.text_content = string_table.substr(r.content_offset, r.content_len);
+        if (r.content_offset <= string_table.size() && r.content_len <= string_table.size() - r.content_offset) {
+            m.text_content = string_table.substr(static_cast<size_t>(r.content_offset), r.content_len);
         }
-        if (r.category_offset + r.category_len <= string_table.size()) {
-            m.category = string_table.substr(r.category_offset, r.category_len);
+        if (r.category_offset <= string_table.size() && r.category_len <= string_table.size() - r.category_offset) {
+            m.category = string_table.substr(static_cast<size_t>(r.category_offset), r.category_len);
         }
 
         m.embedding.resize(dim);
         if (r.vector_idx < total) {
-            std::memcpy(m.embedding.data(), vector_data.data() + r.vector_idx * dim, dim * sizeof(float));
+            std::memcpy(m.embedding.data(), vector_data.data() + static_cast<size_t>(r.vector_idx) * dim, static_cast<size_t>(dim) * sizeof(float));
         }
 
         if (m.id >= next_id_) next_id_ = m.id + 1;
@@ -325,22 +328,28 @@ bool MemoryAttentionEngine::save_to_json(const std::string& filepath) const {
     std::ofstream out(filepath, std::ios::trunc);
     if (!out.is_open()) return false;
 
+    auto esc_json = [](const std::string& s) {
+        std::string out;
+        out.reserve(s.size() + 8);
+        for (char c : s) {
+            if (c == '"') out += "\\\"";
+            else if (c == '\n') out += "\\n";
+            else if (c == '\r') out += "\\r";
+            else if (c == '\t') out += "\\t";
+            else if (c == '\\') out += "\\\\";
+            else out += c;
+        }
+        return out;
+    };
+
     out << "{\n  \"version\": 2,\n  \"engine\": \"haven-cpp-hmb-64bit\",\n  \"memories\": [\n";
     for (size_t i = 0; i < memories_.size(); ++i) {
         const auto& m = memories_[i];
         out << "    {\n";
         out << "      \"id\": " << m.id << ",\n";
-        out << "      \"concept\": \"" << m.concept_name << "\",\n";
-        
-        std::string esc_content;
-        for (char c : m.text_content) {
-            if (c == '"') esc_content += "\\\"";
-            else if (c == '\n') esc_content += "\\n";
-            else if (c == '\\') esc_content += "\\\\";
-            else esc_content += c;
-        }
-        out << "      \"content\": \"" << esc_content << "\",\n";
-        out << "      \"category\": \"" << m.category << "\",\n";
+        out << "      \"concept\": \"" << esc_json(m.concept_name) << "\",\n";
+        out << "      \"content\": \"" << esc_json(m.text_content) << "\",\n";
+        out << "      \"category\": \"" << esc_json(m.category) << "\",\n";
         out << "      \"weight\": " << m.weight << ",\n";
         out << "      \"emotional_salience\": " << m.emotional_salience << ",\n";
         out << "      \"timestamp\": " << m.timestamp << ",\n";
@@ -368,7 +377,12 @@ bool MemoryAttentionEngine::load_from_json(const std::string& filepath) {
         if (id_start == std::string::npos) break;
 
         MemoryAnchor anchor;
-        anchor.id = std::stoull(content.substr(id_start));
+        try {
+            anchor.id = std::stoull(content.substr(id_start));
+        } catch (...) {
+            pos = id_start + 1;
+            continue;
+        }
 
         size_t obj_end = content.find("}", id_pos);
         if (obj_end == std::string::npos) obj_end = content.length();
@@ -399,19 +413,25 @@ bool MemoryAttentionEngine::load_from_json(const std::string& filepath) {
         size_t w_pos = content.find("\"weight\":", id_pos);
         if (w_pos != std::string::npos && w_pos < obj_end) {
             size_t num_start = content.find_first_of("0123456789.-", w_pos + 9);
-            if (num_start != std::string::npos) anchor.weight = std::stof(content.substr(num_start));
+            if (num_start != std::string::npos && num_start < obj_end) {
+                try { anchor.weight = std::stof(content.substr(num_start)); } catch (...) {}
+            }
         }
 
         size_t e_pos = content.find("\"emotional_salience\":", id_pos);
         if (e_pos != std::string::npos && e_pos < obj_end) {
             size_t num_start = content.find_first_of("0123456789.-", e_pos + 21);
-            if (num_start != std::string::npos) anchor.emotional_salience = std::stof(content.substr(num_start));
+            if (num_start != std::string::npos && num_start < obj_end) {
+                try { anchor.emotional_salience = std::stof(content.substr(num_start)); } catch (...) {}
+            }
         }
 
         size_t a_pos = content.find("\"access_count\":", id_pos);
         if (a_pos != std::string::npos && a_pos < obj_end) {
             size_t num_start = content.find_first_of("0123456789", a_pos + 15);
-            if (num_start != std::string::npos) anchor.access_count = std::stoull(content.substr(num_start));
+            if (num_start != std::string::npos && num_start < obj_end) {
+                try { anchor.access_count = std::stoull(content.substr(num_start)); } catch (...) {}
+            }
         }
 
         anchor.embedding.resize(128);
@@ -502,7 +522,7 @@ void MemoryAttentionEngine::apply_memory_attention(
     int head_idx)
 {
     (void)head_idx;
-    if (!attention_scores || !query || memories_.empty() || alpha_ <= 0.001f) return;
+    if (!attention_scores || !query || seq_len <= 0 || head_dim <= 0 || memories_.empty() || alpha_ <= 0.001f) return;
 
     int dim = head_dim;
     float inv_sqrt_dk = 1.0f / std::sqrt((float)dim);

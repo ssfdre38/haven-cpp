@@ -125,36 +125,26 @@ bool HavenMLXEngine::inspect_mlx_dir(const std::string& dir_path, MLXModelMetada
         meta.model_type = extract_json_val(json, "model_type");
         if (meta.model_type.empty()) meta.model_type = "transformer";
 
-        std::string hs = extract_json_val(json, "hidden_size");
-        if (!hs.empty()) meta.hidden_size = std::stoi(hs);
+        auto safe_stoi = [](const std::string& s, int& out) {
+            if (!s.empty()) { try { out = std::stoi(s); } catch (...) {} }
+        };
+        auto safe_stof = [](const std::string& s, float& out) {
+            if (!s.empty()) { try { out = std::stof(s); } catch (...) {} }
+        };
 
-        std::string inter = extract_json_val(json, "intermediate_size");
-        if (!inter.empty()) meta.intermediate_size = std::stoi(inter);
-
-        std::string nl = extract_json_val(json, "num_hidden_layers");
-        if (!nl.empty()) meta.num_hidden_layers = std::stoi(nl);
-
-        std::string ah = extract_json_val(json, "num_attention_heads");
-        if (!ah.empty()) meta.num_attention_heads = std::stoi(ah);
-
-        std::string kv = extract_json_val(json, "num_key_value_heads");
-        if (!kv.empty()) meta.num_key_value_heads = std::stoi(kv);
-
-        std::string vs = extract_json_val(json, "vocab_size");
-        if (!vs.empty()) meta.vocab_size = std::stoi(vs);
-
-        std::string eps = extract_json_val(json, "rms_norm_eps");
-        if (!eps.empty()) meta.rms_norm_eps = std::stof(eps);
-
-        std::string theta = extract_json_val(json, "rope_theta");
-        if (!theta.empty()) meta.rope_theta = std::stof(theta);
+        safe_stoi(extract_json_val(json, "hidden_size"), meta.hidden_size);
+        safe_stoi(extract_json_val(json, "intermediate_size"), meta.intermediate_size);
+        safe_stoi(extract_json_val(json, "num_hidden_layers"), meta.num_hidden_layers);
+        safe_stoi(extract_json_val(json, "num_attention_heads"), meta.num_attention_heads);
+        safe_stoi(extract_json_val(json, "num_key_value_heads"), meta.num_key_value_heads);
+        safe_stoi(extract_json_val(json, "vocab_size"), meta.vocab_size);
+        safe_stof(extract_json_val(json, "rms_norm_eps"), meta.rms_norm_eps);
+        safe_stof(extract_json_val(json, "rope_theta"), meta.rope_theta);
 
         if (json.find("\"quantization\"") != std::string::npos || json.find("\"bits\":") != std::string::npos) {
             meta.is_quantized = true;
-            std::string bits = extract_json_val(json, "bits");
-            if (!bits.empty()) meta.quant_bits = std::stoi(bits);
-            std::string grp = extract_json_val(json, "group_size");
-            if (!grp.empty()) meta.quant_group_size = std::stoi(grp);
+            safe_stoi(extract_json_val(json, "bits"), meta.quant_bits);
+            safe_stoi(extract_json_val(json, "group_size"), meta.quant_group_size);
         }
     }
 

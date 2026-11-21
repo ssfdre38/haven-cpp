@@ -12,6 +12,7 @@
 #endif
 
 void run_benchmark_suite(haven::HavenEngine& haven_engine, const std::string& model_path) {
+    (void)model_path;
     std::cout << "==================================================================\n";
     std::cout << "🚀 HAVEN-CPP: ENTERPRISE SOVEREIGN C++ ENGINE BENCHMARK SUITE\n";
     std::cout << "   AVX2/FMA/F16C | PagedAttention | YaRN | Speculative | FlashAttn\n";

@@ -51,17 +51,22 @@ void DynamicKVCacheManager::reinit(
 }
 
 void DynamicKVCacheManager::write(uint32_t layer, int pos, const float* k, const float* v, uint32_t kv_dim) {
-    if (layer >= num_layers_ || pos < 0 || pos >= (int)max_context_length_) return;
+    if (!k || !v || kv_dim == 0 || layer >= num_layers_ || pos < 0 || pos >= (int)max_context_length_) return;
+
+    const size_t elem_stride = std::max(static_cast<size_t>(num_kv_heads_) * head_dim_, static_cast<size_t>(kv_dim));
 
     // Dynamically grow capacity if needed
-    if ((uint32_t)pos >= capacity_) {
+    if ((uint32_t)pos >= capacity_ || (static_cast<size_t>(pos) + 1) * kv_dim > layers_[layer].keys.size()) {
         uint32_t new_cap = std::min(max_context_length_, std::max(capacity_ * 2, (uint32_t)pos + 512));
-        if (new_cap > capacity_) {
-            capacity_ = new_cap;
-            const size_t new_stride = (size_t)capacity_ * (num_kv_heads_ * head_dim_);
-            for (uint32_t l = 0; l < num_layers_; ++l) {
+        if (new_cap < (uint32_t)pos + 1) new_cap = (uint32_t)pos + 1;
+        capacity_ = std::max(capacity_, new_cap);
+        const size_t new_stride = static_cast<size_t>(capacity_) * elem_stride;
+        for (uint32_t l = 0; l < num_layers_; ++l) {
+            if (layers_[l].keys.size() < new_stride) {
                 layers_[l].keys.resize(new_stride, 0.0f);
                 layers_[l].values.resize(new_stride, 0.0f);
+            }
+            if (layers_[l].salience_scores.size() < capacity_) {
                 layers_[l].salience_scores.resize(capacity_, 1.0f);
                 layers_[l].active_mask.resize(capacity_, true);
             }
@@ -69,16 +74,18 @@ void DynamicKVCacheManager::write(uint32_t layer, int pos, const float* k, const
     }
 
     auto& lay = layers_[layer];
-    const size_t offset = (size_t)pos * kv_dim;
-    const size_t num_bytes = kv_dim * sizeof(float);
+    const size_t offset = static_cast<size_t>(pos) * static_cast<size_t>(kv_dim);
+    const size_t num_bytes = static_cast<size_t>(kv_dim) * sizeof(float);
 
     if (offset + kv_dim <= lay.keys.size()) {
         std::memcpy(lay.keys.data() + offset, k, num_bytes);
         std::memcpy(lay.values.data() + offset, v, num_bytes);
     }
 
-    lay.salience_scores[pos] = 1.0f; // New token starts with full salience
-    lay.active_mask[pos] = true;
+    if (static_cast<size_t>(pos) < lay.salience_scores.size()) {
+        lay.salience_scores[pos] = 1.0f; // New token starts with full salience
+        lay.active_mask[pos] = true;
+    }
     lay.current_len = std::max(lay.current_len, pos + 1);
     current_length_ = std::max(current_length_, pos + 1);
 }
@@ -88,13 +95,13 @@ void DynamicKVCacheManager::append(uint32_t layer, const float* k, const float* 
 }
 
 void DynamicKVCacheManager::update_salience(uint32_t layer, const float* attention_weights, int seq_len) {
-    if (layer >= num_layers_) return;
+    if (!attention_weights || seq_len <= 0 || layer >= num_layers_) return;
 
     auto& lay = layers_[layer];
-    const int len = std::min(seq_len, current_length_ + 1);
+    const size_t max_len = std::min({static_cast<size_t>(seq_len), static_cast<size_t>(current_length_ + 1), lay.salience_scores.size()});
 
     // Apply temporal exponential decay and accumulate new attention weight
-    for (int i = 0; i < len; ++i) {
+    for (size_t i = 0; i < max_len; ++i) {
         lay.salience_scores[i] = lay.salience_scores[i] * salience_decay_ + attention_weights[i];
     }
 }
@@ -104,17 +111,20 @@ size_t DynamicKVCacheManager::prune_stale_entries(uint32_t layer) {
 
     auto& lay = layers_[layer];
     size_t pruned_count = 0;
-    const size_t vec_stride = num_kv_heads_ * head_dim_;
+    const size_t vec_stride = static_cast<size_t>(num_kv_heads_) * head_dim_;
+    const size_t safe_len = std::min({static_cast<size_t>(std::max(0, current_length_)), lay.active_mask.size(), lay.salience_scores.size()});
 
     // Pinned Anchors: Never prune the first 4 tokens (system / soul core anchors)
-    const int pin_count = std::min(4, current_length_);
+    const size_t pin_count = std::min<size_t>(4, safe_len);
 
-    for (int i = pin_count; i < current_length_; ++i) {
+    for (size_t i = pin_count; i < safe_len; ++i) {
         if (lay.active_mask[i] && lay.salience_scores[i] < pruning_threshold_) {
             lay.active_mask[i] = false;
             // Zero out memory to save cache bandwidth during attention GEMV
-            std::memset(lay.keys.data() + i * vec_stride, 0, vec_stride * sizeof(float));
-            std::memset(lay.values.data() + i * vec_stride, 0, vec_stride * sizeof(float));
+            if (vec_stride > 0 && (i + 1) * vec_stride <= lay.keys.size()) {
+                std::memset(lay.keys.data() + i * vec_stride, 0, vec_stride * sizeof(float));
+                std::memset(lay.values.data() + i * vec_stride, 0, vec_stride * sizeof(float));
+            }
             pruned_count++;
         }
     }

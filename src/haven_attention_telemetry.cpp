@@ -16,7 +16,7 @@ AttentionTelemetryEngine::AttentionTelemetryEngine(uint32_t num_layers, uint32_t
 }
 
 float AttentionTelemetryEngine::compute_entropy(const float* probs, int size) {
-    if (size <= 1) return 0.0f;
+    if (!probs || size <= 1) return 0.0f;
     float entropy = 0.0f;
     for (int i = 0; i < size; ++i) {
         float p = probs[i];
@@ -48,6 +48,10 @@ void AttentionTelemetryEngine::record_head_attention(
 }
 
 void AttentionTelemetryEngine::finalize_step() {
+    if (num_layers_ == 0 || num_heads_ == 0) {
+        global_entropy_ = 0.0f;
+        return;
+    }
     float total_entropy = 0.0f;
     for (uint32_t l = 0; l < num_layers_; ++l) {
         auto& lay = telemetry_history_[l];

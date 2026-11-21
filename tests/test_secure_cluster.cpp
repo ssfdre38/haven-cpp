@@ -3,10 +3,23 @@
 #include <iostream>
 #include <iomanip>
 #include <cassert>
+#include <cmath>
+#include <cstring>
 #include <vector>
 #include <string>
 #include <thread>
 #include <chrono>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#endif
 
 int main() {
     std::cout << "\n==================================================================\n";
@@ -16,7 +29,7 @@ int main() {
     // ------------------------------------------------------------------------
     // Step 1: Token Generation and URI Encoding/Decoding
     // ------------------------------------------------------------------------
-    std::cout << "[Step 1/4] Verifying 256-bit Cryptographic Token & Invite URI...\n";
+    std::cout << "[Step 1/5] Verifying 256-bit Cryptographic Token & Invite URI...\n";
     std::string token = haven::HavenSecurity::generate_cluster_token();
     assert(token.length() == 64 && "Token must be a 64-character hex string (256 bits)");
 
@@ -37,7 +50,7 @@ int main() {
     // ------------------------------------------------------------------------
     // Step 2: Constant-Time Verification
     // ------------------------------------------------------------------------
-    std::cout << "\n[Step 2/4] Verifying Constant-Time Token Comparator...\n";
+    std::cout << "\n[Step 2/5] Verifying Constant-Time Token Comparator...\n";
     assert(haven::HavenSecurity::constant_time_verify(token, token) && "Matching tokens must verify");
     std::string tampered_token = token;
     tampered_token[tampered_token.length() - 1] ^= 0x01;
@@ -48,7 +61,7 @@ int main() {
     // ------------------------------------------------------------------------
     // Step 3: Authorized Worker Joins with Cryptographic Token
     // ------------------------------------------------------------------------
-    std::cout << "\n[Step 3/4] Launching Secure Coordinator & Authorized Worker on Loopback...\n";
+    std::cout << "\n[Step 3/5] Launching Secure Coordinator & Authorized Worker on Loopback...\n";
     haven::HavenClusterNode coordinator;
     coordinator.set_cluster_token(token);
     bool coord_ok = coordinator.init_coordinator(11800, 32);
@@ -78,7 +91,7 @@ int main() {
     // ------------------------------------------------------------------------
     // Step 4: Rogue Peer Rejection (Wrong Token Attack)
     // ------------------------------------------------------------------------
-    std::cout << "\n[Step 4/4] Simulating Rogue Peer Attack with Invalid Token...\n";
+    std::cout << "\n[Step 4/5] Simulating Rogue Peer Attack with Invalid Token...\n";
     haven::HavenClusterNode rogue_worker;
     std::string fake_token = haven::HavenSecurity::generate_cluster_token();
     rogue_worker.set_cluster_token(fake_token);
@@ -90,6 +103,76 @@ int main() {
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     assert(!coordinator.is_peer_connected(99) && "Coordinator MUST NOT register unauthorized rogue peer");
     std::cout << "   ✓ Rogue peer with invalid token was instantly dropped and rejected.\n";
+
+    // ------------------------------------------------------------------------
+    // Step 5: Unauthenticated Non-Handshake Frame Injection Defense (CWE-306)
+    // ------------------------------------------------------------------------
+    std::cout << "\n[Step 5/5] Simulating Unauthenticated Raw Activation Frame Injection...\n";
+    {
+#ifdef _WIN32
+        SOCKET raw_sock = socket(AF_INET, SOCK_STREAM, 0);
+        assert(raw_sock != INVALID_SOCKET && "Raw test socket must open");
+#else
+        int raw_sock = socket(AF_INET, SOCK_STREAM, 0);
+        assert(raw_sock >= 0 && "Raw test socket must open");
+#endif
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(11800);
+        inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+        int conn_rc = connect(raw_sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+        assert(conn_rc == 0 && "TCP connect to coordinator port should succeed prior to SHCP auth");
+
+        // Craft a raw FRAME_FLAG_ACTIVATION packet skipping FRAME_FLAG_HANDSHAKE entirely
+        haven::HavenActivationFrameHeader spoof_hdr{};
+        spoof_hdr.magic = haven::HAVEN_CLUSTER_MAGIC;
+        spoof_hdr.protocol_ver = haven::HAVEN_CLUSTER_VERSION;
+        spoof_hdr.flags = haven::FRAME_FLAG_ACTIVATION;
+        spoof_hdr.sequence_id = 1337;
+        spoof_hdr.step_pos = 0;
+        spoof_hdr.from_node_id = 77;
+        spoof_hdr.to_node_id = 0;
+        spoof_hdr.layer_boundary = 0;
+        spoof_hdr.reserved = 0;
+        spoof_hdr.element_count = 4;
+        spoof_hdr.payload_bytes = 4 * sizeof(float);
+
+        float poison_payload[4] = { 9.9f, -9.9f, 42.0f, 1337.0f };
+        send(raw_sock, reinterpret_cast<const char*>(&spoof_hdr), sizeof(spoof_hdr), 0);
+        send(raw_sock, reinterpret_cast<const char*>(poison_payload), sizeof(poison_payload), 0);
+
+        // Coordinator must reject the frame, never register node 77, and never enqueue poison_payload
+        haven::HavenActivationFrame unexpected_frame;
+        bool leaked = coordinator.await_upstream_activations(unexpected_frame, 350);
+        assert(!leaked && "Coordinator MUST NOT enqueue activation frames from unauthenticated peers");
+        assert(!coordinator.is_peer_connected(77) && "Coordinator MUST NOT register unauthenticated node 77");
+
+        // Confirm coordinator sent FRAME_FLAG_AUTH_REJECT and then severed the rogue socket
+        haven::HavenActivationFrameHeader reject_hdr{};
+        size_t got_hdr = 0;
+        while (got_hdr < sizeof(reject_hdr)) {
+            int r = recv(raw_sock, reinterpret_cast<char*>(&reject_hdr) + got_hdr,
+                         static_cast<int>(sizeof(reject_hdr) - got_hdr), 0);
+            if (r <= 0) break;
+            got_hdr += static_cast<size_t>(r);
+        }
+        assert(got_hdr == sizeof(reject_hdr) &&
+               reject_hdr.magic == haven::HAVEN_CLUSTER_MAGIC &&
+               (reject_hdr.flags & haven::FRAME_FLAG_AUTH_REJECT) &&
+               "Coordinator must respond with FRAME_FLAG_AUTH_REJECT");
+
+        char probe = 0;
+        int probe_rc = recv(raw_sock, &probe, 1, 0);
+        assert(probe_rc <= 0 && "Coordinator must close unauthenticated peer socket after rejection");
+
+#ifdef _WIN32
+        closesocket(raw_sock);
+#else
+        close(raw_sock);
+#endif
+    }
+    std::cout << "   ✓ Unauthenticated activation frame injection blocked and connection severed.\n";
 
     authorized_worker.shutdown();
     rogue_worker.shutdown();

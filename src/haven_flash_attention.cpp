@@ -43,7 +43,7 @@ void FlashAttentionCpu::compute_tiled_attention(
     float softcap,
     float* out_attn)
 {
-    if (num_tokens == 0 || head_dim == 0) return;
+    if (!q || !layer_k || !layer_v || !out_attn || num_tokens == 0 || head_dim == 0) return;
     std::memset(out_attn, 0, head_dim * sizeof(float));
 
     float max_score = -1e9f;
@@ -60,7 +60,7 @@ void FlashAttentionCpu::compute_tiled_attention(
         // Compute Q · K^T dot products for this block using AVX2 SIMD
         for (uint32_t i = 0; i < current_block_size; ++i) {
             uint32_t abs_s = indices ? (uint32_t)indices[block_start + i] : (block_start + i);
-            const float* k_vec = layer_k + abs_s * kv_dim + kv_head_offset;
+            const float* k_vec = layer_k + static_cast<size_t>(abs_s) * static_cast<size_t>(kv_dim) + kv_head_offset;
 
             float dot = Avx2Math::vec_dot_f32((int)head_dim, q, k_vec);
             float score = dot * scale;
@@ -89,7 +89,7 @@ void FlashAttentionCpu::compute_tiled_attention(
         // Accumulate new weighted values from this block with AVX2 FMA
         for (uint32_t i = 0; i < current_block_size; ++i) {
             uint32_t abs_s = indices ? (uint32_t)indices[block_start + i] : (block_start + i);
-            const float* v_vec = layer_v + abs_s * kv_dim + kv_head_offset;
+            const float* v_vec = layer_v + static_cast<size_t>(abs_s) * static_cast<size_t>(kv_dim) + kv_head_offset;
 
             float exp_val = std::exp(block_scores[i] - new_max);
             sum_exp += exp_val;

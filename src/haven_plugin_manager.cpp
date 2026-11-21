@@ -89,7 +89,10 @@ bool PluginManager::probe_plugin_metadata(const std::string& filepath, PluginMet
     FreeLibrary(hModule);
     return true;
 #else
-    void* handle = dlopen(filepath.c_str(), RTLD_NOW);
+    std::error_code ec;
+    std::filesystem::path canon_path = std::filesystem::weakly_canonical(filepath, ec);
+    std::string load_target = ec ? filepath : canon_path.string();
+    void* handle = dlopen(load_target.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!handle) return false;
 
     auto create_func = (CreatePluginFunc)dlsym(handle, "create_haven_plugin");
@@ -122,6 +125,7 @@ bool PluginManager::probe_plugin_metadata(const std::string& filepath, PluginMet
 }
 
 size_t PluginManager::discover_plugins(const std::string& plugins_directory, bool lazy_load) {
+    std::lock_guard<std::recursive_mutex> lock(plugins_mutex_);
     plugins_dir_ = plugins_directory;
     lazy_load_enabled_ = lazy_load;
     if (!std::filesystem::exists(plugins_directory)) {
@@ -169,6 +173,7 @@ size_t PluginManager::discover_plugins(const std::string& plugins_directory, boo
 }
 
 bool PluginManager::load_plugin_file(const std::string& filepath, PluginExecutionContext* ctx) {
+    std::lock_guard<std::recursive_mutex> lock(plugins_mutex_);
 #ifdef _WIN32
     std::filesystem::path canon_path = std::filesystem::weakly_canonical(filepath);
     HMODULE hModule = LoadLibraryExA(canon_path.string().c_str(), NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
@@ -226,7 +231,10 @@ bool PluginManager::load_plugin_file(const std::string& filepath, PluginExecutio
     std::cout << "✨ [Plugin Loaded] " << meta.name << " v" << meta.version << " by " << meta.author << " (" << meta.description << ")\n";
     return true;
 #else
-    void* handle = dlopen(filepath.c_str(), RTLD_NOW);
+    std::error_code ec;
+    std::filesystem::path canon_path = std::filesystem::weakly_canonical(filepath, ec);
+    std::string load_target = ec ? filepath : canon_path.string();
+    void* handle = dlopen(load_target.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!handle) {
         std::cerr << "⚠️ Failed to dlopen plugin library: " << filepath << " (" << dlerror() << ")\n";
         return false;
@@ -282,6 +290,7 @@ bool PluginManager::load_plugin_file(const std::string& filepath, PluginExecutio
 }
 
 bool PluginManager::register_native_plugin(std::shared_ptr<IHavenPlugin> plugin, PluginExecutionContext* ctx) {
+    std::lock_guard<std::recursive_mutex> lock(plugins_mutex_);
     if (!plugin) return false;
     PluginMetadata meta = plugin->get_metadata();
     if (!plugin->on_load(ctx ? ctx : execution_ctx_)) return false;
@@ -304,6 +313,7 @@ bool PluginManager::register_native_plugin(std::shared_ptr<IHavenPlugin> plugin,
 }
 
 bool PluginManager::ensure_plugin_loaded(LoadedPluginRecord& record, PluginExecutionContext* ctx) {
+    std::lock_guard<std::recursive_mutex> lock(plugins_mutex_);
     if (record.is_loaded && record.instance) {
         record.last_used = std::chrono::steady_clock::now();
         return true;
@@ -355,7 +365,10 @@ bool PluginManager::ensure_plugin_loaded(LoadedPluginRecord& record, PluginExecu
     std::cout << "⚡ [Hot-Loaded Plugin on Demand] " << record.metadata.name << " v" << record.metadata.version << " (Now Active in RAM)\n";
     return true;
 #else
-    void* handle = dlopen(record.filepath.c_str(), RTLD_NOW);
+    std::error_code ec;
+    std::filesystem::path canon_path = std::filesystem::weakly_canonical(record.filepath, ec);
+    std::string load_target = ec ? record.filepath : canon_path.string();
+    void* handle = dlopen(load_target.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!handle) {
         std::cerr << "⚠️ [Hot-Load Error] Failed dlopen: " << record.filepath << " (" << dlerror() << ")\n";
         return false;
@@ -394,12 +407,14 @@ bool PluginManager::ensure_plugin_loaded(LoadedPluginRecord& record, PluginExecu
 }
 
 bool PluginManager::ensure_plugin_loaded_by_id(const std::string& plugin_id, PluginExecutionContext* ctx) {
+    std::lock_guard<std::recursive_mutex> lock(plugins_mutex_);
     auto it = plugins_.find(plugin_id);
     if (it == plugins_.end()) return false;
     return ensure_plugin_loaded(it->second, ctx);
 }
 
 bool PluginManager::unload_plugin_instance(LoadedPluginRecord& record) {
+    std::lock_guard<std::recursive_mutex> lock(plugins_mutex_);
     if (!record.is_loaded) return true;
     if (record.filepath == "[in-process]") return false;
 
@@ -424,6 +439,7 @@ bool PluginManager::unload_plugin_instance(LoadedPluginRecord& record) {
 }
 
 bool PluginManager::unload_plugin(const std::string& plugin_id) {
+    std::lock_guard<std::recursive_mutex> lock(plugins_mutex_);
     auto it = plugins_.find(plugin_id);
     if (it == plugins_.end()) return false;
     unload_plugin_instance(it->second);
@@ -432,6 +448,7 @@ bool PluginManager::unload_plugin(const std::string& plugin_id) {
 }
 
 size_t PluginManager::unload_idle_plugins(int max_idle_seconds) {
+    std::lock_guard<std::recursive_mutex> lock(plugins_mutex_);
     size_t count = 0;
     auto now = std::chrono::steady_clock::now();
     for (auto& [id, record] : plugins_) {
@@ -448,6 +465,7 @@ size_t PluginManager::unload_idle_plugins(int max_idle_seconds) {
 }
 
 void PluginManager::unload_all() {
+    std::lock_guard<std::recursive_mutex> lock(plugins_mutex_);
     for (auto& [id, record] : plugins_) {
         if (record.is_loaded) {
             unload_plugin_instance(record);
@@ -457,6 +475,7 @@ void PluginManager::unload_all() {
 }
 
 size_t PluginManager::get_active_plugin_count() const {
+    std::lock_guard<std::recursive_mutex> lock(plugins_mutex_);
     size_t count = 0;
     for (const auto& [id, record] : plugins_) {
         if (record.is_loaded) count++;
@@ -465,6 +484,7 @@ size_t PluginManager::get_active_plugin_count() const {
 }
 
 void PluginManager::dispatch_prompt_prefill(std::string& prompt, std::vector<uint32_t>& tokens) {
+    std::lock_guard<std::recursive_mutex> lock(plugins_mutex_);
     for (auto& [id, record] : plugins_) {
         if (record.is_loaded && record.instance) {
             record.instance->on_prompt_prefill(prompt, tokens);
@@ -473,6 +493,7 @@ void PluginManager::dispatch_prompt_prefill(std::string& prompt, std::vector<uin
 }
 
 void PluginManager::dispatch_token_generated(uint32_t token_id, const std::string& piece) {
+    std::lock_guard<std::recursive_mutex> lock(plugins_mutex_);
     for (auto& [id, record] : plugins_) {
         if (record.is_loaded && record.instance) {
             record.instance->on_token_generated(token_id, piece);
@@ -481,54 +502,57 @@ void PluginManager::dispatch_token_generated(uint32_t token_id, const std::strin
 }
 
 bool PluginManager::dispatch_tool_execution(const std::string& action, const std::string& payload, std::string& output) {
-    // 1. Periodically prune idle plugins (older than 180s)
-    unload_idle_plugins(180);
+    {
+        std::lock_guard<std::recursive_mutex> lock(plugins_mutex_);
+        // 1. Periodically prune idle plugins (older than 180s)
+        unload_idle_plugins(180);
 
-    // 2. Check currently active/loaded plugins first
-    for (auto& [id, record] : plugins_) {
-        if (record.is_loaded && record.instance && record.instance->can_handle_tool(action)) {
-            record.last_used = std::chrono::steady_clock::now();
-            return record.instance->execute_tool(action, payload, output);
+        // 2. Check currently active/loaded plugins first
+        for (auto& [id, record] : plugins_) {
+            if (record.is_loaded && record.instance && record.instance->can_handle_tool(action)) {
+                record.last_used = std::chrono::steady_clock::now();
+                return record.instance->execute_tool(action, payload, output);
+            }
         }
-    }
 
-    // 3. Find cold plugin that matches this action from discovery probe
-    for (auto& [id, record] : plugins_) {
-        if (!record.is_loaded) {
-            bool matches = false;
-            for (const auto& act : record.supported_actions) {
-                if (act == action) {
-                    matches = true;
-                    break;
+        // 3. Find cold plugin that matches this action from discovery probe
+        for (auto& [id, record] : plugins_) {
+            if (!record.is_loaded) {
+                bool matches = false;
+                for (const auto& act : record.supported_actions) {
+                    if (act == action) {
+                        matches = true;
+                        break;
+                    }
+                }
+
+                if (matches) {
+                    if (ensure_plugin_loaded(record)) {
+                        if (record.instance->can_handle_tool(action)) {
+                            record.last_used = std::chrono::steady_clock::now();
+                            return record.instance->execute_tool(action, payload, output);
+                        }
+                    }
                 }
             }
+        }
 
-            if (matches) {
+        // 4. Fallback: on-demand probe cold plugins for custom or dynamic actions
+        for (auto& [id, record] : plugins_) {
+            if (!record.is_loaded) {
                 if (ensure_plugin_loaded(record)) {
                     if (record.instance->can_handle_tool(action)) {
                         record.last_used = std::chrono::steady_clock::now();
                         return record.instance->execute_tool(action, payload, output);
+                    } else {
+                        unload_plugin_instance(record);
                     }
                 }
             }
         }
     }
 
-    // 4. Fallback: on-demand probe cold plugins for custom or dynamic actions
-    for (auto& [id, record] : plugins_) {
-        if (!record.is_loaded) {
-            if (ensure_plugin_loaded(record)) {
-                if (record.instance->can_handle_tool(action)) {
-                    record.last_used = std::chrono::steady_clock::now();
-                    return record.instance->execute_tool(action, payload, output);
-                } else {
-                    unload_plugin_instance(record);
-                }
-            }
-        }
-    }
-
-    // 5. Check connected Model Context Protocol (MCP) servers
+    // 5. Check connected Model Context Protocol (MCP) servers (outside plugins_mutex_ to avoid lock inversion)
     if (mcp_manager_ && mcp_manager_->can_handle_tool(action)) {
         return mcp_manager_->dispatch_tool(action, payload, output);
     }
@@ -537,6 +561,7 @@ bool PluginManager::dispatch_tool_execution(const std::string& action, const std
 }
 
 void PluginManager::dispatch_sensory_tick(std::vector<float>& vision_emb, std::vector<float>& audio_emb) {
+    std::lock_guard<std::recursive_mutex> lock(plugins_mutex_);
     for (auto& [id, record] : plugins_) {
         if (record.is_loaded && record.instance) {
             record.instance->on_sensory_tick(vision_emb, audio_emb);
@@ -545,6 +570,7 @@ void PluginManager::dispatch_sensory_tick(std::vector<float>& vision_emb, std::v
 }
 
 size_t PluginManager::reload_all(const std::string& plugins_directory, PluginExecutionContext* ctx) {
+    std::lock_guard<std::recursive_mutex> lock(plugins_mutex_);
     (void)ctx;
     plugins_dir_ = plugins_directory;
     unload_all();
@@ -552,6 +578,7 @@ size_t PluginManager::reload_all(const std::string& plugins_directory, PluginExe
 }
 
 std::string PluginManager::get_tools_prompt_description() const {
+    std::lock_guard<std::recursive_mutex> lock(plugins_mutex_);
     if (plugins_.empty()) return "";
     std::string s = "\n[Autonomous Sovereign Capabilities & Native Tools]:\n"
                     "You have direct native system execution and workspace inspection capabilities via C++20 bare-metal plugins.\n"

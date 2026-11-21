@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <filesystem>
 #include <chrono>
+#include <mutex>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -61,11 +62,20 @@ public:
     // Unloads all active plugins safely
     void unload_all();
 
-    // Plugin inspection
-    const std::unordered_map<std::string, LoadedPluginRecord>& get_loaded_plugins() const { return plugins_; }
-    size_t get_plugin_count() const { return plugins_.size(); }
+    // Plugin inspection (returns thread-safe snapshot copy)
+    std::unordered_map<std::string, LoadedPluginRecord> get_loaded_plugins() const {
+        std::lock_guard<std::recursive_mutex> lock(plugins_mutex_);
+        return plugins_;
+    }
+    size_t get_plugin_count() const {
+        std::lock_guard<std::recursive_mutex> lock(plugins_mutex_);
+        return plugins_.size();
+    }
     size_t get_active_plugin_count() const;
-    bool has_plugin(const std::string& plugin_id) const { return plugins_.find(plugin_id) != plugins_.end(); }
+    bool has_plugin(const std::string& plugin_id) const {
+        std::lock_guard<std::recursive_mutex> lock(plugins_mutex_);
+        return plugins_.find(plugin_id) != plugins_.end();
+    }
 
     // Hot-reloads all plugins from the directory without restarting engine
     size_t reload_all(const std::string& plugins_directory = "plugins", PluginExecutionContext* ctx = nullptr);
@@ -86,6 +96,7 @@ public:
 private:
     bool probe_plugin_metadata(const std::string& filepath, PluginMetadata& out_meta, std::vector<std::string>& out_actions);
 
+    mutable std::recursive_mutex plugins_mutex_;
     std::unordered_map<std::string, LoadedPluginRecord> plugins_;
     std::string plugins_dir_ = "plugins";
     PluginExecutionContext* execution_ctx_ = nullptr;

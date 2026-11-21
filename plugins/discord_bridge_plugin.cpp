@@ -28,6 +28,7 @@ public:
     }
 
     bool on_load(PluginExecutionContext* ctx) override {
+        (void)ctx;
         config_path_ = "discord_config.json";
         channel_name_ = "#sanctuary";
         load_config();
@@ -40,6 +41,7 @@ public:
     }
 
     void on_prompt_prefill(std::string& prompt, std::vector<uint32_t>& tokens) override {
+        (void)tokens;
         // Multi-user social awareness injection
         std::ostringstream ss;
         ss << "\n[Discord Integration: Dedicated Channel " << channel_name_ 
@@ -77,6 +79,13 @@ public:
             return true;
         }
         else if (action == "discord_set_webhook" && !payload.empty()) {
+            bool valid_discord = (payload.starts_with("https://discord.com/api/webhooks/") ||
+                                  payload.starts_with("https://discordapp.com/api/webhooks/")) &&
+                                 payload.find_first_of(" \t\r\n\"\\") == std::string::npos;
+            if (!valid_discord) {
+                output = "⚠️ Blocked: Webhook URL must be a valid https://discord.com/api/webhooks/ endpoint.";
+                return false;
+            }
             webhook_url_ = payload;
             save_config();
             output = "💬 Discord Channel Webhook URL updated and saved.";
@@ -169,13 +178,29 @@ private:
     }
 
     void save_config() {
+        auto esc = [](const std::string& s) {
+            std::string out;
+            for (char c : s) {
+                if (c == '"') out += "\\\"";
+                else if (c == '\\') out += "\\\\";
+                else if (c == '\n') out += "\\n";
+                else if (c == '\r') continue;
+                else out += c;
+            }
+            return out;
+        };
         std::ofstream f(config_path_);
-        f << "{\n  \"channel_name\": \"" << channel_name_ << "\",\n  \"webhook_url\": \"" << webhook_url_ << "\"\n}\n";
+        f << "{\n  \"channel_name\": \"" << esc(channel_name_) << "\",\n  \"webhook_url\": \"" << esc(webhook_url_) << "\"\n}\n";
     }
 
 #ifdef _WIN32
     bool send_discord_post(const std::string& json_body) {
         if (webhook_url_.empty()) return false;
+        if (!webhook_url_.starts_with("https://discord.com/api/webhooks/") &&
+            !webhook_url_.starts_with("https://discordapp.com/api/webhooks/")) {
+            return false;
+        }
+        if (webhook_url_.find_first_of(" \t\r\n") != std::string::npos) return false;
         size_t proto_pos = webhook_url_.find("://");
         if (proto_pos == std::string::npos) return false;
         std::string without_proto = webhook_url_.substr(proto_pos + 3);

@@ -25,6 +25,7 @@ public:
     }
 
     bool on_load(PluginExecutionContext* ctx) override {
+        (void)ctx;
         std::cout << "🎵 [YouTubeMusicPlugin] Initialized YouTube Music media controller hook.\n";
         return true;
     }
@@ -64,8 +65,20 @@ public:
             return true;
         }
         else if (action == "yt_music_search" && !payload.empty()) {
-            std::string encoded_query = payload;
-            std::replace(encoded_query.begin(), encoded_query.end(), ' ', '+');
+            std::string encoded_query;
+            encoded_query.reserve(payload.size() * 3);
+            static const char hex[] = "0123456789ABCDEF";
+            for (unsigned char c : payload) {
+                if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+                    encoded_query += static_cast<char>(c);
+                } else if (c == ' ') {
+                    encoded_query += '+';
+                } else {
+                    encoded_query += '%';
+                    encoded_query += hex[(c >> 4) & 0xF];
+                    encoded_query += hex[c & 0xF];
+                }
+            }
             std::string url = "https://music.youtube.com/search?q=" + encoded_query;
             ShellExecuteA(NULL, "open", url.c_str(), NULL, NULL, SW_SHOWNORMAL);
             output = "🎵 Opened YouTube Music search for: '" + payload + "'";

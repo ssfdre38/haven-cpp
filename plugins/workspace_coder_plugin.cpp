@@ -40,6 +40,49 @@ static std::string extract_json_field(const std::string& json, const std::string
     return "";
 }
 
+static bool resolve_workspace_path(const std::string& raw_input, std::filesystem::path& out_path, bool allow_root = false) {
+    std::string s = raw_input;
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r' || s.front() == '\n' || s.front() == '"' || s.front() == '\'')) {
+        s.erase(0, 1);
+    }
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' || s.back() == '\n' || s.back() == '"' || s.back() == '\'')) {
+        s.pop_back();
+    }
+    if (s.empty() || s.find('\0') != std::string::npos) return false;
+
+    std::error_code ec;
+    std::filesystem::path root = std::filesystem::weakly_canonical(std::filesystem::current_path(ec), ec);
+    if (ec) return false;
+
+    std::filesystem::path candidate = std::filesystem::path(s);
+    std::filesystem::path resolved = std::filesystem::weakly_canonical(candidate.is_absolute() ? candidate : (root / candidate), ec);
+    if (ec) return false;
+
+    std::string root_str = root.string();
+    std::string res_str = resolved.string();
+#ifdef _WIN32
+    std::string root_cmp = root_str, res_cmp = res_str;
+    for (char& c : root_cmp) c = (char)tolower((unsigned char)c);
+    for (char& c : res_cmp) c = (char)tolower((unsigned char)c);
+#else
+    const std::string& root_cmp = root_str;
+    const std::string& res_cmp = res_str;
+#endif
+    if (res_cmp == root_cmp) {
+        if (!allow_root) return false;
+        out_path = resolved;
+        return true;
+    }
+    if (res_cmp.size() <= root_cmp.size() || res_cmp.compare(0, root_cmp.size(), root_cmp) != 0) {
+        return false;
+    }
+    char sep = res_cmp[root_cmp.size()];
+    if (sep != '\\' && sep != '/') return false;
+
+    out_path = resolved;
+    return true;
+}
+
 class WorkspaceCoderPlugin : public IHavenPlugin {
 public:
     PluginMetadata get_metadata() const override {
@@ -79,29 +122,26 @@ public:
 
     bool execute_tool(const std::string& action, const std::string& payload, std::string& output) override {
         if (action == "read_file" || action == "read_code") {
-            if (payload.empty()) {
-                output = "📁 [WorkspaceCoder] Please specify a file path to read.";
+            std::filesystem::path safe_path;
+            if (!resolve_workspace_path(payload, safe_path)) {
+                output = "📁 [WorkspaceCoder] Blocked: Path is empty or outside the active workspace sandbox.";
                 return true;
             }
+            std::string path_str = safe_path.string();
 
-            std::string path_str = payload;
-            // Trim quotes if passed
-            if (path_str.front() == '"' || path_str.front() == '\'') path_str = path_str.substr(1);
-            if (path_str.back() == '"' || path_str.back() == '\'') path_str.pop_back();
-
-            if (!std::filesystem::exists(path_str)) {
+            if (!std::filesystem::exists(safe_path) || !std::filesystem::is_regular_file(safe_path)) {
                 output = "📁 [WorkspaceCoder] File not found: " + path_str;
                 return true;
             }
 
             try {
-                auto sz = std::filesystem::file_size(path_str);
+                auto sz = std::filesystem::file_size(safe_path);
                 if (sz > 500000) { // 500KB cap
                     output = "📁 [WorkspaceCoder] File is too large (" + std::to_string(sz / 1024) + " KB) to read entirely in one turn.";
                     return true;
                 }
 
-                std::ifstream ifs(path_str);
+                std::ifstream ifs(safe_path);
                 if (!ifs.is_open()) {
                     output = "📁 [WorkspaceCoder] Failed to open file: " + path_str;
                     return true;
@@ -136,31 +176,27 @@ public:
                 }
             }
 
-            // Trim quotes or spaces from path
-            while (!path_str.empty() && (path_str.front() == ' ' || path_str.front() == '"' || path_str.front() == '\'')) path_str.erase(0, 1);
-            while (!path_str.empty() && (path_str.back() == ' ' || path_str.back() == '\r' || path_str.back() == '"' || path_str.back() == '\'')) path_str.pop_back();
-
-            if (path_str.empty()) {
-                output = "📁 [WorkspaceCoder] write_file requires a valid target file path.";
+            std::filesystem::path safe_path;
+            if (!resolve_workspace_path(path_str, safe_path)) {
+                output = "📁 [WorkspaceCoder] Blocked: Target write path must stay inside the active workspace directory.";
                 return true;
             }
 
             try {
-                std::filesystem::path p(path_str);
-                if (p.has_parent_path()) {
-                    std::filesystem::create_directories(p.parent_path());
+                if (safe_path.has_parent_path()) {
+                    std::filesystem::create_directories(safe_path.parent_path());
                 }
 
-                std::ofstream ofs(path_str, std::ios::binary | std::ios::trunc);
+                std::ofstream ofs(safe_path, std::ios::binary | std::ios::trunc);
                 if (!ofs.is_open()) {
-                    output = "📁 [WorkspaceCoder] Failed to open file for writing: " + path_str;
+                    output = "📁 [WorkspaceCoder] Failed to open file for writing: " + safe_path.string();
                     return true;
                 }
 
                 ofs.write(content.data(), content.size());
                 ofs.close();
 
-                output = "📁 [WorkspaceCoder] ✓ Successfully wrote " + std::to_string(content.size()) + " bytes to: " + path_str;
+                output = "📁 [WorkspaceCoder] ✓ Successfully wrote " + std::to_string(content.size()) + " bytes to: " + safe_path.string();
                 return true;
             } catch (const std::exception& e) {
                 output = "📁 [WorkspaceCoder] Write error: " + std::string(e.what());
@@ -186,32 +222,38 @@ public:
                 }
             }
 
-            while (!path_str.empty() && (path_str.front() == ' ' || path_str.front() == '\n' || path_str.front() == '"' || path_str.front() == '\'')) path_str.erase(0, 1);
-            while (!path_str.empty() && (path_str.back() == ' ' || path_str.back() == '\r' || path_str.back() == '\n' || path_str.back() == '"' || path_str.back() == '\'')) path_str.pop_back();
-
-            if (path_str.empty() || !std::filesystem::exists(path_str)) {
-                output = "📁 [WorkspaceCoder] Target file not found for patch: " + path_str;
+            std::filesystem::path safe_path;
+            if (!resolve_workspace_path(path_str, safe_path) || !std::filesystem::exists(safe_path)) {
+                output = "📁 [WorkspaceCoder] Blocked or not found: Target patch file must exist inside the active workspace.";
+                return true;
+            }
+            if (target.empty()) {
+                output = "📁 [WorkspaceCoder] Error: Target text block cannot be empty.";
                 return true;
             }
 
             try {
-                std::ifstream ifs(path_str, std::ios::binary);
+                if (std::filesystem::file_size(safe_path) > 2ULL * 1024 * 1024) {
+                    output = "📁 [WorkspaceCoder] Error: File exceeds 2MB patch limit.";
+                    return true;
+                }
+                std::ifstream ifs(safe_path, std::ios::binary);
                 std::string file_content((std::istreambuf_iterator<char>(ifs)), (std::istreambuf_iterator<char>()));
                 ifs.close();
 
                 size_t match_pos = file_content.find(target);
                 if (match_pos == std::string::npos) {
-                    output = "📁 [WorkspaceCoder] Error: Target text block not found in file: " + path_str;
+                    output = "📁 [WorkspaceCoder] Error: Target text block not found in file: " + safe_path.string();
                     return true;
                 }
 
                 file_content.replace(match_pos, target.length(), replacement);
 
-                std::ofstream ofs(path_str, std::ios::binary | std::ios::trunc);
+                std::ofstream ofs(safe_path, std::ios::binary | std::ios::trunc);
                 ofs.write(file_content.data(), file_content.size());
                 ofs.close();
 
-                output = "📁 [WorkspaceCoder] ✓ Successfully patched target in: " + path_str;
+                output = "📁 [WorkspaceCoder] ✓ Successfully patched target in: " + safe_path.string();
                 return true;
             } catch (const std::exception& e) {
                 output = "📁 [WorkspaceCoder] Patch error: " + std::string(e.what());
@@ -220,18 +262,15 @@ public:
         }
 
         if (action == "create_directory") {
-            std::string dir_path = payload;
-            while (!dir_path.empty() && (dir_path.front() == ' ' || dir_path.front() == '"' || dir_path.front() == '\'')) dir_path.erase(0, 1);
-            while (!dir_path.empty() && (dir_path.back() == ' ' || dir_path.back() == '\r' || dir_path.back() == '"' || dir_path.back() == '\'')) dir_path.pop_back();
-
-            if (dir_path.empty()) {
-                output = "📁 [WorkspaceCoder] Please specify a directory path to create.";
+            std::filesystem::path safe_dir;
+            if (!resolve_workspace_path(payload, safe_dir)) {
+                output = "📁 [WorkspaceCoder] Blocked: Directory creation is confined to the active workspace.";
                 return true;
             }
 
             try {
-                bool created = std::filesystem::create_directories(dir_path);
-                output = std::string("📁 [WorkspaceCoder] Directory ") + (created ? "created" : "already exists") + ": " + dir_path;
+                bool created = std::filesystem::create_directories(safe_dir);
+                output = std::string("📁 [WorkspaceCoder] Directory ") + (created ? "created" : "already exists") + ": " + safe_dir.string();
                 return true;
             } catch (const std::exception& e) {
                 output = "📁 [WorkspaceCoder] Failed to create directory: " + std::string(e.what());
@@ -240,27 +279,20 @@ public:
         }
 
         if (action == "delete_file") {
-            std::string path_str = payload;
-            while (!path_str.empty() && (path_str.front() == ' ' || path_str.front() == '"' || path_str.front() == '\'')) path_str.erase(0, 1);
-            while (!path_str.empty() && (path_str.back() == ' ' || path_str.back() == '\r' || path_str.back() == '"' || path_str.back() == '\'')) path_str.pop_back();
-
-            if (path_str.empty() || path_str == "/" || path_str == "\\" || 
-                path_str == "C:" || path_str == "C:\\" || path_str.starts_with("C:\\Windows") ||
-                path_str == "/bin" || path_str == "/sbin" || path_str == "/usr" || 
-                path_str == "/etc" || path_str == "/lib" || path_str == "/dev" || 
-                path_str == "/boot" || path_str == "/sys" || path_str == "/proc") {
-                output = "📁 [WorkspaceCoder] Blocked: Deletion of critical system or root paths is prohibited.";
+            std::filesystem::path safe_path;
+            if (!resolve_workspace_path(payload, safe_path, false)) {
+                output = "📁 [WorkspaceCoder] Blocked: Deletion outside the active workspace or of workspace root is prohibited.";
                 return true;
             }
 
-            if (!std::filesystem::exists(path_str)) {
-                output = "📁 [WorkspaceCoder] Target file does not exist: " + path_str;
+            if (!std::filesystem::exists(safe_path) || !std::filesystem::is_regular_file(safe_path)) {
+                output = "📁 [WorkspaceCoder] Target file does not exist: " + safe_path.string();
                 return true;
             }
 
             try {
-                bool ok = std::filesystem::remove(path_str);
-                output = "📁 [WorkspaceCoder] " + std::string(ok ? "✓ Deleted: " : "Failed to delete: ") + path_str;
+                bool ok = std::filesystem::remove(safe_path);
+                output = "📁 [WorkspaceCoder] " + std::string(ok ? "✓ Deleted: " : "Failed to delete: ") + safe_path.string();
                 return true;
             } catch (const std::exception& e) {
                 output = "📁 [WorkspaceCoder] Delete error: " + std::string(e.what());
@@ -269,17 +301,18 @@ public:
         }
 
         if (action == "list_directory" || action == "list_files") {
-            std::string target_dir = payload.empty() ? "." : payload;
-            if (!std::filesystem::exists(target_dir)) {
-                output = "📁 [WorkspaceCoder] Directory not found: " + target_dir;
+            std::string req_dir = payload.empty() ? "." : payload;
+            std::filesystem::path safe_dir;
+            if (!resolve_workspace_path(req_dir, safe_dir, true) || !std::filesystem::exists(safe_dir)) {
+                output = "📁 [WorkspaceCoder] Blocked or not found: Directory listing is confined to the active workspace.";
                 return true;
             }
 
             std::stringstream ss;
-            ss << "📁 Directory Listing [" << target_dir << "]:\n";
+            ss << "📁 Directory Listing [" << safe_dir.string() << "]:\n";
             int count = 0;
             try {
-                for (const auto& entry : std::filesystem::directory_iterator(target_dir)) {
+                for (const auto& entry : std::filesystem::directory_iterator(safe_dir)) {
                     if (count++ > 50) {
                         ss << "   ... and more items\n";
                         break;
@@ -346,13 +379,14 @@ public:
         }
 
         if (action == "file_info") {
-            if (!std::filesystem::exists(payload)) {
-                output = "📁 [WorkspaceCoder] Target not found: " + payload;
+            std::filesystem::path safe_path;
+            if (!resolve_workspace_path(payload, safe_path, true) || !std::filesystem::exists(safe_path)) {
+                output = "📁 [WorkspaceCoder] Blocked or target not found inside workspace.";
                 return true;
             }
-            auto sz = std::filesystem::is_regular_file(payload) ? std::filesystem::file_size(payload) : 0;
-            output = "📁 Target Info: " + payload + " | Size: " + std::to_string(sz) + " bytes | Type: " + 
-                     (std::filesystem::is_directory(payload) ? "Directory" : "File");
+            auto sz = std::filesystem::is_regular_file(safe_path) ? std::filesystem::file_size(safe_path) : 0;
+            output = "📁 Target Info: " + safe_path.string() + " | Size: " + std::to_string(sz) + " bytes | Type: " + 
+                     (std::filesystem::is_directory(safe_path) ? "Directory" : "File");
             return true;
         }
 

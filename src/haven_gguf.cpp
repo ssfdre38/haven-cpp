@@ -1,6 +1,7 @@
 #include "haven/haven_gguf.h"
 #include <iostream>
 #include <cstring>
+#include <limits>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -30,13 +31,18 @@ bool GgufLoader::load_file(const std::string& filepath) {
     }
 
     LARGE_INTEGER size;
-    GetFileSizeEx(hFile, &size);
-    file_size_ = (size_t)size.QuadPart;
+    if (!GetFileSizeEx(hFile, &size) || size.QuadPart <= 0) {
+        CloseHandle(hFile);
+        std::cerr << "Invalid or empty GGUF file: " << filepath << "\n";
+        return false;
+    }
+    file_size_ = static_cast<size_t>(size.QuadPart);
 
     HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
     CloseHandle(hFile);
 
     if (!hMap) {
+        file_size_ = 0;
         std::cerr << "Failed to create file mapping for: " << filepath << "\n";
         return false;
     }
@@ -44,6 +50,7 @@ bool GgufLoader::load_file(const std::string& filepath) {
     mmap_handle_ = hMap;
     mmap_data_ = reinterpret_cast<const uint8_t*>(MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0));
     if (!mmap_data_) {
+        close();
         std::cerr << "Failed to map view of file: " << filepath << "\n";
         return false;
     }
@@ -51,14 +58,23 @@ bool GgufLoader::load_file(const std::string& filepath) {
     int fd = open(filepath.c_str(), O_RDONLY);
     if (fd < 0) return false;
     struct stat sb;
-    fstat(fd, &sb);
-    file_size_ = sb.st_size;
-    mmap_data_ = (const uint8_t*)mmap(NULL, file_size_, PROT_READ, MAP_SHARED, fd, 0);
+    if (fstat(fd, &sb) != 0 || sb.st_size <= 0) {
+        ::close(fd);
+        return false;
+    }
+    file_size_ = static_cast<size_t>(sb.st_size);
+    void* mapped = mmap(NULL, file_size_, PROT_READ, MAP_SHARED, fd, 0);
     ::close(fd);
+    if (mapped == MAP_FAILED || mapped == nullptr) {
+        file_size_ = 0;
+        return false;
+    }
+    mmap_data_ = static_cast<const uint8_t*>(mapped);
 #endif
 
     if (!parse_header()) {
         std::cerr << "Invalid GGUF header.\n";
+        close();
         return false;
     }
 
@@ -86,179 +102,266 @@ void GgufLoader::close() {
     file_size_ = 0;
 }
 
-static std::string read_gguf_string(const uint8_t*& ptr, const uint8_t* end) {
-    if (ptr + 8 > end) return "";
-    uint64_t len = *reinterpret_cast<const uint64_t*>(ptr);
+static bool has_bytes(const uint8_t* ptr, const uint8_t* end, uint64_t needed) {
+    if (ptr > end) return false;
+    return needed <= static_cast<uint64_t>(end - ptr);
+}
+
+static std::string read_gguf_string(const uint8_t*& ptr, const uint8_t* end, bool& ok) {
+    if (!has_bytes(ptr, end, 8)) {
+        ptr = end;
+        ok = false;
+        return "";
+    }
+    uint64_t len = 0;
+    std::memcpy(&len, ptr, sizeof(len));
     ptr += 8;
-    if (ptr + len > end) return "";
-    std::string s(reinterpret_cast<const char*>(ptr), len);
+    constexpr uint64_t MAX_GGUF_STR_LEN = 64ULL * 1024 * 1024;
+    if (len > MAX_GGUF_STR_LEN || !has_bytes(ptr, end, len)) {
+        ptr = end;
+        ok = false;
+        return "";
+    }
+    std::string s(reinterpret_cast<const char*>(ptr), static_cast<size_t>(len));
     ptr += len;
     return s;
 }
 
-static void skip_gguf_value(uint32_t val_type, const uint8_t*& ptr, const uint8_t* end) {
-    if (val_type == 0 || val_type == 1 || val_type == 7) ptr += 1;
-    else if (val_type == 2 || val_type == 3) ptr += 2;
-    else if (val_type == 4 || val_type == 5 || val_type == 6) ptr += 4;
-    else if (val_type == 10 || val_type == 11 || val_type == 12) ptr += 8;
-    else if (val_type == 8) { // string
-        if (ptr + 8 <= end) {
-            uint64_t slen = *reinterpret_cast<const uint64_t*>(ptr);
-            ptr += 8 + slen;
-        }
+static bool skip_gguf_value(uint32_t val_type, const uint8_t*& ptr, const uint8_t* end, int depth = 0) {
+    if (depth > 16 || ptr > end) {
+        ptr = end;
+        return false;
     }
-    else if (val_type == 9) { // array
-        if (ptr + 12 <= end) {
-            uint32_t arr_type = *reinterpret_cast<const uint32_t*>(ptr);
-            uint64_t arr_len = *reinterpret_cast<const uint64_t*>(ptr + 4);
-            ptr += 12;
-            if (arr_type == 0 || arr_type == 1 || arr_type == 7) {
-                ptr += arr_len * 1;
-            } else if (arr_type == 2 || arr_type == 3) {
-                ptr += arr_len * 2;
-            } else if (arr_type == 4 || arr_type == 5 || arr_type == 6) {
-                ptr += arr_len * 4;
-            } else if (arr_type == 10 || arr_type == 11 || arr_type == 12) {
-                ptr += arr_len * 8;
-            } else if (arr_type == 8) { // array of strings (e.g. tokenizer merges)
-                for (uint64_t i = 0; i < arr_len && ptr + 8 <= end; ++i) {
-                    uint64_t slen = *reinterpret_cast<const uint64_t*>(ptr);
-                    ptr += 8 + slen;
-                }
-            } else {
-                for (uint64_t i = 0; i < arr_len && ptr < end; ++i) {
-                    skip_gguf_value(arr_type, ptr, end);
-                }
+    auto advance = [&](uint64_t n) -> bool {
+        if (!has_bytes(ptr, end, n)) {
+            ptr = end;
+            return false;
+        }
+        ptr += n;
+        return true;
+    };
+
+    if (val_type == 0 || val_type == 1 || val_type == 7) return advance(1);
+    if (val_type == 2 || val_type == 3) return advance(2);
+    if (val_type == 4 || val_type == 5 || val_type == 6) return advance(4);
+    if (val_type == 10 || val_type == 11 || val_type == 12) return advance(8);
+    if (val_type == 8) { // string
+        if (!has_bytes(ptr, end, 8)) { ptr = end; return false; }
+        uint64_t slen = 0;
+        std::memcpy(&slen, ptr, sizeof(slen));
+        ptr += 8;
+        return advance(slen);
+    }
+    if (val_type == 9) { // array
+        if (!has_bytes(ptr, end, 12)) { ptr = end; return false; }
+        uint32_t arr_type = 0;
+        uint64_t arr_len = 0;
+        std::memcpy(&arr_type, ptr, sizeof(arr_type));
+        std::memcpy(&arr_len, ptr + 4, sizeof(arr_len));
+        ptr += 12;
+
+        uint64_t elem_size = 0;
+        if (arr_type == 0 || arr_type == 1 || arr_type == 7) elem_size = 1;
+        else if (arr_type == 2 || arr_type == 3) elem_size = 2;
+        else if (arr_type == 4 || arr_type == 5 || arr_type == 6) elem_size = 4;
+        else if (arr_type == 10 || arr_type == 11 || arr_type == 12) elem_size = 8;
+
+        if (elem_size > 0) {
+            uint64_t avail = static_cast<uint64_t>(end - ptr);
+            if (arr_len > avail / elem_size) {
+                ptr = end;
+                return false;
             }
+            ptr += arr_len * elem_size;
+            return true;
         }
+        if (arr_type == 8) {
+            for (uint64_t i = 0; i < arr_len; ++i) {
+                if (!has_bytes(ptr, end, 8)) { ptr = end; return false; }
+                uint64_t slen = 0;
+                std::memcpy(&slen, ptr, sizeof(slen));
+                ptr += 8;
+                if (!advance(slen)) return false;
+            }
+            return true;
+        }
+        for (uint64_t i = 0; i < arr_len; ++i) {
+            if (!skip_gguf_value(arr_type, ptr, end, depth + 1)) return false;
+        }
+        return true;
     }
+
+    // Unknown type: abort parse safely
+    ptr = end;
+    return false;
 }
 
 bool GgufLoader::parse_header() {
-    if (file_size_ < 24) return false;
+    if (!mmap_data_ || file_size_ < 24) return false;
 
     // Check GGUF Magic: "GGUF" in ASCII (0x46554747)
-    uint32_t magic = *reinterpret_cast<const uint32_t*>(mmap_data_);
+    uint32_t magic = 0;
+    std::memcpy(&magic, mmap_data_, sizeof(magic));
     if (magic != 0x46554747) {
-        std::cerr << "Magic header mismatch: " << std::hex << magic << "\n";
+        std::cerr << "Magic header mismatch: " << std::hex << magic << std::dec << "\n";
         return false;
     }
 
-    [[maybe_unused]] uint32_t version = *reinterpret_cast<const uint32_t*>(mmap_data_ + 4);
-    uint64_t tensor_count = *reinterpret_cast<const uint64_t*>(mmap_data_ + 8);
-    uint64_t kv_count = *reinterpret_cast<const uint64_t*>(mmap_data_ + 16);
+    uint32_t version = 0;
+    uint64_t tensor_count = 0;
+    uint64_t kv_count = 0;
+    std::memcpy(&version, mmap_data_ + 4, sizeof(version));
+    std::memcpy(&tensor_count, mmap_data_ + 8, sizeof(tensor_count));
+    std::memcpy(&kv_count, mmap_data_ + 16, sizeof(kv_count));
+    (void)version;
+
+    constexpr uint64_t MAX_GGUF_KV = 1000000ULL;
+    constexpr uint64_t MAX_GGUF_TENSORS = 1000000ULL;
+    if (kv_count > MAX_GGUF_KV || tensor_count > MAX_GGUF_TENSORS) {
+        std::cerr << "⛔ GGUF metadata or tensor count exceeds safe bounds\n";
+        return false;
+    }
 
     const uint8_t* ptr = mmap_data_ + 24;
     const uint8_t* end = mmap_data_ + file_size_;
 
     uint32_t alignment = 32;
 
-    // Parse Metadata Key-Value pairs
     auto ends_with = [](const std::string& str, const std::string& suffix) -> bool {
         if (str.length() < suffix.length()) return false;
         return str.compare(str.length() - suffix.length(), suffix.length(), suffix) == 0;
     };
 
-    auto read_float_val = [](uint32_t val_type, const uint8_t*& p, const uint8_t* e) -> float {
-        if (val_type == 6 && p + 4 <= e) {
-            float v = *reinterpret_cast<const float*>(p);
-            p += 4;
-            return v;
-        } else if (val_type == 12 && p + 8 <= e) {
-            double v = *reinterpret_cast<const double*>(p);
-            p += 8;
-            return static_cast<float>(v);
-        } else if (val_type == 4 && p + 4 <= e) {
-            uint32_t v = *reinterpret_cast<const uint32_t*>(p);
-            p += 4;
-            return static_cast<float>(v);
+    auto read_uint_val = [&](uint32_t val_type, uint32_t& out) -> bool {
+        if (val_type == 4 && has_bytes(ptr, end, 4)) {
+            uint32_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            ptr += 4;
+            out = v;
+            return true;
         }
-        return 0.0f;
+        if (val_type == 10 && has_bytes(ptr, end, 8)) {
+            uint64_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            ptr += 8;
+            out = static_cast<uint32_t>(v);
+            return true;
+        }
+        return false;
     };
 
-    for (uint64_t i = 0; i < kv_count && ptr < end; ++i) {
-        std::string key = read_gguf_string(ptr, end);
-        if (ptr + 4 > end) break;
-        uint32_t val_type = *reinterpret_cast<const uint32_t*>(ptr);
+    auto read_float_val = [&](uint32_t val_type, float& out) -> bool {
+        if (val_type == 6 && has_bytes(ptr, end, 4)) {
+            float v = 0.0f;
+            std::memcpy(&v, ptr, sizeof(v));
+            ptr += 4;
+            out = v;
+            return true;
+        }
+        if (val_type == 12 && has_bytes(ptr, end, 8)) {
+            double v = 0.0;
+            std::memcpy(&v, ptr, sizeof(v));
+            ptr += 8;
+            out = static_cast<float>(v);
+            return true;
+        }
+        if (val_type == 4 && has_bytes(ptr, end, 4)) {
+            uint32_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            ptr += 4;
+            out = static_cast<float>(v);
+            return true;
+        }
+        return skip_gguf_value(val_type, ptr, end);
+    };
+
+    for (uint64_t i = 0; i < kv_count; ++i) {
+        bool str_ok = true;
+        std::string key = read_gguf_string(ptr, end, str_ok);
+        if (!str_ok || !has_bytes(ptr, end, 4)) return false;
+
+        uint32_t val_type = 0;
+        std::memcpy(&val_type, ptr, sizeof(val_type));
         ptr += 4;
 
         if (key == "general.architecture" && val_type == 8) {
-            config_.architecture = read_gguf_string(ptr, end);
+            config_.architecture = read_gguf_string(ptr, end, str_ok);
+            if (!str_ok) return false;
         }
         else if (key == "general.alignment" && val_type == 4) {
-            alignment = *reinterpret_cast<const uint32_t*>(ptr);
-            if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
-                alignment = 32;
-            }
-            ptr += 4;
+            uint32_t al = 32;
+            if (!read_uint_val(val_type, al)) return false;
+            if (al == 0 || (al & (al - 1)) != 0 || al > 4096) al = 32;
+            alignment = al;
         }
         else if (ends_with(key, ".context_length") && (val_type == 4 || val_type == 10)) {
-            config_.max_context_length = (val_type == 4) ? *reinterpret_cast<const uint32_t*>(ptr) : (uint32_t)(*reinterpret_cast<const uint64_t*>(ptr));
-            ptr += (val_type == 4 ? 4 : 8);
+            if (!read_uint_val(val_type, config_.max_context_length)) return false;
         }
         else if (ends_with(key, ".embedding_length") && (val_type == 4 || val_type == 10)) {
-            config_.embedding_dim = (val_type == 4) ? *reinterpret_cast<const uint32_t*>(ptr) : (uint32_t)(*reinterpret_cast<const uint64_t*>(ptr));
-            ptr += (val_type == 4 ? 4 : 8);
+            if (!read_uint_val(val_type, config_.embedding_dim)) return false;
         }
         else if (ends_with(key, ".feed_forward_length") && (val_type == 4 || val_type == 10)) {
-            config_.hidden_dim = (val_type == 4) ? *reinterpret_cast<const uint32_t*>(ptr) : (uint32_t)(*reinterpret_cast<const uint64_t*>(ptr));
-            ptr += (val_type == 4 ? 4 : 8);
+            if (!read_uint_val(val_type, config_.hidden_dim)) return false;
         }
         else if (ends_with(key, ".block_count") && (val_type == 4 || val_type == 10)) {
-            config_.num_layers = (val_type == 4) ? *reinterpret_cast<const uint32_t*>(ptr) : (uint32_t)(*reinterpret_cast<const uint64_t*>(ptr));
-            ptr += (val_type == 4 ? 4 : 8);
+            if (!read_uint_val(val_type, config_.num_layers)) return false;
         }
         else if (ends_with(key, ".attention.head_count") && (val_type == 4 || val_type == 10)) {
-            config_.num_heads = (val_type == 4) ? *reinterpret_cast<const uint32_t*>(ptr) : (uint32_t)(*reinterpret_cast<const uint64_t*>(ptr));
-            ptr += (val_type == 4 ? 4 : 8);
+            if (!read_uint_val(val_type, config_.num_heads)) return false;
         }
         else if (ends_with(key, ".attention.head_count_kv") && (val_type == 4 || val_type == 10)) {
-            config_.num_kv_heads = (val_type == 4) ? *reinterpret_cast<const uint32_t*>(ptr) : (uint32_t)(*reinterpret_cast<const uint64_t*>(ptr));
-            ptr += (val_type == 4 ? 4 : 8);
+            if (!read_uint_val(val_type, config_.num_kv_heads)) return false;
         }
         else if (ends_with(key, ".attention.key_length") && (val_type == 4 || val_type == 10)) {
-            config_.head_dim = (val_type == 4) ? *reinterpret_cast<const uint32_t*>(ptr) : (uint32_t)(*reinterpret_cast<const uint64_t*>(ptr));
-            ptr += (val_type == 4 ? 4 : 8);
+            if (!read_uint_val(val_type, config_.head_dim)) return false;
         }
         else if (ends_with(key, ".attention.sliding_window") && (val_type == 4 || val_type == 10)) {
-            config_.sliding_window = (val_type == 4) ? *reinterpret_cast<const uint32_t*>(ptr) : (uint32_t)(*reinterpret_cast<const uint64_t*>(ptr));
-            ptr += (val_type == 4 ? 4 : 8);
+            if (!read_uint_val(val_type, config_.sliding_window)) return false;
         }
         else if (ends_with(key, ".attention.layer_norm_rms_epsilon")) {
-            config_.rms_norm_eps = read_float_val(val_type, ptr, end);
+            if (!read_float_val(val_type, config_.rms_norm_eps)) return false;
         }
         else if (ends_with(key, ".rope.freq_base_swa")) {
-            config_.rope_freq_base_swa = read_float_val(val_type, ptr, end);
+            if (!read_float_val(val_type, config_.rope_freq_base_swa)) return false;
         }
         else if (ends_with(key, ".rope.freq_base")) {
-            config_.rope_freq_base = read_float_val(val_type, ptr, end);
+            if (!read_float_val(val_type, config_.rope_freq_base)) return false;
         }
         else if (ends_with(key, ".rope.dimension_count_swa") && (val_type == 4 || val_type == 10)) {
-            config_.rope_dimension_count_swa = (val_type == 4) ? *reinterpret_cast<const uint32_t*>(ptr) : (uint32_t)(*reinterpret_cast<const uint64_t*>(ptr));
-            ptr += (val_type == 4 ? 4 : 8);
+            if (!read_uint_val(val_type, config_.rope_dimension_count_swa)) return false;
         }
         else if (ends_with(key, ".rope.dimension_count") && (val_type == 4 || val_type == 10)) {
-            config_.rope_dimension_count = (val_type == 4) ? *reinterpret_cast<const uint32_t*>(ptr) : (uint32_t)(*reinterpret_cast<const uint64_t*>(ptr));
-            ptr += (val_type == 4 ? 4 : 8);
+            if (!read_uint_val(val_type, config_.rope_dimension_count)) return false;
         }
         else if (ends_with(key, ".final_logit_softcapping")) {
-            config_.final_logit_softcapping = read_float_val(val_type, ptr, end);
+            if (!read_float_val(val_type, config_.final_logit_softcapping)) return false;
         }
         else if (ends_with(key, ".attn_logit_softcapping")) {
-            config_.attn_logit_softcapping = read_float_val(val_type, ptr, end);
+            if (!read_float_val(val_type, config_.attn_logit_softcapping)) return false;
         }
         else if (key == "tokenizer.ggml.tokens" && val_type == 9) {
-            [[maybe_unused]] uint32_t arr_type = *reinterpret_cast<const uint32_t*>(ptr);
-            uint64_t arr_len = *reinterpret_cast<const uint64_t*>(ptr + 4);
+            if (!has_bytes(ptr, end, 12)) return false;
+            uint32_t arr_type = 0;
+            uint64_t arr_len = 0;
+            std::memcpy(&arr_type, ptr, sizeof(arr_type));
+            std::memcpy(&arr_len, ptr + 4, sizeof(arr_len));
             ptr += 12;
-            config_.vocab_size = (uint32_t)arr_len;
-            vocab_.reserve(arr_len);
-            for (uint64_t t = 0; t < arr_len && ptr < end; ++t) {
-                vocab_.push_back(read_gguf_string(ptr, end));
+            constexpr uint64_t MAX_VOCAB_SIZE = 2000000ULL;
+            if (arr_type != 8 || arr_len > MAX_VOCAB_SIZE) {
+                std::cerr << "⛔ Invalid GGUF vocabulary array type or size\n";
+                return false;
+            }
+            config_.vocab_size = static_cast<uint32_t>(arr_len);
+            vocab_.clear();
+            vocab_.reserve(static_cast<size_t>(arr_len));
+            for (uint64_t t = 0; t < arr_len; ++t) {
+                std::string tok = read_gguf_string(ptr, end, str_ok);
+                if (!str_ok) return false;
+                vocab_.push_back(std::move(tok));
             }
         }
         else {
-            skip_gguf_value(val_type, ptr, end);
+            if (!skip_gguf_value(val_type, ptr, end)) return false;
         }
     }
 
@@ -286,81 +389,119 @@ bool GgufLoader::parse_header() {
 
     // Parse Tensor Info Headers
     std::vector<std::pair<std::string, TensorDesc>> parsed_tensors;
-    parsed_tensors.reserve(tensor_count);
+    parsed_tensors.reserve(static_cast<size_t>(tensor_count));
 
-    for (uint64_t i = 0; i < tensor_count && ptr < end; ++i) {
-        std::string name = read_gguf_string(ptr, end);
-        if (ptr + 4 > end) break;
-        uint32_t n_dims = *reinterpret_cast<const uint32_t*>(ptr);
+    for (uint64_t i = 0; i < tensor_count; ++i) {
+        bool str_ok = true;
+        std::string name = read_gguf_string(ptr, end, str_ok);
+        if (!str_ok || !has_bytes(ptr, end, 4)) return false;
+
+        uint32_t n_dims = 0;
+        std::memcpy(&n_dims, ptr, sizeof(n_dims));
         ptr += 4;
+
+        if (n_dims == 0 || n_dims > 8) {
+            std::cerr << "⛔ Invalid tensor dimension count (" << n_dims << ") for: " << name << "\n";
+            return false;
+        }
+
+        uint64_t dims_and_meta_bytes = static_cast<uint64_t>(n_dims) * 8ULL + 12ULL;
+        if (!has_bytes(ptr, end, dims_and_meta_bytes)) {
+            std::cerr << "⛔ Truncated tensor descriptor for: " << name << "\n";
+            return false;
+        }
 
         TensorDesc desc;
         desc.name = name;
         desc.shape.resize(n_dims);
-        for (uint32_t d = 0; d < n_dims && ptr + 8 <= end; ++d) {
-            desc.shape[d] = *reinterpret_cast<const uint64_t*>(ptr);
+        for (uint32_t d = 0; d < n_dims; ++d) {
+            uint64_t dim_val = 0;
+            std::memcpy(&dim_val, ptr, sizeof(dim_val));
+            desc.shape[d] = dim_val;
             ptr += 8;
         }
 
-        if (ptr + 12 > end) break;
-        desc.type = static_cast<QuantType>(*reinterpret_cast<const uint32_t*>(ptr));
-        desc.offset = *reinterpret_cast<const uint64_t*>(ptr + 4);
+        uint32_t raw_type = 0;
+        uint64_t raw_offset = 0;
+        std::memcpy(&raw_type, ptr, sizeof(raw_type));
+        std::memcpy(&raw_offset, ptr + 4, sizeof(raw_offset));
+        desc.type = static_cast<QuantType>(raw_type);
+        desc.offset = raw_offset;
         ptr += 12;
 
-        parsed_tensors.push_back({name, desc});
+        parsed_tensors.push_back({std::move(name), std::move(desc)});
     }
 
     // Calculate Data Offset (aligned to alignment boundary)
     if (alignment == 0) alignment = 32;
     uint64_t current_pos = static_cast<uint64_t>(ptr - mmap_data_);
-    uint64_t data_start = (current_pos + alignment - 1) & ~(static_cast<uint64_t>(alignment - 1));
+    uint64_t align_mask = static_cast<uint64_t>(alignment - 1);
+    if (current_pos > std::numeric_limits<uint64_t>::max() - align_mask) return false;
+    uint64_t data_start = (current_pos + align_mask) & ~align_mask;
 
-    if (data_start > file_size_) {
+    if (!parsed_tensors.empty() && data_start > file_size_) {
         std::cerr << "⛔ Data start offset exceeds mapped file size\n";
         return false;
     }
 
-    auto get_tensor_data_size = [](QuantType type, const std::vector<uint64_t>& shape) -> size_t {
+    auto get_tensor_data_size = [](QuantType type, const std::vector<uint64_t>& shape) -> uint64_t {
         if (shape.empty()) return 0;
         uint64_t n_elems = 1;
         for (uint64_t dim : shape) {
             if (dim == 0) return 0;
+            if (dim > std::numeric_limits<uint64_t>::max() / n_elems) return 0;
             n_elems *= dim;
         }
+
+        auto safe_block_bytes = [](uint64_t elems, uint64_t block_elems, uint64_t block_bytes) -> uint64_t {
+            if (elems > std::numeric_limits<uint64_t>::max() - (block_elems - 1)) return 0;
+            uint64_t blocks = (elems + block_elems - 1) / block_elems;
+            if (blocks > std::numeric_limits<uint64_t>::max() / block_bytes) return 0;
+            return blocks * block_bytes;
+        };
+
         switch (type) {
-            case QuantType::F32:  return static_cast<size_t>(n_elems * 4);
+            case QuantType::F32:  return safe_block_bytes(n_elems, 1, 4);
             case QuantType::F16:
-            case QuantType::BF16: return static_cast<size_t>(n_elems * 2);
-            case QuantType::Q8_0: return static_cast<size_t>((n_elems + 31) / 32 * sizeof(block_q8_0));
-            case QuantType::Q4_0: return static_cast<size_t>((n_elems + 31) / 32 * sizeof(block_q4_0));
-            case QuantType::Q5_0: return static_cast<size_t>((n_elems + 31) / 32 * sizeof(block_q5_0));
-            case QuantType::Q4_K: return static_cast<size_t>((n_elems + 255) / 256 * sizeof(block_q4_K));
-            case QuantType::Q5_K: return static_cast<size_t>((n_elems + 255) / 256 * sizeof(block_q5_K));
-            case QuantType::Q6_K: return static_cast<size_t>((n_elems + 255) / 256 * sizeof(block_q6_K));
-            case QuantType::I8:   return static_cast<size_t>(n_elems);
-            case QuantType::I16:  return static_cast<size_t>(n_elems * 2);
-            case QuantType::I32:  return static_cast<size_t>(n_elems * 4);
+            case QuantType::BF16: return safe_block_bytes(n_elems, 1, 2);
+            case QuantType::Q4_0: return safe_block_bytes(n_elems, 32, sizeof(block_q4_0));
+            case QuantType::Q4_1: return safe_block_bytes(n_elems, 32, 20);
+            case QuantType::Q5_0: return safe_block_bytes(n_elems, 32, sizeof(block_q5_0));
+            case QuantType::Q5_1: return safe_block_bytes(n_elems, 32, 24);
+            case QuantType::Q8_0: return safe_block_bytes(n_elems, 32, sizeof(block_q8_0));
+            case QuantType::Q8_1: return safe_block_bytes(n_elems, 32, 36);
+            case QuantType::Q2_K: return safe_block_bytes(n_elems, 256, 84);
+            case QuantType::Q3_K: return safe_block_bytes(n_elems, 256, sizeof(block_q3_K));
+            case QuantType::Q4_K: return safe_block_bytes(n_elems, 256, sizeof(block_q4_K));
+            case QuantType::Q5_K: return safe_block_bytes(n_elems, 256, sizeof(block_q5_K));
+            case QuantType::Q6_K: return safe_block_bytes(n_elems, 256, sizeof(block_q6_K));
+            case QuantType::Q8_K: return safe_block_bytes(n_elems, 256, 292);
+            case QuantType::I8:   return safe_block_bytes(n_elems, 1, 1);
+            case QuantType::I16:  return safe_block_bytes(n_elems, 1, 2);
+            case QuantType::I32:  return safe_block_bytes(n_elems, 1, 4);
             case QuantType::I64:
-            case QuantType::F64:  return static_cast<size_t>(n_elems * 8);
-            default: return static_cast<size_t>(n_elems);
+            case QuantType::F64:  return safe_block_bytes(n_elems, 1, 8);
+            default: return safe_block_bytes(n_elems, 1, 1);
         }
     };
 
     for (auto& item : parsed_tensors) {
         TensorDesc& desc = item.second;
-        desc.size_bytes = get_tensor_data_size(desc.type, desc.shape);
-        if (desc.offset > file_size_ ||
+        uint64_t expected_bytes = get_tensor_data_size(desc.type, desc.shape);
+        if (expected_bytes == 0 ||
+            desc.offset > file_size_ ||
             data_start > file_size_ - desc.offset ||
-            desc.size_bytes > file_size_ - (data_start + desc.offset)) 
+            expected_bytes > file_size_ - (data_start + desc.offset))
         {
             std::cerr << "⛔ Corrupted tensor offset/size for: " << desc.name << "\n";
             return false;
         }
+        desc.size_bytes = static_cast<size_t>(expected_bytes);
         desc.data = mmap_data_ + data_start + desc.offset;
         tensors_[item.first] = desc;
     }
 
-    std::cout << "   ✓ GGUF Loaded: Architecture [" << config_.architecture << "] (" 
+    std::cout << "   ✓ GGUF Loaded: Architecture [" << config_.architecture << "] ("
               << config_.num_layers << " layers, " << config_.embedding_dim << " hidden, "
               << config_.vocab_size << " vocab, " << tensors_.size() << " tensors mapped)\n";
 

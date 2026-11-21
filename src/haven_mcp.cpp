@@ -46,6 +46,40 @@ static std::string mcp_unescape_json(const std::string& s) {
     return out;
 }
 
+static bool is_unescaped_quote(const std::string& s, size_t idx) {
+    if (idx >= s.length() || s[idx] != '"') return false;
+    size_t backslashes = 0;
+    size_t j = idx;
+    while (j > 0 && s[j - 1] == '\\') {
+        backslashes++;
+        j--;
+    }
+    return (backslashes % 2) == 0;
+}
+
+static bool is_balanced_json_object(const std::string& s) {
+    if (s.size() < 2 || s.front() != '{' || s.back() != '}') return false;
+    int depth = 0;
+    bool in_str = false;
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (c == '\r' || c == '\n') return false;
+        if (in_str) {
+            if (c == '\\') { ++i; continue; }
+            if (c == '"') in_str = false;
+        } else {
+            if (c == '"') in_str = true;
+            else if (c == '{') depth++;
+            else if (c == '}') {
+                depth--;
+                if (depth < 0) return false;
+                if (depth == 0 && i + 1 < s.size()) return false;
+            }
+        }
+    }
+    return !in_str && depth == 0;
+}
+
 static std::string mcp_extract_json_field(const std::string& json, const std::string& key) {
     std::string pattern = "\"" + key + "\":";
     size_t pos = json.find(pattern);
@@ -57,7 +91,7 @@ static std::string mcp_extract_json_field(const std::string& json, const std::st
     if (json[start] == '"') {
         size_t end = start + 1;
         while (end < json.length()) {
-            if (json[end] == '"' && json[end - 1] != '\\') break;
+            if (is_unescaped_quote(json, end)) break;
             end++;
         }
         return mcp_unescape_json(json.substr(start + 1, end - start - 1));
@@ -102,7 +136,7 @@ McpProcessBridge::~McpProcessBridge() {
 }
 
 bool McpProcessBridge::start() {
-    std::lock_guard<std::mutex> lock(io_mutex_);
+    std::lock_guard<std::recursive_mutex> lock(io_mutex_);
     if (is_running_) return true;
 
 #ifdef _WIN32
@@ -153,10 +187,12 @@ bool McpProcessBridge::start() {
 
     const char* workdir = config_.cwd.empty() ? nullptr : config_.cwd.c_str();
 
-    // Create child process
+    // Create child process using writable command-line buffer per Win32 CreateProcessA contract
+    std::vector<char> cmd_buf(cmdline.begin(), cmdline.end());
+    cmd_buf.push_back('\0');
     BOOL success = CreateProcessA(
         NULL,
-        const_cast<char*>(cmdline.c_str()),
+        cmd_buf.data(),
         NULL,
         NULL,
         TRUE,
@@ -216,7 +252,7 @@ bool McpProcessBridge::start() {
 }
 
 void McpProcessBridge::stop() {
-    std::lock_guard<std::mutex> lock(io_mutex_);
+    std::lock_guard<std::recursive_mutex> lock(io_mutex_);
     if (!is_running_) return;
 
 #ifdef _WIN32
@@ -293,6 +329,11 @@ bool McpProcessBridge::read_json_line(std::string& out_line, int timeout_ms) {
             DWORD bytes_read = 0;
             if (ReadFile(h_child_stdout_rd_, chunk, sizeof(chunk) - 1, &bytes_read, NULL) && bytes_read > 0) {
                 chunk[bytes_read] = '\0';
+                constexpr size_t MAX_MCP_READ_BUFFER = 8ULL * 1024 * 1024;
+                if (read_buffer_.size() + bytes_read > MAX_MCP_READ_BUFFER) {
+                    read_buffer_.clear();
+                    return false;
+                }
                 read_buffer_.append(chunk, bytes_read);
                 continue;
             }
@@ -316,7 +357,12 @@ bool McpProcessBridge::read_json_line(std::string& out_line, int timeout_ms) {
             ssize_t r = read(stdout_fd_, chunk, sizeof(chunk) - 1);
             if (r > 0) {
                 chunk[r] = '\0';
-                read_buffer_.append(chunk, r);
+                constexpr size_t MAX_MCP_READ_BUFFER = 8ULL * 1024 * 1024;
+                if (read_buffer_.size() + static_cast<size_t>(r) > MAX_MCP_READ_BUFFER) {
+                    read_buffer_.clear();
+                    return false;
+                }
+                read_buffer_.append(chunk, static_cast<size_t>(r));
                 continue;
             } else if (r <= 0) {
                 is_running_ = false;
@@ -330,6 +376,7 @@ bool McpProcessBridge::read_json_line(std::string& out_line, int timeout_ms) {
 }
 
 bool McpProcessBridge::perform_handshake(int timeout_ms) {
+    std::lock_guard<std::recursive_mutex> lock(io_mutex_);
     if (!start()) return false;
 
     // 1. Send MCP initialize request
@@ -366,6 +413,7 @@ bool McpProcessBridge::perform_handshake(int timeout_ms) {
 }
 
 bool McpProcessBridge::discover_tools(std::vector<McpToolInfo>& out_tools, int timeout_ms) {
+    std::lock_guard<std::recursive_mutex> lock(io_mutex_);
     if (!is_initialized_) {
         if (!perform_handshake(timeout_ms)) return false;
     }
@@ -429,7 +477,7 @@ bool McpProcessBridge::discover_tools(std::vector<McpToolInfo>& out_tools, int t
         }
 
         cur = obj_end;
-        if (resp[cur] == ']') break;
+        if (cur >= resp.length() || resp[cur] == ']') break;
     }
 
     std::cout << "📦 [MCP:" << config_.name << "] Registered " << out_tools.size() << " tools from server.\n";
@@ -437,18 +485,23 @@ bool McpProcessBridge::discover_tools(std::vector<McpToolInfo>& out_tools, int t
 }
 
 bool McpProcessBridge::call_tool(const std::string& tool_name, const std::string& arguments_json, std::string& out_text, int timeout_ms) {
+    std::lock_guard<std::recursive_mutex> lock(io_mutex_);
     if (!is_initialized_) {
         if (!perform_handshake()) return false;
     }
 
     int call_id = next_req_id_++;
     std::string args_payload = arguments_json;
-    if (args_payload.empty() || args_payload.front() != '{') {
-        if (!args_payload.empty()) {
-            args_payload = "{\"input\":\"" + mcp_escape_json(args_payload) + "\"}";
-        } else {
-            args_payload = "{}";
-        }
+    // Trim whitespace for JSON object validation
+    size_t af = args_payload.find_first_not_of(" \t\r\n");
+    size_t al = args_payload.find_last_not_of(" \t\r\n");
+    std::string trimmed = (af != std::string::npos && al != std::string::npos) ? args_payload.substr(af, al - af + 1) : "";
+    if (!trimmed.empty() && is_balanced_json_object(trimmed)) {
+        args_payload = trimmed;
+    } else if (!args_payload.empty()) {
+        args_payload = "{\"input\":\"" + mcp_escape_json(args_payload) + "\"}";
+    } else {
+        args_payload = "{}";
     }
 
     std::string call_req = "{\"jsonrpc\":\"2.0\",\"id\":" + std::to_string(call_id) +
@@ -494,7 +547,7 @@ bool McpProcessBridge::call_tool(const std::string& tool_name, const std::string
             if (val_start == std::string::npos) break;
             size_t val_end = val_start + 1;
             while (val_end < resp.length()) {
-                if (resp[val_end] == '"' && resp[val_end - 1] != '\\') break;
+                if (is_unescaped_quote(resp, val_end)) break;
                 val_end++;
             }
             if (!full_extracted.empty()) full_extracted += "\n";
@@ -619,7 +672,7 @@ bool McpManager::load_config(const std::string& config_path) {
         }
 
         cur = obj_end;
-        if (content[cur] == '}') break;
+        if (cur >= content.length() || content[cur] == '}') break;
     }
 
     std::cout << "✨ [MCP Subsystem] Loaded " << servers_.size() << " MCP servers with " 

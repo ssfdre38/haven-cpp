@@ -43,6 +43,13 @@ bool HavenEngine::load_model(const std::string& gguf_filepath) {
         return false;
     }
     const auto& cfg = loader_.get_config();
+    if (cfg.embedding_dim == 0 || cfg.hidden_dim == 0 || cfg.num_layers == 0 ||
+        cfg.num_heads == 0 || cfg.num_kv_heads == 0 || cfg.head_dim == 0 ||
+        cfg.vocab_size == 0 || cfg.max_context_length == 0) {
+        std::cerr << "⛔ [HavenEngine] Invalid zero model dimension in GGUF config.\n";
+        return false;
+    }
+
     embedding_scratch_.resize(cfg.embedding_dim, 0.0f);
     norm_scratch_.resize(cfg.embedding_dim, 0.0f);
     q_scratch_.resize(std::max(cfg.embedding_dim, cfg.num_heads * cfg.head_dim), 0.0f);
@@ -53,7 +60,7 @@ bool HavenEngine::load_model(const std::string& gguf_filepath) {
     ffn_up_scratch_.resize(cfg.hidden_dim, 0.0f);
     ffn_down_scratch_.resize(cfg.embedding_dim, 0.0f);
     logits_scratch_.resize(cfg.vocab_size, 0.0f);
-    default_norm_weights_.assign(std::max(cfg.embedding_dim, cfg.hidden_dim), 1.0f);
+    default_norm_weights_.assign(std::max({cfg.embedding_dim, cfg.hidden_dim, cfg.head_dim, 256u}), 1.0f);
     attn_scores_scratch_.resize(std::max(1024u, cfg.max_context_length), 0.0f);
 
     // Cache global tensors
@@ -62,12 +69,6 @@ bool HavenEngine::load_model(const std::string& gguf_filepath) {
     per_layer_model_proj_tensor_ = loader_.get_tensor("per_layer_model_proj.weight");
     per_layer_proj_norm_tensor_  = loader_.get_tensor("per_layer_proj_norm.weight");
 
-    if (per_layer_token_embd_tensor_ && per_layer_token_embd_tensor_->shape.size() > 0) {
-        per_layer_emb_scratch_.resize(per_layer_token_embd_tensor_->shape[0], 0.0f);
-    }
-    if (per_layer_model_proj_tensor_ && per_layer_model_proj_tensor_->shape.size() > 1) {
-        per_layer_proj_scratch_.resize(per_layer_model_proj_tensor_->shape[1], 0.0f);
-    }
     layer_gate_scratch_.resize(cfg.embedding_dim, 0.0f);
 
     output_norm_tensor_ = loader_.get_tensor("output_norm.weight");
@@ -75,8 +76,10 @@ bool HavenEngine::load_model(const std::string& gguf_filepath) {
     output_tensor_ = loader_.get_tensor("output.weight");
     if (!output_tensor_) output_tensor_ = token_embd_tensor_;
 
-    // Cache per-layer tensors
+    // Cache per-layer tensors & determine worst-case Q/KV projection dimensions across all layers
     layers_.resize(cfg.num_layers);
+    uint32_t max_q_dim = cfg.num_heads * cfg.head_dim;
+    uint32_t max_kv_dim = cfg.num_kv_heads * cfg.head_dim;
     for (uint32_t l = 0; l < cfg.num_layers; ++l) {
         std::string prefix = "blk." + std::to_string(l) + ".";
         layers_[l].attn_norm            = loader_.get_tensor(prefix + "attn_norm.weight");
@@ -99,19 +102,32 @@ bool HavenEngine::load_model(const std::string& gguf_filepath) {
         layers_[l].proj                 = loader_.get_tensor(prefix + "proj.weight");
         layers_[l].post_norm            = loader_.get_tensor(prefix + "post_norm.weight");
         layers_[l].layer_output_scale   = loader_.get_tensor(prefix + "layer_output_scale.weight");
+
+        if (layers_[l].attn_q && layers_[l].attn_q->shape.size() > 1) {
+            max_q_dim = std::max(max_q_dim, static_cast<uint32_t>(layers_[l].attn_q->shape[1]));
+        }
+        if (layers_[l].attn_k && layers_[l].attn_k->shape.size() > 1) {
+            max_kv_dim = std::max(max_kv_dim, static_cast<uint32_t>(layers_[l].attn_k->shape[1]));
+        }
+        if (layers_[l].attn_v && layers_[l].attn_v->shape.size() > 1) {
+            max_kv_dim = std::max(max_kv_dim, static_cast<uint32_t>(layers_[l].attn_v->shape[1]));
+        }
     }
 
-    kv_cache_ = DynamicKVCacheManager(cfg.num_layers, cfg.max_context_length, cfg.num_kv_heads, cfg.head_dim, 0.0f, 1.0f);
+    uint32_t max_head_dim = std::max(cfg.head_dim, (cfg.num_heads > 0 ? max_q_dim / cfg.num_heads : cfg.head_dim));
+    uint32_t kv_cache_head_dim = std::max(max_head_dim, (cfg.num_kv_heads > 0 ? (max_kv_dim + cfg.num_kv_heads - 1) / cfg.num_kv_heads : cfg.head_dim));
+    kv_cache_ = DynamicKVCacheManager(cfg.num_layers, cfg.max_context_length, cfg.num_kv_heads, kv_cache_head_dim, 0.0f, 1.0f);
     telemetry_engine_ = AttentionTelemetryEngine(cfg.num_layers, cfg.num_heads);
     tokenizer_.initialize(loader_.get_vocabulary());
+    speculative_engine_.initialize_draft_heads(cfg.embedding_dim);
 
-    // Dynamically resize all scratch buffers to exact model dimensions
-    const int pleias_dim = cfg.num_layers * 256;
+    // Dynamically resize all scratch buffers to exact worst-case model dimensions
+    const size_t pleias_dim = static_cast<size_t>(cfg.num_layers) * 256ULL;
     embedding_scratch_.resize(cfg.embedding_dim, 0.0f);
     norm_scratch_.resize(cfg.embedding_dim, 0.0f);
-    q_scratch_.resize(cfg.num_heads * cfg.head_dim, 0.0f);
-    k_scratch_.resize(cfg.num_kv_heads * cfg.head_dim, 0.0f);
-    v_scratch_.resize(cfg.num_kv_heads * cfg.head_dim, 0.0f);
+    q_scratch_.resize(std::max<size_t>(cfg.embedding_dim, max_q_dim), 0.0f);
+    k_scratch_.resize(std::max<size_t>(cfg.embedding_dim, max_kv_dim), 0.0f);
+    v_scratch_.resize(std::max<size_t>(cfg.embedding_dim, max_kv_dim), 0.0f);
     attn_out_scratch_.resize(cfg.embedding_dim, 0.0f);
     ffn_gate_scratch_.resize(cfg.hidden_dim, 0.0f);
     ffn_up_scratch_.resize(cfg.hidden_dim, 0.0f);
@@ -120,10 +136,11 @@ bool HavenEngine::load_model(const std::string& gguf_filepath) {
     per_layer_emb_scratch_.resize(pleias_dim, 0.0f);
     per_layer_proj_scratch_.resize(pleias_dim, 0.0f);
     pleias_proj_scratch_.resize(cfg.embedding_dim, 0.0f);
-    attn_scores_scratch_.resize(cfg.num_heads * cfg.max_context_length, 0.0f);
-    attn_heads_out_scratch_.resize(cfg.num_heads * cfg.head_dim, 0.0f);
-    attn_indices_scratch_.resize(cfg.max_context_length, 0);
+    attn_scores_scratch_.resize(static_cast<size_t>(cfg.num_heads) * cfg.max_context_length, 0.0f);
+    attn_heads_out_scratch_.resize(std::max<size_t>(cfg.embedding_dim, max_q_dim), 0.0f);
+    attn_indices_scratch_.resize(std::max<size_t>(static_cast<size_t>(cfg.max_context_length) + 4, 520), 0);
     logits_scratch_.resize(cfg.vocab_size, 0.0f);
+    default_norm_weights_.assign(std::max({cfg.embedding_dim, cfg.hidden_dim, max_head_dim, 256u}), 1.0f);
 
     // Initialize Persistent Cognitive Memory Vault
     std::string mem_path = "wwwroot/memories.json";
@@ -208,7 +225,7 @@ void HavenEngine::set_yarn_context_scale(float scale) {
 }
 
 SpeculativeCandidate HavenEngine::draft_speculative_tokens(const std::vector<uint32_t>& context) {
-    return speculative_engine_.draft_candidates(context, embedding_scratch_.data(), 4096);
+    return speculative_engine_.draft_candidates(context, embedding_scratch_.data(), static_cast<uint32_t>(embedding_scratch_.size()));
 }
 
 uint64_t HavenEngine::submit_chunked_prefill(const std::vector<uint32_t>& tokens) {
@@ -226,10 +243,25 @@ size_t HavenEngine::prune_kv_cache() {
 void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t active_cluster) {
     (void)active_cluster;
     const auto& cfg = loader_.get_config();
+    if (cfg.embedding_dim == 0 || cfg.hidden_dim == 0 || cfg.num_heads == 0 || cfg.num_kv_heads == 0 || cfg.max_context_length == 0) {
+        return;
+    }
+    if (pos < 0) pos = 0;
+    if (pos >= static_cast<int>(cfg.max_context_length)) {
+        pos = static_cast<int>(cfg.max_context_length) - 1;
+    }
+
+    auto safe_f32_weights = [&](const TensorDesc* t, size_t count) -> const float* {
+        if (t && t->data && t->type == QuantType::F32 &&
+            (t->size_bytes == 0 || t->size_bytes >= count * sizeof(float))) {
+            return reinterpret_cast<const float*>(t->data);
+        }
+        return default_norm_weights_.data();
+    };
 
     // 1. Token Embedding Lookup
     if (token_embd_tensor_ && token < cfg.vocab_size) {
-        Avx2Math::dequantize_row(embedding_scratch_.data(), *token_embd_tensor_, token, cfg.embedding_dim);
+        Avx2Math::dequantize_row(embedding_scratch_.data(), *token_embd_tensor_, static_cast<int>(token), static_cast<int>(cfg.embedding_dim));
         if (cfg.is_gemma) {
             float emb_scale = std::sqrt((float)cfg.embedding_dim);
             for (size_t i = 0; i < cfg.embedding_dim; ++i) {
@@ -243,8 +275,8 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
     }
 
     // 1a-2. Dequantize & Project Per-Layer Direct Embeddings (Google Pleias Branch)
-    if (per_layer_token_embd_tensor_ && !per_layer_emb_scratch_.empty()) {
-        Avx2Math::dequantize_row(per_layer_emb_scratch_.data(), *per_layer_token_embd_tensor_, token, (int)per_layer_emb_scratch_.size());
+    if (per_layer_token_embd_tensor_ && token < cfg.vocab_size && !per_layer_emb_scratch_.empty()) {
+        Avx2Math::dequantize_row(per_layer_emb_scratch_.data(), *per_layer_token_embd_tensor_, static_cast<int>(token), (int)per_layer_emb_scratch_.size());
         
         const float tok_scale = std::sqrt(256.0f); // sqrt(n_embd_per_layer) = 16.0f
         for (size_t i = 0; i < per_layer_emb_scratch_.size(); ++i) {
@@ -259,7 +291,7 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
                 per_layer_proj_scratch_[i] *= proj_scale;
             }
             
-            const float* proj_norm_w = per_layer_proj_norm_tensor_ ? reinterpret_cast<const float*>(per_layer_proj_norm_tensor_->data) : default_norm_weights_.data();
+            const float* proj_norm_w = safe_f32_weights(per_layer_proj_norm_tensor_, 256);
             
             const float input_scale = 1.0f / std::sqrt(2.0f);
             for (uint32_t l = 0; l < cfg.num_layers; ++l) {
@@ -280,19 +312,21 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
     }
 
     // 2. Transformer Layer Loop
-    const float* ones_w = default_norm_weights_.data();
-
     for (uint32_t l = 0; l < cfg.num_layers; ++l) {
         const auto& lt = (l < layers_.size()) ? layers_[l] : LayerTensors{};
 
-        const int q_dim = (lt.attn_q && lt.attn_q->shape.size() > 1) ? (int)lt.attn_q->shape[1] : (cfg.num_heads * cfg.head_dim);
-        const int kv_dim = (lt.attn_k && lt.attn_k->shape.size() > 1) ? (int)lt.attn_k->shape[1] : (cfg.num_kv_heads * cfg.head_dim);
-        const int actual_head_dim = (cfg.num_heads > 0) ? (q_dim / cfg.num_heads) : cfg.head_dim;
+        const int q_dim = std::max(1, std::min<int>(
+            static_cast<int>(q_scratch_.size()),
+            (lt.attn_q && lt.attn_q->shape.size() > 1) ? (int)lt.attn_q->shape[1] : (int)(cfg.num_heads * cfg.head_dim)));
+        const int kv_dim = std::max(1, std::min<int>(
+            static_cast<int>(k_scratch_.size()),
+            (lt.attn_k && lt.attn_k->shape.size() > 1) ? (int)lt.attn_k->shape[1] : (int)(cfg.num_kv_heads * cfg.head_dim)));
+        const int actual_head_dim = std::max(1, (cfg.num_heads > 0) ? (q_dim / (int)cfg.num_heads) : (int)cfg.head_dim);
         const float attn_scale = cfg.is_gemma ? 1.0f : (1.0f / std::sqrt((float)actual_head_dim));
         const int gqa_ratio = std::max(1u, cfg.num_heads / cfg.num_kv_heads);
 
         // 2a. Pre-Attention RMSNorm
-        const float* attn_norm_w = lt.attn_norm ? reinterpret_cast<const float*>(lt.attn_norm->data) : ones_w;
+        const float* attn_norm_w = safe_f32_weights(lt.attn_norm, cfg.embedding_dim);
         Avx2Math::rms_norm(norm_scratch_.data(), embedding_scratch_.data(), attn_norm_w, cfg.embedding_dim, cfg.rms_norm_eps);
 
         // 2b. Q, K, V Projections
@@ -319,14 +353,14 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
 
         // 2b-2. Gemma 2 / 4 Per-Head Q-Norm, K-Norm, and V-Norm
         if (lt.attn_q_norm) {
-            const float* q_norm_w = reinterpret_cast<const float*>(lt.attn_q_norm->data);
+            const float* q_norm_w = safe_f32_weights(lt.attn_q_norm, static_cast<size_t>(actual_head_dim));
             for (uint32_t h = 0; h < cfg.num_heads; ++h) {
                 float* q_h = q_scratch_.data() + h * actual_head_dim;
                 Avx2Math::rms_norm(q_h, q_h, q_norm_w, actual_head_dim, cfg.rms_norm_eps);
             }
         }
         if (lt.attn_k_norm) {
-            const float* k_norm_w = reinterpret_cast<const float*>(lt.attn_k_norm->data);
+            const float* k_norm_w = safe_f32_weights(lt.attn_k_norm, static_cast<size_t>(actual_head_dim));
             for (uint32_t h = 0; h < cfg.num_kv_heads; ++h) {
                 float* k_h = k_scratch_.data() + h * actual_head_dim;
                 Avx2Math::rms_norm(k_h, k_h, k_norm_w, actual_head_dim, cfg.rms_norm_eps);
@@ -344,13 +378,22 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         bool is_swa = has_swa && (cfg.architecture == "mistral" || (l % 6 != 5));
         float layer_freq_base = is_swa ? cfg.rope_freq_base_swa : cfg.rope_freq_base;
         int rope_dim = actual_head_dim;
-        const float* freq_factors_w = (!is_swa && rope_freqs_tensor_) ? reinterpret_cast<const float*>(rope_freqs_tensor_->data) : nullptr;
+        const float* freq_factors_w = (!is_swa && rope_freqs_tensor_ && rope_freqs_tensor_->type == QuantType::F32 &&
+            (rope_freqs_tensor_->size_bytes == 0 || rope_freqs_tensor_->size_bytes >= static_cast<size_t>(rope_dim / 2) * sizeof(float)))
+            ? reinterpret_cast<const float*>(rope_freqs_tensor_->data) : nullptr;
 
         uint32_t kv_source_layer = l;
         bool has_kv = (lt.attn_k != nullptr);
         if (!has_kv) {
-            uint32_t n_kv_start = (cfg.num_layers > 18) ? (cfg.num_layers - 18) : 24; // 24 for 42-layer model
-            kv_source_layer = n_kv_start - (is_swa ? 2 : 1); // 22 for SWA, 23 for Global
+            if (cfg.num_layers > 20) {
+                uint32_t n_kv_start = cfg.num_layers - 18;
+                kv_source_layer = n_kv_start - (is_swa ? 2 : 1);
+            } else {
+                kv_source_layer = (l > 0) ? (l - 1) : 0;
+            }
+            if (kv_source_layer >= cfg.num_layers) {
+                kv_source_layer = 0;
+            }
         }
 
         if (has_kv) {
@@ -361,40 +404,47 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         }
 
         // 2e. Multi-Head Attention (GQA) with Attention Sinks & Zero-Allocation Scratch Buffers
-        const int seq_len = std::min(pos + 1, (int)cfg.max_context_length);
+        const auto& kv_lay = kv_cache_.get_layer(kv_source_layer);
+        const size_t max_safe_positions = (kv_dim > 0) ? (kv_lay.keys.size() / static_cast<size_t>(kv_dim)) : 0;
+        const int seq_len = std::min({pos + 1, (int)cfg.max_context_length, (int)max_safe_positions});
         const int s_start = is_swa ? std::max(0, seq_len - 512) : 0;
 
         int active_attn_len = 0;
+        const int max_indices = static_cast<int>(attn_indices_scratch_.size());
         if (is_swa && s_start > 4) {
-            for (int s = 0; s < 4; ++s) attn_indices_scratch_[active_attn_len++] = s; // Pinned Sink (BOS / System Anchor)
-            for (int s = s_start; s < seq_len; ++s) attn_indices_scratch_[active_attn_len++] = s; // SWA Window
+            for (int s = 0; s < 4 && active_attn_len < max_indices; ++s) attn_indices_scratch_[active_attn_len++] = s;
+            for (int s = s_start; s < seq_len && active_attn_len < max_indices; ++s) attn_indices_scratch_[active_attn_len++] = s;
         } else {
-            for (int s = s_start; s < seq_len; ++s) attn_indices_scratch_[active_attn_len++] = s;
+            for (int s = s_start; s < seq_len && active_attn_len < max_indices; ++s) attn_indices_scratch_[active_attn_len++] = s;
         }
 
-        const float* layer_k = kv_cache_.get_layer(kv_source_layer).keys.data();
-        const float* layer_v = kv_cache_.get_layer(kv_source_layer).values.data();
+        const float* layer_k = kv_lay.keys.data();
+        const float* layer_v = kv_lay.values.data();
 
         #pragma omp parallel for schedule(static)
         for (uint32_t h = 0; h < cfg.num_heads; ++h) {
             const float* q_h = q_scratch_.data() + h * actual_head_dim;
-            const uint32_t kv_head_idx = h / gqa_ratio;
+            const uint32_t kv_head_idx = std::min(h / gqa_ratio, cfg.num_kv_heads - 1);
             const uint32_t kv_head_offset = kv_head_idx * actual_head_dim;
             float* out_h = attn_heads_out_scratch_.data() + h * actual_head_dim;
 
-            FlashAttentionCpu::compute_tiled_attention(
-                q_h,
-                layer_k,
-                layer_v,
-                attn_indices_scratch_.data(),
-                (uint32_t)active_attn_len,
-                (uint32_t)actual_head_dim,
-                (uint32_t)kv_dim,
-                kv_head_offset,
-                attn_scale,
-                cfg.attn_logit_softcapping,
-                out_h
-            );
+            if (active_attn_len > 0 && kv_head_offset + static_cast<uint32_t>(actual_head_dim) <= static_cast<uint32_t>(kv_dim)) {
+                FlashAttentionCpu::compute_tiled_attention(
+                    q_h,
+                    layer_k,
+                    layer_v,
+                    attn_indices_scratch_.data(),
+                    (uint32_t)active_attn_len,
+                    (uint32_t)actual_head_dim,
+                    (uint32_t)kv_dim,
+                    kv_head_offset,
+                    attn_scale,
+                    cfg.attn_logit_softcapping,
+                    out_h
+                );
+            } else {
+                std::memset(out_h, 0, static_cast<size_t>(actual_head_dim) * sizeof(float));
+            }
         }
 
         // 2f. Attention Output Projection
@@ -406,7 +456,7 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
 
         // 2f-2. Post-Attention Norm (Gemma 2 / 4)
         if (lt.post_attention_norm) {
-            const float* post_attn_w = reinterpret_cast<const float*>(lt.post_attention_norm->data);
+            const float* post_attn_w = safe_f32_weights(lt.post_attention_norm, cfg.embedding_dim);
             Avx2Math::rms_norm(attn_out_scratch_.data(), attn_out_scratch_.data(), post_attn_w, cfg.embedding_dim, cfg.rms_norm_eps);
         }
 
@@ -417,7 +467,7 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         }
 
         // 2g. Pre-FFN RMSNorm
-        const float* ffn_norm_w = lt.ffn_norm ? reinterpret_cast<const float*>(lt.ffn_norm->data) : ones_w;
+        const float* ffn_norm_w = safe_f32_weights(lt.ffn_norm, cfg.embedding_dim);
         Avx2Math::rms_norm(norm_scratch_.data(), embedding_scratch_.data(), ffn_norm_w, cfg.embedding_dim, cfg.rms_norm_eps);
 
         // 2h. FFN Gate & Up Projections (SwiGLU for LLaMA / Qwen / Mistral, GeGLU for Gemma)
@@ -446,7 +496,7 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
 
         // 2i-2. Post-FFN Norm (Gemma 2 / 4)
         if (lt.post_ffw_norm) {
-            const float* post_ffn_w = reinterpret_cast<const float*>(lt.post_ffw_norm->data);
+            const float* post_ffn_w = safe_f32_weights(lt.post_ffw_norm, cfg.embedding_dim);
             Avx2Math::rms_norm(ffn_down_scratch_.data(), ffn_down_scratch_.data(), post_ffn_w, cfg.embedding_dim, cfg.rms_norm_eps);
         }
 
@@ -457,8 +507,8 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         }
 
         // 2-pleias. Per-Layer Token Injection (Google Pleias Branch)
-        if (lt.inp_gate && lt.proj && !per_layer_emb_scratch_.empty()) {
-            float pleias_gate[256];
+        if (lt.inp_gate && lt.proj && !per_layer_emb_scratch_.empty() && (static_cast<size_t>(l) + 1) * 256 <= per_layer_emb_scratch_.size()) {
+            float pleias_gate[256] = {0};
             Avx2Math::gemv(pleias_gate, *lt.inp_gate, embedding_scratch_.data(), 256, cfg.embedding_dim);
             Avx2Math::gelu(pleias_gate, 256);
 
@@ -471,7 +521,7 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
             Avx2Math::gemv(pleias_proj, *lt.proj, pleias_gate, cfg.embedding_dim, 256);
 
             if (lt.post_norm) {
-                const float* post_w = reinterpret_cast<const float*>(lt.post_norm->data);
+                const float* post_w = safe_f32_weights(lt.post_norm, cfg.embedding_dim);
                 Avx2Math::rms_norm(pleias_proj, pleias_proj, post_w, cfg.embedding_dim, cfg.rms_norm_eps);
             }
 
@@ -480,12 +530,13 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
                 embedding_scratch_[i] += pleias_proj[i];
             }
         } else if (lt.post_norm) {
-            const float* post_norm_w = reinterpret_cast<const float*>(lt.post_norm->data);
+            const float* post_norm_w = safe_f32_weights(lt.post_norm, cfg.embedding_dim);
             Avx2Math::rms_norm(embedding_scratch_.data(), embedding_scratch_.data(), post_norm_w, cfg.embedding_dim, cfg.rms_norm_eps);
         }
 
         // 2-scale. Layer Output Scale (Gemma 4 Pleias)
-        if (lt.layer_output_scale && lt.layer_output_scale->data) {
+        if (lt.layer_output_scale && lt.layer_output_scale->data && lt.layer_output_scale->type == QuantType::F32 &&
+            (lt.layer_output_scale->size_bytes == 0 || lt.layer_output_scale->size_bytes >= sizeof(float))) {
             const float scale = *reinterpret_cast<const float*>(lt.layer_output_scale->data);
             for (size_t i = 0; i < cfg.embedding_dim; ++i) {
                 embedding_scratch_[i] *= scale;
@@ -502,7 +553,7 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
     }
 
     // 3. Final Output Norm & Logits Projection
-    const float* out_norm_w = output_norm_tensor_ ? reinterpret_cast<const float*>(output_norm_tensor_->data) : ones_w;
+    const float* out_norm_w = safe_f32_weights(output_norm_tensor_, cfg.embedding_dim);
     Avx2Math::rms_norm(norm_scratch_.data(), embedding_scratch_.data(), out_norm_w, cfg.embedding_dim, cfg.rms_norm_eps);
 
     if (output_tensor_) {
@@ -629,19 +680,19 @@ HAVEN_API bool haven_load_model(void* engine, const char* filepath) {
 }
 
 HAVEN_API void haven_inject_memory(void* engine, const char* concept_name, float weight, const float* embedding, int dim) {
-    if (!engine || !concept_name || !embedding) return;
+    if (!engine || !concept_name || !embedding || dim <= 0 || dim > 1000000) return;
     std::vector<float> emb_vec(embedding, embedding + dim);
     reinterpret_cast<haven::HavenEngine*>(engine)->inject_memory(concept_name, weight, emb_vec);
 }
 
 HAVEN_API void haven_inject_vision_frame(void* engine, const float* patch_embeddings, int num_patches, uint32_t width, uint32_t height, float salience) {
-    if (!engine || !patch_embeddings) return;
+    if (!engine || !patch_embeddings || num_patches <= 0 || num_patches > 10000000) return;
     std::vector<float> patches(patch_embeddings, patch_embeddings + num_patches);
     reinterpret_cast<haven::HavenEngine*>(engine)->inject_vision_frame(patches, width, height, salience);
 }
 
 HAVEN_API void haven_inject_audio_spectrum(void* engine, const float* mel_bands, int num_bands, float energy_rms, float centroid, bool is_speech) {
-    if (!engine || !mel_bands) return;
+    if (!engine || !mel_bands || num_bands <= 0 || num_bands > 1000000) return;
     std::vector<float> bands(mel_bands, mel_bands + num_bands);
     reinterpret_cast<haven::HavenEngine*>(engine)->inject_audio_spectrum(bands, energy_rms, centroid, is_speech);
 }
@@ -667,7 +718,7 @@ HAVEN_API float haven_get_attention_entropy(void* engine) {
 }
 
 HAVEN_API void haven_set_persona(void* engine, const float* persona_vector, int dim) {
-    if (!engine || !persona_vector) return;
+    if (!engine || !persona_vector || dim <= 0 || dim > 1000000) return;
     std::vector<float> vec(persona_vector, persona_vector + dim);
     reinterpret_cast<haven::HavenEngine*>(engine)->set_persona_embedding(vec);
 }
@@ -693,10 +744,9 @@ HAVEN_API void haven_forward(void* engine, uint32_t token, int pos, float* out_l
 }
 
 HAVEN_API uint32_t haven_sample_token(void* engine, float* logits, uint32_t vocab_size) {
-    if (!engine || !logits) return 0;
-    static haven::PersonaSampler sampler;
-    static std::vector<uint32_t> empty_history;
-    return sampler.sample(logits, vocab_size, empty_history);
+    if (!engine || !logits || vocab_size == 0) return 0;
+    static const std::vector<uint32_t> empty_history;
+    return reinterpret_cast<haven::HavenEngine*>(engine)->get_sampler().sample(logits, vocab_size, empty_history);
 }
 
 HAVEN_API void haven_destroy_engine(void* engine) {

@@ -26,6 +26,7 @@ public:
     }
 
     bool on_load(PluginExecutionContext* ctx) override {
+        (void)ctx;
         std::cout << "🌐 [WebResearchPlugin] Sovereign web intelligence & Wikipedia pipeline active.\n";
         return true;
     }
@@ -40,11 +41,28 @@ public:
                 action == "get_weather");
     }
 
+    static std::string url_encode(const std::string& s, char space_char) {
+        std::string out;
+        out.reserve(s.size() * 3);
+        static const char hex[] = "0123456789ABCDEF";
+        for (unsigned char c : s) {
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+                out += static_cast<char>(c);
+            } else if (c == ' ') {
+                out += space_char;
+            } else {
+                out += '%';
+                out += hex[(c >> 4) & 0xF];
+                out += hex[c & 0xF];
+            }
+        }
+        return out;
+    }
+
     bool execute_tool(const std::string& action, const std::string& payload, std::string& output) override {
 #ifdef _WIN32
         if (action == "wiki_summary" && !payload.empty()) {
-            std::string topic = payload;
-            std::replace(topic.begin(), topic.end(), ' ', '_');
+            std::string topic = url_encode(payload, '_');
             std::string path = "/api/rest_v1/page/summary/" + topic;
             std::string json_resp = http_get(L"en.wikipedia.org", std::wstring(path.begin(), path.end()));
             
@@ -62,16 +80,14 @@ public:
             return true;
         }
         else if (action == "get_weather") {
-            std::string city = payload.empty() ? "" : payload;
-            std::replace(city.begin(), city.end(), ' ', '+');
+            std::string city = payload.empty() ? "" : url_encode(payload, '+');
             std::string path = "/" + city + "?format=3";
             std::string resp = http_get(L"wttr.in", std::wstring(path.begin(), path.end()));
             output = "🌤️ Live Weather: " + (resp.empty() ? "Unable to retrieve weather" : resp);
             return true;
         }
         else if (action == "web_search" && !payload.empty()) {
-            std::string query = payload;
-            std::replace(query.begin(), query.end(), ' ', '+');
+            std::string query = url_encode(payload, '+');
             std::string path = "/html/?q=" + query;
             std::string resp = http_get(L"html.duckduckgo.com", std::wstring(path.begin(), path.end()));
             output = "🔍 DuckDuckGo Research Query for '" + payload + "': [Response length " + std::to_string(resp.size()) + " bytes]";
@@ -114,7 +130,7 @@ private:
                 if (WinHttpReadData(hRequest, buffer.data(), dwSize, &dwDownloaded)) {
                     result.append(buffer.data(), dwDownloaded);
                 }
-            } while (dwSize > 0);
+            } while (dwSize > 0 && result.size() < 512 * 1024);
         }
 
         WinHttpCloseHandle(hRequest);

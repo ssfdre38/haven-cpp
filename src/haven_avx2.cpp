@@ -40,6 +40,7 @@ float Avx2Math::vec_dot_q8_0(int n, const block_q8_0* vx, const float* vy) {
 
 // AVX2 RMS Normalization: y = (x / RMS(x)) * weight
 void Avx2Math::rms_norm(float* out, const float* x, const float* weight, int size, float eps) {
+    if (!out || !x || !weight || size <= 0) return;
     float sum_sq = 0.0f;
     __m256 acc = _mm256_setzero_ps();
 
@@ -76,8 +77,10 @@ void Avx2Math::apply_rope(
     int pos, float freq_base, float freq_scale, const float* freq_factors,
     int rope_dim)
 {
+    if (!q || head_dim <= 0 || num_heads < 0 || num_kv_heads < 0) return;
     if (rope_dim <= 0 || rope_dim > head_dim) rope_dim = head_dim / 2;
     const int num_pairs = rope_dim / 2;
+    if (num_pairs <= 0 || freq_base <= 0.0f) return;
 
     for (int h = 0; h < num_heads; ++h) {
         float* q_head = q + h * head_dim;
@@ -707,9 +710,35 @@ void Avx2Math::softcap_logits(float* logits, int size, float cap) {
     }
 }
 
+// Helper: compute exact row byte stride for tensor bounds verification
+static size_t haven_row_bytes(QuantType type, int cols) {
+    if (cols <= 0) return 0;
+    const size_t c = static_cast<size_t>(cols);
+    switch (type) {
+        case QuantType::Q8_0: return (c / 32) * sizeof(block_q8_0);
+        case QuantType::Q4_0: return (c / 32) * sizeof(block_q4_0);
+        case QuantType::Q5_0: return (c / 32) * sizeof(block_q5_0);
+        case QuantType::Q4_K: return (c / 256) * sizeof(block_q4_K);
+        case QuantType::Q5_K: return (c / 256) * sizeof(block_q5_K);
+        case QuantType::Q6_K: return (c / 256) * sizeof(block_q6_K);
+        case QuantType::Q3_K: return (c / 256) * sizeof(block_q3_K);
+        case QuantType::BF16:
+        case QuantType::F16:  return c * sizeof(uint16_t);
+        case QuantType::F32:  return c * sizeof(float);
+        default: return 0;
+    }
+}
+
 // Dequantizes a single row of a tensor into float buffer (e.g. token embedding lookup)
 void Avx2Math::dequantize_row(float* out, const TensorDesc& weight, int row, int cols) {
-    if (!weight.data || cols <= 0) return;
+    if (!out || !weight.data || row < 0 || cols <= 0) return;
+    if (weight.size_bytes > 0) {
+        const size_t rb = haven_row_bytes(weight.type, cols);
+        if (rb == 0 || static_cast<size_t>(row) + 1 > weight.size_bytes / rb) {
+            std::memset(out, 0, static_cast<size_t>(cols) * sizeof(float));
+            return;
+        }
+    }
 
     if (weight.type == QuantType::Q8_0) {
         const auto* blocks = reinterpret_cast<const block_q8_0*>(weight.data);
@@ -913,7 +942,14 @@ void Avx2Math::silu(float* x, int size) {
 
 // Matrix-Vector Multiplication: y = W * x
 void Avx2Math::gemv(float* y, const TensorDesc& weight, const float* x, int rows, int cols) {
-    if (!weight.data || rows <= 0 || cols <= 0) return;
+    if (!y || !weight.data || !x || rows <= 0 || cols <= 0) return;
+    if (weight.size_bytes > 0) {
+        const size_t rb = haven_row_bytes(weight.type, cols);
+        if (rb == 0 || static_cast<size_t>(rows) > weight.size_bytes / rb) {
+            std::memset(y, 0, static_cast<size_t>(rows) * sizeof(float));
+            return;
+        }
+    }
 
     if (weight.type == QuantType::Q8_0) {
         const auto* blocks = reinterpret_cast<const block_q8_0*>(weight.data);

@@ -142,16 +142,24 @@ public:
     bool is_peer_connected(uint32_t node_id) const;
     std::vector<uint32_t> get_connected_peer_ids() const;
     uint16_t get_listen_port() const { return listen_port_; }
-    void set_cluster_token(const std::string& token) { cluster_token_ = token; }
-    const std::string& get_cluster_token() const { return cluster_token_; }
+    void set_cluster_token(const std::string& token) {
+        std::lock_guard<std::mutex> lock(token_mutex_);
+        cluster_token_ = token;
+    }
+    std::string get_cluster_token() const {
+        std::lock_guard<std::mutex> lock(token_mutex_);
+        return cluster_token_;
+    }
 
 private:
     void server_listen_loop();
-    void client_recv_loop(uint64_t socket_handle, uint32_t peer_node_id);
+    void client_recv_loop(uint64_t socket_handle, uint32_t peer_node_id, bool require_auth);
 
     uint16_t listen_port_ = 0;
     uint64_t server_socket_ = ~0ULL;
     std::atomic<bool> is_running_{false};
+    std::atomic<size_t> active_peer_threads_{0};
+    mutable std::mutex token_mutex_;
     std::string cluster_token_;
 
     std::thread server_thread_;
@@ -159,6 +167,7 @@ private:
     std::vector<std::thread> client_threads_;
 
     mutable std::mutex peers_mutex_;
+    mutable std::mutex send_mutex_;
     std::unordered_map<uint32_t, uint64_t> peer_sockets_; // node_id -> socket descriptor
 
     std::shared_ptr<ActivationRingBuffer> inbound_ring_;
@@ -209,7 +218,10 @@ public:
 
     // Security & Authentication
     void set_cluster_token(const std::string& token);
-    const std::string& get_cluster_token() const { return cluster_token_; }
+    std::string get_cluster_token() const {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        return cluster_token_;
+    }
     std::string generate_invite_uri(const std::string& host_override = "") const;
     bool init_worker_with_token(uint32_t local_node_id, uint16_t listen_port, 
                                 const std::string& invite_or_host, uint16_t coordinator_port = 0,
@@ -243,7 +255,10 @@ public:
     uint32_t get_local_node_id() const { return local_node_id_; }
     uint16_t get_listen_port() const { return listen_port_; }
     bool is_active() const { return is_active_; }
-    const std::vector<ClusterNodeInfo>& get_nodes() const { return nodes_; }
+    std::vector<ClusterNodeInfo> get_nodes() const {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        return nodes_;
+    }
     const PipelineClusterScheduler& get_scheduler() const { return scheduler_; }
     void set_scheduler(const PipelineClusterScheduler& scheduler);
     bool is_peer_connected(uint32_t node_id) const;
@@ -257,6 +272,7 @@ private:
     uint16_t listen_port_ = 11438;
     std::atomic<bool> is_active_{false};
 
+    mutable std::mutex state_mutex_;
     std::vector<ClusterNodeInfo> nodes_;
     PipelineClusterScheduler scheduler_;
     std::unique_ptr<ClusterTransportRing> transport_;

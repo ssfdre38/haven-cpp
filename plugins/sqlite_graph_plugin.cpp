@@ -156,13 +156,25 @@ private:
     }
 
     void save_graph_to_disk() {
+        auto esc = [](const std::string& s) {
+            std::string out;
+            for (char c : s) {
+                if (c == '"') out += "\\\"";
+                else if (c == '\\') out += "\\\\";
+                else if (c == '\n') out += "\\n";
+                else if (c == '\r') out += "\\r";
+                else if (c == '\t') out += "\\t";
+                else out += c;
+            }
+            return out;
+        };
         std::string path = "wwwroot/knowledge_graph.json";
         std::ofstream ofs(path);
         if (ofs.is_open()) {
             ofs << "{\n  \"relations\": [\n";
             for (size_t i = 0; i < triples_.size(); ++i) {
                 const auto& t = triples_[i];
-                ofs << "    {\"subject\": \"" << t.subject << "\", \"predicate\": \"" << t.predicate << "\", \"object\": \"" << t.object << "\"}";
+                ofs << "    {\"subject\": \"" << esc(t.subject) << "\", \"predicate\": \"" << esc(t.predicate) << "\", \"object\": \"" << esc(t.object) << "\"}";
                 if (i + 1 < triples_.size()) ofs << ",";
                 ofs << "\n";
             }

@@ -24,6 +24,7 @@ public:
     }
 
     bool on_load(PluginExecutionContext* ctx) override {
+        (void)ctx;
         vault_dir_ = "vault";
         if (!std::filesystem::exists(vault_dir_)) {
             try { std::filesystem::create_directories(vault_dir_); } catch (...) {}
@@ -89,10 +90,26 @@ public:
             return true;
         }
         else if (action == "vault_read" && !payload.empty()) {
-            std::filesystem::path p = std::filesystem::path(vault_dir_) / payload;
-            if (!p.has_extension()) p += ".md";
-            if (!std::filesystem::exists(p)) {
-                output = "⚠️ Note not found: " + p.string();
+            if (payload.find("..") != std::string::npos || payload.find('/') != std::string::npos ||
+                payload.find('\\') != std::string::npos || payload.find(':') != std::string::npos ||
+                payload.find('\0') != std::string::npos) {
+                output = "⚠️ Blocked: Invalid note path outside vault.";
+                return false;
+            }
+            std::error_code ec;
+            std::filesystem::path root = std::filesystem::weakly_canonical(vault_dir_, ec);
+            std::filesystem::path rel = std::filesystem::path(payload).filename();
+            if (!rel.has_extension()) rel += ".md";
+            std::filesystem::path p = std::filesystem::weakly_canonical(root / rel, ec);
+            std::string root_s = root.string();
+            std::string p_s = p.string();
+            if (ec || p_s.size() <= root_s.size() || p_s.compare(0, root_s.size(), root_s) != 0 ||
+                (p_s[root_s.size()] != '\\' && p_s[root_s.size()] != '/')) {
+                output = "⚠️ Blocked: Path escapes vault directory.";
+                return false;
+            }
+            if (!std::filesystem::exists(p) || !std::filesystem::is_regular_file(p)) {
+                output = "⚠️ Note not found: " + p.filename().string();
                 return false;
             }
             std::ifstream file(p);

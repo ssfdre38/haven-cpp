@@ -45,6 +45,9 @@ public:
     // Updates speculative draft weights based on acceptance feedback
     void update_feedback(bool was_accepted);
 
+    // Re-initializes draft heads to match the loaded model's embedding dimension
+    void initialize_draft_heads(uint32_t embedding_dim);
+
     float get_acceptance_rate() const;
     size_t get_total_drafted_tokens() const { return total_drafted_; }
     size_t get_total_accepted_tokens() const { return total_accepted_; }
@@ -56,7 +59,6 @@ private:
     size_t total_accepted_ = 0;
 
     std::vector<std::vector<float>> draft_head_weights_;
-    void initialize_draft_heads(uint32_t embedding_dim);
 };
 
 } // namespace haven
