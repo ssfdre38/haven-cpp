@@ -136,8 +136,6 @@ Every dynamically loaded `.dll` plugin was tested via the live HTTP API (`/api/t
 
 ---
 
----
-
 ## 6. Cloud TPU v6e-4 (Trillium) Native C++20 PJRT & Live HTTP/SSE Benchmarks (November 2026)
 
 All TPU benchmarks were compiled directly from pure C++20 (`src/haven_tpu_pjrt.cpp`, `src/haven_tpu_gemma4.cpp`, `src/haven_server.cpp`) via `dlopen("libtpu.so")` (OpenXLA PJRT C ABI `0.75`, zero Python runtime) on a real 4-chip `v6e-4` slice in `europe-west4-a` using `haven-chat-v5.0.gguf` (42-layer Gemma 4, 262,144 vocab).
@@ -152,7 +150,7 @@ All TPU benchmarks were compiled directly from pure C++20 (`src/haven_tpu_pjrt.c
 
 ### 6B. Full On-Chip 42-Layer Gemma 4 Engine (`test-tpu-gemma4-onchip`, `T=2048`)
 
-CPU Ground Truth (`180-vCPU EPYC 9B14`, `OMP=48`): 133-token prompt prefill in `4,140.6 ms`, `Top1 = 12932 ("Oh")`. All 16 tested TPU configurations matched `Top1 = 12932 == 12932` (`100%`).
+CPU Ground Truth (`180-vCPU EPYC 9B14`, `OMP=48`): 133-token prompt prefill in `4,140.6 ms`, `Top1 = 12932 ("Oh")`. All 16 tested TPU configurations matched `Top1 = 12932 == 12932` (`100%`), with **24.81 ms** 133-token TTFT on 4-chip INT8 (**167x faster TTFT** than 48-thread EPYC).
 
 | Config | Silicon & Precision | Emb Mode | Parity / Top-1 | `S=128` MXU Prefill | Step Latency (H2D / TPU / D2H) | Per-User | Aggregate |
 | :--- | :--- | :--- | :---: | ---: | :--- | ---: | ---: |
