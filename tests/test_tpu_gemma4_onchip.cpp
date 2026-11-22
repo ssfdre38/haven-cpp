@@ -28,11 +28,13 @@ int main(int argc, char** argv) {
     std::string model_path = "";
     std::string libtpu_path = "";
     bool emit_only = false;
+    bool onchip_emb_only = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--libtpu" && i + 1 < argc) libtpu_path = argv[++i];
         else if (a == "--emit-only") emit_only = true;
+        else if (a == "--onchip-emb-only") onchip_emb_only = true;
         else if (!a.starts_with("-")) model_path = a;
     }
 
@@ -58,18 +60,22 @@ int main(int argc, char** argv) {
     if (emit_only) {
         for (int R : {1, 4}) {
             for (bool i8 : {false, true}) {
-                TpuGemma4Config cfg;
-                cfg.batch_size = 1;
-                cfg.max_seq_len = 2048;
-                cfg.prefill_chunk_size = 128;
-                cfg.num_replicas = R;
-                cfg.use_int8_weights = i8;
-                cfg.return_full_logits = false;
-                std::string dec_ir = HavenTpuGemma4Engine::emit_stablehlo_mlir(mc, cfg, 1);
-                std::string pre_ir = HavenTpuGemma4Engine::emit_stablehlo_mlir(mc, cfg, 128);
-                std::cout << "  [IR OK] R=" << R << " " << (i8 ? "INT8" : "BF16")
-                          << " | decode_mlir=" << (dec_ir.size() / 1024) << " KB"
-                          << " | prefill_128_mlir=" << (pre_ir.size() / 1024) << " KB\n";
+                for (bool onchip_emb : {false, true}) {
+                    TpuGemma4Config cfg;
+                    cfg.batch_size = onchip_emb ? 128 : 1;
+                    cfg.max_seq_len = 2048;
+                    cfg.prefill_chunk_size = 128;
+                    cfg.num_replicas = R;
+                    cfg.use_int8_weights = i8;
+                    cfg.use_onchip_embeddings = onchip_emb;
+                    cfg.return_full_logits = false;
+                    std::string dec_ir = HavenTpuGemma4Engine::emit_stablehlo_mlir(mc, cfg, 1);
+                    std::string pre_ir = HavenTpuGemma4Engine::emit_stablehlo_mlir(mc, cfg, 128);
+                    std::cout << "  [IR OK] R=" << R << " " << (i8 ? "INT8" : "BF16")
+                              << " " << (onchip_emb ? "OnChipEmb(B=128)" : "HostEmb(B=1)")
+                              << " | decode_mlir=" << (dec_ir.size() / 1024) << " KB"
+                              << " | prefill_128_mlir=" << (pre_ir.size() / 1024) << " KB\n";
+                }
             }
         }
         return 0;
@@ -104,13 +110,14 @@ int main(int argc, char** argv) {
               << std::chrono::duration<double, std::milli>(cpu1 - cpu0).count()
               << " ms | Top1 Token=" << cpu_top1 << " (\"" << host_engine.detokenize(cpu_top1) << "\")\n";
 
-    // Helper to benchmark any (R, B, use_int8, return_logits) configuration end-to-end!
-    auto run_config_bench = [&](const std::string& label, int R, int B, bool use_int8, bool full_logits, int gen_steps, int prefill_chunk) {
+    // Helper to benchmark any (R, B, use_int8, return_logits, onchip_emb) configuration end-to-end!
+    auto run_config_bench = [&](const std::string& label, int R, int B, bool use_int8, bool full_logits, int gen_steps, int prefill_chunk, bool onchip_emb = false) {
         if (R > n_devs) return;
         std::cout << "\n----------------------------------------------------------------------\n";
         std::cout << "[BENCH] " << label << " (R=" << R << ", B=" << B
                   << ", " << (use_int8 ? "W8A16-INT8" : "BF16")
-                  << ", " << (full_logits ? "FullLogits" : "OnChipArgmax") << ")\n";
+                  << ", " << (full_logits ? "FullLogits" : "OnChipArgmax")
+                  << ", " << (onchip_emb ? "OnChipEmb" : "HostEmb") << ")\n";
         std::cout << "----------------------------------------------------------------------\n";
 
         TpuGemma4Config cfg;
@@ -120,6 +127,7 @@ int main(int argc, char** argv) {
         cfg.num_replicas = R;
         cfg.use_int8_weights = use_int8;
         cfg.return_full_logits = full_logits;
+        cfg.use_onchip_embeddings = onchip_emb;
         cfg.donate_kv_cache = true;
 
         HavenTpuGemma4Engine gemma_tpu;
@@ -251,29 +259,31 @@ int main(int argc, char** argv) {
         gemma_tpu.shutdown();
     };
 
-    // 1. Exact 262k Logit Parity Verification (1-Chip BF16 & 4-Chip SPMD BF16)
-    run_config_bench("1A. Parity Check (1-Chip BF16 Full Logits)", 1, 1, false, true, 64, 128);
-    if (n_devs >= 4) {
-        run_config_bench("1B. Parity Check (4-Chip Optical ICI Tensor-Parallel BF16)", 4, 1, false, true, 64, 128);
+    if (!onchip_emb_only) {
+        // 1. Exact 262k Logit Parity Verification (1-Chip BF16 & 4-Chip SPMD BF16)
+        run_config_bench("1A. Parity Check (1-Chip BF16 Full Logits)", 1, 1, false, true, 64, 128);
+        if (n_devs >= 4) {
+            run_config_bench("1B. Parity Check (4-Chip Optical ICI Tensor-Parallel BF16)", 4, 1, false, true, 64, 128);
+        }
+
+        // 2. Peak Interactive Single-Stream Decode (B=1, On-Chip Argmax — 4 bytes over PCIe!)
+        run_config_bench("2A. Single-Stream Interactive (1-Chip BF16)", 1, 1, false, false, 128, 128);
+        run_config_bench("2B. Single-Stream Interactive (1-Chip W8A16 INT8)", 1, 1, true, false, 128, 128);
+        if (n_devs >= 4) {
+            run_config_bench("2C. Single-Stream Interactive (4-Chip Tensor-Parallel BF16)", 4, 1, false, false, 128, 128);
+            run_config_bench("2D. Single-Stream Interactive (4-Chip Tensor-Parallel W8A16 INT8)", 4, 1, true, false, 128, 128);
+        }
     }
 
-    // 2. Peak Interactive Single-Stream Decode (B=1, On-Chip Argmax — 4 bytes over PCIe!)
-    run_config_bench("2A. Single-Stream Interactive (1-Chip BF16)", 1, 1, false, false, 128, 128);
-    run_config_bench("2B. Single-Stream Interactive (1-Chip W8A16 INT8)", 1, 1, true, false, 128, 128);
+    // 3. Cloud-Scale Continuous Batching with On-Chip Sharded Token+Pleias Gather (512-byte H2D at B=128!)
     if (n_devs >= 4) {
-        run_config_bench("2C. Single-Stream Interactive (4-Chip Tensor-Parallel BF16)", 4, 1, false, false, 128, 128);
-        run_config_bench("2D. Single-Stream Interactive (4-Chip Tensor-Parallel W8A16 INT8)", 4, 1, true, false, 128, 128);
-    }
-
-    // 3. Cloud-Scale Continuous Batching (B=16, B=32, B=64, B=128 concurrent users on 4-Chip TP!)
-    if (n_devs >= 4) {
-        run_config_bench("3A. Cloud Continuous Batching (4-Chip TP, B=16, W8A16 INT8)", 4, 16, true, false, 64, 0);
-        run_config_bench("3B. Cloud Continuous Batching (4-Chip TP, B=32, W8A16 INT8)", 4, 32, true, false, 64, 0);
-        run_config_bench("3C. Cloud Continuous Batching (4-Chip TP, B=64, W8A16 INT8)", 4, 64, true, false, 64, 0);
-        run_config_bench("3D. Cloud Continuous Batching (4-Chip TP, B=64, BF16)",       4, 64, false, false, 64, 0);
-        run_config_bench("3E. Cloud Continuous Batching (4-Chip TP, B=128, W8A16 INT8)", 4, 128, true, false, 64, 0);
+        run_config_bench("3A. Interactive On-Chip Gather Parity (4-Chip TP, B=1, BF16 FullLogits)", 4, 1, false, true, 64, 128, true);
+        run_config_bench("3B. Interactive On-Chip Gather Peak (4-Chip TP, B=1, W8A16 INT8)",       4, 1, true, false, 128, 128, true);
+        run_config_bench("3C. Cloud Continuous Batching On-Chip Gather (4-Chip TP, B=64, BF16)",   4, 64, false, false, 64, 0, true);
+        run_config_bench("3D. Cloud Continuous Batching On-Chip Gather (4-Chip TP, B=128, INT8)",  4, 128, true, false, 64, 0, true);
+        run_config_bench("3E. Cloud Continuous Batching On-Chip Gather (4-Chip TP, B=128, BF16)",  4, 128, false, false, 64, 0, true);
     } else {
-        run_config_bench("3A. Single-Chip Continuous Batching (1-Chip, B=32, W8A16 INT8)", 1, 32, true, false, 64, 0);
+        run_config_bench("3A. Single-Chip On-Chip Gather (1-Chip, B=32, W8A16 INT8)", 1, 32, true, false, 64, 0, true);
     }
 
     std::cout << "\n======================================================================\n";

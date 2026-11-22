@@ -250,15 +250,64 @@ struct MlirEmitter {
     }
 
     // Cross-replica AllReduce sum across R chips over Optical ICI (no-op if R == 1)
-    std::string emit_all_reduce_sum_3d(const std::string& x, int B, int S, int D, int R) {
+    std::string emit_all_reduce_sum_3d(const std::string& x, int B, int S, int D, int R, const char* elem_type = "f32") {
         if (R <= 1) return x;
-        const std::string t = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "x" + std::to_string(D) + "xf32>";
+        const std::string et(elem_type);
+        const std::string t = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "x" + std::to_string(D) + "x" + et + ">";
+        const std::string st = "tensor<" + et + ">";
         std::string out = tmp("ar");
         ss << "    " << out << " = \"stablehlo.all_reduce\"(" << x << ") ({\n"
-           << "    ^bb0(%ra: tensor<f32>, %rb: tensor<f32>):\n"
-           << "      %rs = stablehlo.add %ra, %rb : tensor<f32>\n"
-           << "      stablehlo.return %rs : tensor<f32>\n"
+           << "    ^bb0(%ra: " << st << ", %rb: " << st << "):\n"
+           << "      %rs = stablehlo.add %ra, %rb : " << st << "\n"
+           << "      stablehlo.return %rs : " << st << "\n"
            << "    }) {replica_groups = " << replica_group_attr(R) << "} : (" << t << ") -> " << t << "\n";
+        return out;
+    }
+
+    // Gather rows from a 2D [V_sh, K] table (bf16 or i8) using [B, S, 1] i32 indices -> [B, S, K] f32
+    std::string emit_table_gather_2d(const std::string& table, const std::string& scale_1d,
+                                     const std::string& idx_3d, int V_sh, int K, int B, int S, bool use_int8) {
+        const std::string wel = use_int8 ? "i8" : "bf16";
+        const std::string tab_t = "tensor<" + std::to_string(V_sh) + "x" + std::to_string(K) + "x" + wel + ">";
+        const std::string idx_t = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "x1xi32>";
+        const std::string raw_t = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "x" + std::to_string(K) + "x" + wel + ">";
+        const std::string f32_t = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "x" + std::to_string(K) + "xf32>";
+
+        std::string g_raw = tmp("graw");
+        std::string g_f32 = tmp("gf32");
+        ss << "    " << g_raw << " = \"stablehlo.gather\"(" << table << ", " << idx_3d << ") {\n"
+           << "      dimension_numbers = #stablehlo.gather<\n"
+           << "        offset_dims = [2],\n"
+           << "        collapsed_slice_dims = [0],\n"
+           << "        start_index_map = [0],\n"
+           << "        index_vector_dim = 2\n"
+           << "      >,\n"
+           << "      indices_are_sorted = false,\n"
+           << "      slice_sizes = array<i64: 1, " << K << ">\n"
+           << "    } : (" << tab_t << ", " << idx_t << ") -> " << raw_t << "\n"
+           << "    " << g_f32 << " = stablehlo.convert " << g_raw << " : (" << raw_t << ") -> " << f32_t << "\n";
+
+        if (!use_int8) return g_f32;
+
+        const std::string s1_t = "tensor<" + std::to_string(V_sh) + "xf32>";
+        const std::string s2_t = "tensor<" + std::to_string(V_sh) + "x1xf32>";
+        const std::string gs_t = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "x1xf32>";
+        const std::string g2_t = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "xf32>";
+        std::string s2 = tmp("gs2"), gs = tmp("gsc"), g2 = tmp("gsr"), sb = tmp("gsb"), out = tmp("gdq");
+        ss << "    " << s2 << " = stablehlo.reshape " << scale_1d << " : (" << s1_t << ") -> " << s2_t << "\n"
+           << "    " << gs << " = \"stablehlo.gather\"(" << s2 << ", " << idx_3d << ") {\n"
+           << "      dimension_numbers = #stablehlo.gather<\n"
+           << "        offset_dims = [2],\n"
+           << "        collapsed_slice_dims = [0],\n"
+           << "        start_index_map = [0],\n"
+           << "        index_vector_dim = 2\n"
+           << "      >,\n"
+           << "      indices_are_sorted = false,\n"
+           << "      slice_sizes = array<i64: 1, 1>\n"
+           << "    } : (" << s2_t << ", " << idx_t << ") -> " << gs_t << "\n"
+           << "    " << g2  << " = stablehlo.reshape " << gs << " : (" << gs_t << ") -> " << g2_t << "\n"
+           << "    " << sb  << " = stablehlo.broadcast_in_dim " << g2 << ", dims = [0, 1] : (" << g2_t << ") -> " << f32_t << "\n"
+           << "    " << out << " = stablehlo.multiply " << g_f32 << ", " << sb << " : " << f32_t << "\n";
         return out;
     }
 
@@ -345,14 +394,22 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const ModelConfig& mc,
         return " {tf.aliasing_output = " + std::to_string(out_slot) + " : i32}";
     };
 
+    const bool onchip_emb = tc.use_onchip_embeddings;
+
     em.ss << "module @haven_gemma4_onchip {\n"
-          << "  func.func @main(\n"
-          // Dynamic per-step inputs (0..2)
-          << "    %x_emb_in: tensor<" << B << "x" << S << "x" << D << "xbf16>,\n"
-          << "    %pleias_tok_in: tensor<" << B << "x" << S << "x" << L << "x" << P_dim << "xbf16>,\n"
-          << "    %pos: tensor<i32>,\n"
-          // Stacked projection weights (3..14)
-          << "    %w_ffn_gate: tensor<" << L << "x" << F_sh << "x" << D << "x" << wel << ">,\n"
+          << "  func.func @main(\n";
+    if (onchip_emb) {
+        // Ultra-compact dynamic inputs (4*B*S bytes token IDs + 4B pos!)
+        em.ss << "    %tok_ids_in: tensor<" << B << "x" << S << "xi32>,\n"
+              << "    %pos: tensor<i32>,\n";
+    } else {
+        // Host-dequantized embedding inputs
+        em.ss << "    %x_emb_in: tensor<" << B << "x" << S << "x" << D << "xbf16>,\n"
+              << "    %pleias_tok_in: tensor<" << B << "x" << S << "x" << L << "x" << P_dim << "xbf16>,\n"
+              << "    %pos: tensor<i32>,\n";
+    }
+    // Stacked projection weights
+    em.ss << "    %w_ffn_gate: tensor<" << L << "x" << F_sh << "x" << D << "x" << wel << ">,\n"
           << "    %w_ffn_up: tensor<" << L << "x" << F_sh << "x" << D << "x" << wel << ">,\n"
           << "    %w_ffn_down: tensor<" << L << "x" << D << "x" << F_sh << "x" << wel << ">,\n"
           << "    %w_swa_q: tensor<" << N_swa << "x" << Q_swa_sh << "x" << D << "x" << wel << ">,\n"
@@ -364,8 +421,11 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const ModelConfig& mc,
           << "    %w_glob_k: tensor<" << N_glob_kv << "x" << KV_glob_sh << "x" << D << "x" << wel << ">,\n"
           << "    %w_glob_v: tensor<" << N_glob_kv << "x" << KV_glob_sh << "x" << D << "x" << wel << ">,\n"
           << "    %w_lm_head: tensor<" << V_sh << "x" << D << "x" << wel << ">,\n";
+    if (onchip_emb) {
+        em.ss << "    %w_pl_tok_emb: tensor<" << V_sh << "x" << (L * P_dim) << "x" << wel << ">,\n";
+    }
 
-    // Optional INT8 per-row F32 scales (12 scale tensors right after weights when use_int8_weights=true)
+    // Optional INT8 per-row F32 scales
     if (i8) {
         em.ss << "    %s_ffn_gate: tensor<" << L << "x" << F_sh << "xf32>,\n"
               << "    %s_ffn_up: tensor<" << L << "x" << F_sh << "xf32>,\n"
@@ -379,6 +439,9 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const ModelConfig& mc,
               << "    %s_glob_k: tensor<" << N_glob_kv << "x" << KV_glob_sh << "xf32>,\n"
               << "    %s_glob_v: tensor<" << N_glob_kv << "x" << KV_glob_sh << "xf32>,\n"
               << "    %s_lm_head: tensor<" << V_sh << "xf32>,\n";
+        if (onchip_emb) {
+            em.ss << "    %s_pl_tok_emb: tensor<" << V_sh << "xf32>,\n";
+        }
     }
 
     // Replicated BF16 Pleias weights, F32 norms, RoPE tables
@@ -448,26 +511,95 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const ModelConfig& mc,
           << "    %win_or_sink = stablehlo.or %in_win, %is_sink : " << t_st_i1 << "\n"
           << "    %mask_swa = stablehlo.and %mask_glob, %win_or_sink : " << t_st_i1 << "\n";
 
-    // Step 1: Convert x_emb_in [B, S, D] to F32 and compute Pleias per-layer embeddings [B, S, L, 256]
+    // Step 1: Obtain x_emb [B, S, D] and Pleias per-layer token embeddings [B, S, L, 256]
     const std::string t_bsd_f32 = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "x" + std::to_string(D) + "xf32>";
     const std::string t_bsd_bf  = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "x" + std::to_string(D) + "xbf16>";
     const std::string t_pl_f32  = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "x" + std::to_string(L) + "x" + std::to_string(P_dim) + "xf32>";
     const std::string t_pl_bf   = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "x" + std::to_string(L) + "x" + std::to_string(P_dim) + "xbf16>";
     const std::string t_pl_flat = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "x" + std::to_string(L * P_dim) + "xf32>";
+    const std::string t_pl_flat_bf = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "x" + std::to_string(L * P_dim) + "xbf16>";
 
-    em.ss << "    %x0 = stablehlo.convert %x_emb_in : (" << t_bsd_bf << ") -> " << t_bsd_f32 << "\n"
-          << "    %pl_proj_raw = stablehlo.dot_general %x_emb_in, %w_pl_mproj, contracting_dims = [2] x [1] : ("
+    std::string x_emb_bf_var;
+    std::string x0_f32_var;
+    std::string pl_tok_f32_var;
+
+    if (onchip_emb) {
+        const std::string t_bs_i32 = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "xi32>";
+        const std::string t_bs_i1  = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "xi1>";
+        const std::string t_idx3   = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "x1xi32>";
+        em.ss << "    %c_z_bs = stablehlo.constant dense<0> : " << t_bs_i32 << "\n"
+              << "    %c_vmax_bs = stablehlo.constant dense<" << (V_sh - 1) << "> : " << t_bs_i32 << "\n";
+
+        std::string rel_ids = "%tok_ids_in";
+        if (R > 1) {
+            em.ss << "    %rid_u32_e = stablehlo.replica_id : tensor<ui32>\n"
+                  << "    %rid_i32_e = stablehlo.convert %rid_u32_e : (tensor<ui32>) -> tensor<i32>\n"
+                  << "    %c_vsh_e = stablehlo.constant dense<" << V_sh << "> : tensor<i32>\n"
+                  << "    %v_lo = stablehlo.multiply %rid_i32_e, %c_vsh_e : tensor<i32>\n"
+                  << "    %v_lo_b = stablehlo.broadcast_in_dim %v_lo, dims = [] : (tensor<i32>) -> " << t_bs_i32 << "\n"
+                  << "    %rel_ids = stablehlo.subtract %tok_ids_in, %v_lo_b : " << t_bs_i32 << "\n"
+                  << "    %ge_lo = stablehlo.compare GE, %rel_ids, %c_z_bs, SIGNED : (" << t_bs_i32 << ", " << t_bs_i32 << ") -> " << t_bs_i1 << "\n"
+                  << "    %le_hi = stablehlo.compare LE, %rel_ids, %c_vmax_bs, SIGNED : (" << t_bs_i32 << ", " << t_bs_i32 << ") -> " << t_bs_i1 << "\n"
+                  << "    %in_shard = stablehlo.and %ge_lo, %le_hi : " << t_bs_i1 << "\n";
+            rel_ids = "%rel_ids";
+        }
+        em.ss << "    %cl_hi = stablehlo.minimum " << rel_ids << ", %c_vmax_bs : " << t_bs_i32 << "\n"
+              << "    %cl_id = stablehlo.maximum %cl_hi, %c_z_bs : " << t_bs_i32 << "\n"
+              << "    %idx_3d = stablehlo.reshape %cl_id : (" << t_bs_i32 << ") -> " << t_idx3 << "\n";
+
+        // Gather token embeddings directly from tied sharded %w_lm_head (ZERO extra HBM3 bytes!)
+        std::string emb_loc = em.emit_table_gather_2d("%w_lm_head", "%s_lm_head", "%idx_3d", V_sh, D, B, S, i8);
+        const float emb_scale = mc.is_gemma ? std::sqrt(static_cast<float>(D)) : 1.0f;
+        em.ss << "    %c_emb_sc = stablehlo.constant dense<" << fmt_f32(emb_scale) << "> : " << t_bsd_f32 << "\n"
+              << "    %emb_sc_loc = stablehlo.multiply " << emb_loc << ", %c_emb_sc : " << t_bsd_f32 << "\n";
+        std::string emb_f32 = "%emb_sc_loc";
+        if (R > 1) {
+            const std::string t_bsd_i1 = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "x" + std::to_string(D) + "xi1>";
+            em.ss << "    %in_sh_d = stablehlo.broadcast_in_dim %in_shard, dims = [0, 1] : (" << t_bs_i1 << ") -> " << t_bsd_i1 << "\n"
+                  << "    %z_bsd = stablehlo.constant dense<0.0000000e+00> : " << t_bsd_f32 << "\n"
+                  << "    %emb_masked = stablehlo.select %in_sh_d, %emb_sc_loc, %z_bsd : " << t_bsd_i1 << ", " << t_bsd_f32 << "\n";
+            emb_f32 = em.emit_all_reduce_sum_3d("%emb_masked", B, S, D, R, "f32");
+        }
+        em.ss << "    %x_emb_bf = stablehlo.convert " << emb_f32 << " : (" << t_bsd_f32 << ") -> " << t_bsd_bf << "\n";
+        x0_f32_var = emb_f32;
+        x_emb_bf_var = "%x_emb_bf";
+
+        // Gather Pleias per-layer token embeddings from sharded %w_pl_tok_emb (AllReduced in BF16 over Optical ICI!)
+        std::string pl_loc = em.emit_table_gather_2d("%w_pl_tok_emb", "%s_pl_tok_emb", "%idx_3d", V_sh, L * P_dim, B, S, i8);
+        const float tok_pl_scale = std::sqrt(static_cast<float>(P_dim));
+        em.ss << "    %c_pl_tsc = stablehlo.constant dense<" << fmt_f32(tok_pl_scale) << "> : " << t_pl_flat << "\n"
+              << "    %pl_sc_loc = stablehlo.multiply " << pl_loc << ", %c_pl_tsc : " << t_pl_flat << "\n"
+              << "    %pl_loc_bf = stablehlo.convert %pl_sc_loc : (" << t_pl_flat << ") -> " << t_pl_flat_bf << "\n";
+        std::string pl_flat_bf = "%pl_loc_bf";
+        if (R > 1) {
+            const std::string t_plf_i1 = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "x" + std::to_string(L * P_dim) + "xi1>";
+            em.ss << "    %in_sh_pl = stablehlo.broadcast_in_dim %in_shard, dims = [0, 1] : (" << t_bs_i1 << ") -> " << t_plf_i1 << "\n"
+                  << "    %z_plbf = stablehlo.constant dense<0.0000000e+00> : " << t_pl_flat_bf << "\n"
+                  << "    %pl_masked_bf = stablehlo.select %in_sh_pl, %pl_loc_bf, %z_plbf : " << t_plf_i1 << ", " << t_pl_flat_bf << "\n";
+            pl_flat_bf = em.emit_all_reduce_sum_3d("%pl_masked_bf", B, S, L * P_dim, R, "bf16");
+        }
+        em.ss << "    %pl_tok_4d_bf = stablehlo.reshape " << pl_flat_bf << " : (" << t_pl_flat_bf << ") -> " << t_pl_bf << "\n"
+              << "    %pl_tok_f32 = stablehlo.convert %pl_tok_4d_bf : (" << t_pl_bf << ") -> " << t_pl_f32 << "\n";
+        pl_tok_f32_var = "%pl_tok_f32";
+    } else {
+        em.ss << "    %x0 = stablehlo.convert %x_emb_in : (" << t_bsd_bf << ") -> " << t_bsd_f32 << "\n"
+              << "    %pl_tok_f32 = stablehlo.convert %pleias_tok_in : (" << t_pl_bf << ") -> " << t_pl_f32 << "\n";
+        x0_f32_var = "%x0";
+        x_emb_bf_var = "%x_emb_in";
+        pl_tok_f32_var = "%pl_tok_f32";
+    }
+
+    em.ss << "    %pl_proj_raw = stablehlo.dot_general " << x_emb_bf_var << ", %w_pl_mproj, contracting_dims = [2] x [1] : ("
           << t_bsd_bf << ", tensor<" << (L * P_dim) << "x" << D << "xbf16>) -> " << t_pl_flat << "\n"
           << "    %c_pl_pscale = stablehlo.constant dense<" << fmt_f32(1.0f / std::sqrt(static_cast<float>(D))) << "> : " << t_pl_flat << "\n"
           << "    %pl_proj_sc = stablehlo.multiply %pl_proj_raw, %c_pl_pscale : " << t_pl_flat << "\n"
           << "    %pl_proj_4d = stablehlo.reshape %pl_proj_sc : (" << t_pl_flat << ") -> " << t_pl_f32 << "\n";
     std::string pl_proj_norm = em.emit_rms_norm_4d("%pl_proj_4d", "%w_pl_pnorm", B, S, L, P_dim, mc.rms_norm_eps, c0_f32);
-    em.ss << "    %pl_tok_f32 = stablehlo.convert %pleias_tok_in : (" << t_pl_bf << ") -> " << t_pl_f32 << "\n"
-          << "    %pl_sum = stablehlo.add " << pl_proj_norm << ", %pl_tok_f32 : " << t_pl_f32 << "\n"
+    em.ss << "    %pl_sum = stablehlo.add " << pl_proj_norm << ", " << pl_tok_f32_var << " : " << t_pl_f32 << "\n"
           << "    %c_inv_s2 = stablehlo.constant dense<" << fmt_f32(1.0f / std::sqrt(2.0f)) << "> : " << t_pl_f32 << "\n"
           << "    %pleias_all = stablehlo.multiply %pl_sum, %c_inv_s2 : " << t_pl_f32 << "\n";
 
-    std::string x_cur = "%x0";
+    std::string x_cur = x0_f32_var;
     std::string kv_ks = "%kv_ks_in";
     std::string kv_vs = "%kv_vs_in";
     std::string kv_kg = "%kv_kg_in";
@@ -981,7 +1113,71 @@ bool HavenTpuGemma4Engine::build_and_upload_weights(const HavenEngine& host_engi
         }
     }
 
-    // Append INT8 scales immediately after the 12 main weights (matching MLIR arg order!)
+    // 2b. Optional sharded Pleias per-layer token embedding table [V_sh, L * P_dim] (streamed per shard for low host RAM!)
+    if (cfg_.use_onchip_embeddings) {
+        const TensorDesc* pl_td = host_engine.get_per_layer_token_embd_tensor();
+        const int pl_cols = L * P_dim;
+        const size_t shard_elems = static_cast<size_t>(V_sh) * static_cast<size_t>(pl_cols);
+        for (int rep = 0; rep < R; ++rep) {
+            const int dev = replica_dev_indices_[static_cast<size_t>(rep)];
+            const int row_base = rep * V_sh;
+            PJRT_Buffer* wb = nullptr;
+            if (!i8) {
+                std::vector<uint16_t> bf(shard_elems, 0);
+                if (pl_td && pl_td->data) {
+                    #pragma omp parallel
+                    {
+                        std::vector<float> row_f32(static_cast<size_t>(pl_cols));
+                        #pragma omp for schedule(static)
+                        for (int r = 0; r < V_sh; ++r) {
+                            Avx2Math::dequantize_row(row_f32.data(), *pl_td, row_base + r, pl_cols);
+                            HavenTpuPjrtBackend::convert_f32_to_bf16(
+                                row_f32.data(),
+                                bf.data() + static_cast<size_t>(r) * static_cast<size_t>(pl_cols),
+                                static_cast<size_t>(pl_cols));
+                        }
+                    }
+                }
+                wb = backend_->upload_bf16_nd(bf.data(), {V_sh, pl_cols}, dev);
+                total_bytes += shard_elems * sizeof(uint16_t);
+            } else {
+                std::vector<int8_t> sq(shard_elems, 0);
+                std::vector<float> sc(static_cast<size_t>(V_sh), 1.0f);
+                if (pl_td && pl_td->data) {
+                    #pragma omp parallel
+                    {
+                        std::vector<float> row_f32(static_cast<size_t>(pl_cols));
+                        #pragma omp for schedule(static)
+                        for (int r = 0; r < V_sh; ++r) {
+                            Avx2Math::dequantize_row(row_f32.data(), *pl_td, row_base + r, pl_cols);
+                            float max_abs = 0.0f;
+                            for (int c = 0; c < pl_cols; ++c) {
+                                float a = std::fabs(row_f32[static_cast<size_t>(c)]);
+                                if (a > max_abs) max_abs = a;
+                            }
+                            const float scale = (max_abs > 1e-12f) ? (max_abs / 127.0f) : 1.0f;
+                            const float inv_scale = (max_abs > 1e-12f) ? (127.0f / max_abs) : 0.0f;
+                            sc[static_cast<size_t>(r)] = scale;
+                            int8_t* dst_r = sq.data() + static_cast<size_t>(r) * static_cast<size_t>(pl_cols);
+                            for (int c = 0; c < pl_cols; ++c) {
+                                int q = static_cast<int>(std::lrintf(row_f32[static_cast<size_t>(c)] * inv_scale));
+                                dst_r[c] = static_cast<int8_t>(std::clamp(q, -127, 127));
+                            }
+                        }
+                    }
+                }
+                wb = backend_->upload_s8_nd(sq.data(), {V_sh, pl_cols}, dev);
+                PJRT_Buffer* sb = backend_->upload_f32_nd(sc.data(), {V_sh}, dev);
+                if (!sb) { backend_->destroy_buffer(wb); return false; }
+                replica_scale_bufs[static_cast<size_t>(rep)].push_back(sb);
+                total_bytes += shard_elems + static_cast<size_t>(V_sh) * sizeof(float);
+            }
+            if (!wb) return false;
+            replica_weight_bufs_[static_cast<size_t>(rep)].push_back(wb);
+        }
+    }
+
+    // Append INT8 scales immediately after the main weights (matching MLIR arg order!)
     if (i8) {
         for (int rep = 0; rep < R; ++rep) {
             for (auto* sb : replica_scale_bufs[static_cast<size_t>(rep)]) {
@@ -1184,6 +1380,12 @@ bool HavenTpuGemma4Engine::initialize(HavenTpuPjrtBackend* backend,
     host_engine_ = &host_engine;
     model_cfg_ = mc;
     cfg_ = cfg;
+    // On-chip embedding gather reuses %w_lm_head directly when output weights are tied to token_embd (Gemma 4)
+    if (cfg_.use_onchip_embeddings &&
+        host_engine.get_output_tensor() != nullptr &&
+        host_engine.get_output_tensor() != host_engine.get_token_embd_tensor()) {
+        cfg_.use_onchip_embeddings = false;
+    }
     metrics_ = {};
 
     // 1. Compile full 42-layer decode graph (S = 1) FIRST so we discover XLA's exact torus replica-to-device assignment!
@@ -1264,71 +1466,98 @@ bool HavenTpuGemma4Engine::execute_graph(PJRT_LoadedExecutable* exec,
         return false;
     }
 
-    // Fast host lookup of [B, S, D] token embeddings and [B, S, L, 256] Pleias token embeddings (~5 us for B=1, S=1!)
-    const size_t emb_n = static_cast<size_t>(B) * static_cast<size_t>(S) * static_cast<size_t>(D);
-    const size_t pl_n  = static_cast<size_t>(B) * static_cast<size_t>(S) * static_cast<size_t>(L) * static_cast<size_t>(P_dim);
-    emb_f32_scratch_.resize(emb_n);
-    emb_bf16_scratch_.resize(emb_n);
-    pleias_f32_scratch_.resize(pl_n);
-    pleias_bf16_scratch_.resize(pl_n);
-
-    const TensorDesc* tok_td = host_engine_->get_token_embd_tensor();
-    const TensorDesc* pl_td  = host_engine_->get_per_layer_token_embd_tensor();
-    const float emb_scale = model_cfg_.is_gemma ? std::sqrt(static_cast<float>(D)) : 1.0f;
-    const float tok_pl_scale = std::sqrt(static_cast<float>(P_dim));
-
-    for (int idx = 0; idx < B * S; ++idx) {
-        const int tok = static_cast<int>(std::min<uint32_t>(flat_tokens[static_cast<size_t>(idx)], model_cfg_.vocab_size - 1));
-        float* edst = emb_f32_scratch_.data() + static_cast<size_t>(idx) * static_cast<size_t>(D);
-        if (tok_td) {
-            Avx2Math::dequantize_row(edst, *tok_td, tok, D);
-            for (int c = 0; c < D; ++c) edst[c] *= emb_scale;
-        } else {
-            std::memset(edst, 0, static_cast<size_t>(D) * sizeof(float));
-        }
-
-        float* pdst = pleias_f32_scratch_.data() + static_cast<size_t>(idx) * static_cast<size_t>(L * P_dim);
-        if (pl_td) {
-            Avx2Math::dequantize_row(pdst, *pl_td, tok, L * P_dim);
-            for (int c = 0; c < L * P_dim; ++c) pdst[c] *= tok_pl_scale;
-        } else {
-            std::memset(pdst, 0, static_cast<size_t>(L * P_dim) * sizeof(float));
-        }
-    }
-
-    HavenTpuPjrtBackend::convert_f32_to_bf16(emb_f32_scratch_.data(), emb_bf16_scratch_.data(), emb_n);
-    HavenTpuPjrtBackend::convert_f32_to_bf16(pleias_f32_scratch_.data(), pleias_bf16_scratch_.data(), pl_n);
-
     int32_t pos_i32 = static_cast<int32_t>(std::clamp(start_pos, 0, std::max(0, cfg_.max_seq_len - S)));
 
     auto th0 = std::chrono::high_resolution_clock::now();
-    // Upload tiny per-step inputs (26 KB for B=1, S=1!) to each replica's assigned TPU chip
+    std::vector<PJRT_Buffer*> step_toks(static_cast<size_t>(R), nullptr);
     std::vector<PJRT_Buffer*> step_emb(static_cast<size_t>(R), nullptr);
     std::vector<PJRT_Buffer*> step_pl(static_cast<size_t>(R), nullptr);
     std::vector<PJRT_Buffer*> step_pos(static_cast<size_t>(R), nullptr);
     std::vector<std::vector<PJRT_Buffer*>> args_per_rep(static_cast<size_t>(R));
 
-    for (int rep = 0; rep < R; ++rep) {
-        const int dev = replica_dev_indices_[static_cast<size_t>(rep)];
-        step_emb[static_cast<size_t>(rep)] = backend_->upload_bf16_nd(emb_bf16_scratch_.data(), {B, S, D}, dev);
-        step_pl[static_cast<size_t>(rep)]  = backend_->upload_bf16_nd(pleias_bf16_scratch_.data(), {B, S, L, P_dim}, dev);
-        step_pos[static_cast<size_t>(rep)] = backend_->upload_i32_nd(&pos_i32, {}, dev);
-        if (!step_emb[static_cast<size_t>(rep)] || !step_pl[static_cast<size_t>(rep)] || !step_pos[static_cast<size_t>(rep)]) {
-            for (int k = 0; k <= rep; ++k) {
-                backend_->destroy_buffer(step_emb[static_cast<size_t>(k)]);
-                backend_->destroy_buffer(step_pl[static_cast<size_t>(k)]);
-                backend_->destroy_buffer(step_pos[static_cast<size_t>(k)]);
-            }
-            last_error_ = "Per-step H2D upload failed: " + backend_->get_last_error();
-            return false;
+    if (cfg_.use_onchip_embeddings) {
+        // Zero CPU dequantization! Upload ONLY [B, S] int32 token IDs (4 bytes for B=1, 512 bytes for B=128!)
+        std::vector<int32_t> tok_ids_i32(static_cast<size_t>(B) * static_cast<size_t>(S));
+        for (size_t i = 0; i < tok_ids_i32.size(); ++i) {
+            tok_ids_i32[i] = static_cast<int32_t>(std::min<uint32_t>(flat_tokens[i], model_cfg_.vocab_size - 1));
         }
-        auto& a = args_per_rep[static_cast<size_t>(rep)];
-        a.reserve(3 + replica_weight_bufs_[static_cast<size_t>(rep)].size() + 4);
-        a.push_back(step_emb[static_cast<size_t>(rep)]);
-        a.push_back(step_pl[static_cast<size_t>(rep)]);
-        a.push_back(step_pos[static_cast<size_t>(rep)]);
-        for (auto* wb : replica_weight_bufs_[static_cast<size_t>(rep)]) a.push_back(wb);
-        for (auto* kv : replica_kv_bufs_[static_cast<size_t>(rep)]) a.push_back(kv);
+        for (int rep = 0; rep < R; ++rep) {
+            const int dev = replica_dev_indices_[static_cast<size_t>(rep)];
+            step_toks[static_cast<size_t>(rep)] = backend_->upload_i32_nd(tok_ids_i32.data(), {B, S}, dev);
+            step_pos[static_cast<size_t>(rep)]  = backend_->upload_i32_nd(&pos_i32, {}, dev);
+            if (!step_toks[static_cast<size_t>(rep)] || !step_pos[static_cast<size_t>(rep)]) {
+                for (int k = 0; k <= rep; ++k) {
+                    backend_->destroy_buffer(step_toks[static_cast<size_t>(k)]);
+                    backend_->destroy_buffer(step_pos[static_cast<size_t>(k)]);
+                }
+                last_error_ = "Per-step token-ID H2D upload failed: " + backend_->get_last_error();
+                return false;
+            }
+            auto& a = args_per_rep[static_cast<size_t>(rep)];
+            a.reserve(2 + replica_weight_bufs_[static_cast<size_t>(rep)].size() + 4);
+            a.push_back(step_toks[static_cast<size_t>(rep)]);
+            a.push_back(step_pos[static_cast<size_t>(rep)]);
+            for (auto* wb : replica_weight_bufs_[static_cast<size_t>(rep)]) a.push_back(wb);
+            for (auto* kv : replica_kv_bufs_[static_cast<size_t>(rep)]) a.push_back(kv);
+        }
+    } else {
+        // Fast host lookup of [B, S, D] token embeddings and [B, S, L, 256] Pleias token embeddings
+        const size_t emb_n = static_cast<size_t>(B) * static_cast<size_t>(S) * static_cast<size_t>(D);
+        const size_t pl_n  = static_cast<size_t>(B) * static_cast<size_t>(S) * static_cast<size_t>(L) * static_cast<size_t>(P_dim);
+        emb_f32_scratch_.resize(emb_n);
+        emb_bf16_scratch_.resize(emb_n);
+        pleias_f32_scratch_.resize(pl_n);
+        pleias_bf16_scratch_.resize(pl_n);
+
+        const TensorDesc* tok_td = host_engine_->get_token_embd_tensor();
+        const TensorDesc* pl_td  = host_engine_->get_per_layer_token_embd_tensor();
+        const float emb_scale = model_cfg_.is_gemma ? std::sqrt(static_cast<float>(D)) : 1.0f;
+        const float tok_pl_scale = std::sqrt(static_cast<float>(P_dim));
+
+        for (int idx = 0; idx < B * S; ++idx) {
+            const int tok = static_cast<int>(std::min<uint32_t>(flat_tokens[static_cast<size_t>(idx)], model_cfg_.vocab_size - 1));
+            float* edst = emb_f32_scratch_.data() + static_cast<size_t>(idx) * static_cast<size_t>(D);
+            if (tok_td) {
+                Avx2Math::dequantize_row(edst, *tok_td, tok, D);
+                for (int c = 0; c < D; ++c) edst[c] *= emb_scale;
+            } else {
+                std::memset(edst, 0, static_cast<size_t>(D) * sizeof(float));
+            }
+
+            float* pdst = pleias_f32_scratch_.data() + static_cast<size_t>(idx) * static_cast<size_t>(L * P_dim);
+            if (pl_td) {
+                Avx2Math::dequantize_row(pdst, *pl_td, tok, L * P_dim);
+                for (int c = 0; c < L * P_dim; ++c) pdst[c] *= tok_pl_scale;
+            } else {
+                std::memset(pdst, 0, static_cast<size_t>(L * P_dim) * sizeof(float));
+            }
+        }
+
+        HavenTpuPjrtBackend::convert_f32_to_bf16(emb_f32_scratch_.data(), emb_bf16_scratch_.data(), emb_n);
+        HavenTpuPjrtBackend::convert_f32_to_bf16(pleias_f32_scratch_.data(), pleias_bf16_scratch_.data(), pl_n);
+
+        for (int rep = 0; rep < R; ++rep) {
+            const int dev = replica_dev_indices_[static_cast<size_t>(rep)];
+            step_emb[static_cast<size_t>(rep)] = backend_->upload_bf16_nd(emb_bf16_scratch_.data(), {B, S, D}, dev);
+            step_pl[static_cast<size_t>(rep)]  = backend_->upload_bf16_nd(pleias_bf16_scratch_.data(), {B, S, L, P_dim}, dev);
+            step_pos[static_cast<size_t>(rep)] = backend_->upload_i32_nd(&pos_i32, {}, dev);
+            if (!step_emb[static_cast<size_t>(rep)] || !step_pl[static_cast<size_t>(rep)] || !step_pos[static_cast<size_t>(rep)]) {
+                for (int k = 0; k <= rep; ++k) {
+                    backend_->destroy_buffer(step_emb[static_cast<size_t>(k)]);
+                    backend_->destroy_buffer(step_pl[static_cast<size_t>(k)]);
+                    backend_->destroy_buffer(step_pos[static_cast<size_t>(k)]);
+                }
+                last_error_ = "Per-step H2D upload failed: " + backend_->get_last_error();
+                return false;
+            }
+            auto& a = args_per_rep[static_cast<size_t>(rep)];
+            a.reserve(3 + replica_weight_bufs_[static_cast<size_t>(rep)].size() + 4);
+            a.push_back(step_emb[static_cast<size_t>(rep)]);
+            a.push_back(step_pl[static_cast<size_t>(rep)]);
+            a.push_back(step_pos[static_cast<size_t>(rep)]);
+            for (auto* wb : replica_weight_bufs_[static_cast<size_t>(rep)]) a.push_back(wb);
+            for (auto* kv : replica_kv_bufs_[static_cast<size_t>(rep)]) a.push_back(kv);
+        }
     }
 
     auto te0 = std::chrono::high_resolution_clock::now();
@@ -1344,6 +1573,7 @@ bool HavenTpuGemma4Engine::execute_graph(PJRT_LoadedExecutable* exec,
     auto td0 = std::chrono::high_resolution_clock::now();
 
     for (int rep = 0; rep < R; ++rep) {
+        backend_->destroy_buffer(step_toks[static_cast<size_t>(rep)]);
         backend_->destroy_buffer(step_emb[static_cast<size_t>(rep)]);
         backend_->destroy_buffer(step_pl[static_cast<size_t>(rep)]);
         backend_->destroy_buffer(step_pos[static_cast<size_t>(rep)]);
