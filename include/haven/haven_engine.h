@@ -122,6 +122,12 @@ public:
 
     const ModelConfig& get_config() const { return loader_.get_config(); }
     const TensorDesc* get_token_embd_tensor() const { return token_embd_tensor_; }
+    const TensorDesc* get_per_layer_token_embd_tensor() const { return per_layer_token_embd_tensor_; }
+    const TensorDesc* get_per_layer_model_proj_tensor() const { return per_layer_model_proj_tensor_; }
+    const TensorDesc* get_per_layer_proj_norm_tensor() const { return per_layer_proj_norm_tensor_; }
+    const TensorDesc* get_rope_freqs_tensor() const { return rope_freqs_tensor_; }
+    const TensorDesc* get_output_norm_tensor() const { return output_norm_tensor_; }
+    const TensorDesc* get_output_tensor() const { return output_tensor_; }
     const LayerTensors& get_layer_tensors(uint32_t l) const { return layers_[l]; }
     size_t get_memory_count() const { return memory_engine_.get_memory_count(); }
     size_t get_knowledge_count() const { return knowledge_store_.get_relation_count(); }

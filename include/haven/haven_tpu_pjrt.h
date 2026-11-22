@@ -81,15 +81,21 @@ public:
     static void convert_f32_to_bf16(const float* src, uint16_t* dst, size_t n);
     static void convert_bf16_to_f32(const uint16_t* src, float* dst, size_t n);
 
-    // HBM3 Tensor Transfer & Lifecycle
+    // HBM3 Tensor Transfer & Lifecycle (2D convenience + general N-D)
     PJRT_Buffer* upload_bf16_2d(const uint16_t* host_data, int64_t rows, int64_t cols, int device_index = 0);
     PJRT_Buffer* upload_f32_2d(const float* host_data, int64_t rows, int64_t cols, int device_index = 0);
+    PJRT_Buffer* upload_bf16_nd(const uint16_t* host_data, const std::vector<int64_t>& dims, int device_index = 0);
+    PJRT_Buffer* upload_f32_nd(const float* host_data, const std::vector<int64_t>& dims, int device_index = 0);
+    PJRT_Buffer* upload_s8_nd(const int8_t* host_data, const std::vector<int64_t>& dims, int device_index = 0);
+    PJRT_Buffer* upload_i32_nd(const int32_t* host_data, const std::vector<int64_t>& dims, int device_index = 0);
     bool download_f32(PJRT_Buffer* buf, float* host_out, size_t num_elems);
     bool download_bf16(PJRT_Buffer* buf, uint16_t* host_out, size_t num_elems);
+    bool download_i32(PJRT_Buffer* buf, int32_t* host_out, size_t num_elems);
     void destroy_buffer(PJRT_Buffer* buf);
 
-    // Compile textual StableHLO MLIR module for single-device or device-ordinal execution
+    // Compile textual StableHLO MLIR module (portable single-device, ordinal-bound, or multi-replica SPMD)
     PJRT_LoadedExecutable* compile_stablehlo(const std::string& mlir_code, int device_ordinal = -1);
+    PJRT_LoadedExecutable* compile_stablehlo_replicated(const std::string& mlir_code, int num_replicas);
     void destroy_executable(PJRT_LoadedExecutable* exec);
 
     // Execute a compiled StableHLO executable on a single addressable TPU device
@@ -98,6 +104,13 @@ public:
                     const std::vector<PJRT_Buffer*>& inputs,
                     size_t num_outputs,
                     std::vector<PJRT_Buffer*>& outputs);
+
+    // Execute a multi-replica SPMD StableHLO executable across R TensorCores simultaneously
+    bool execute_replicated(PJRT_LoadedExecutable* exec,
+                            int num_replicas,
+                            const std::vector<std::vector<PJRT_Buffer*>>& inputs_per_replica,
+                            size_t num_outputs,
+                            std::vector<std::vector<PJRT_Buffer*>>& outputs_per_replica);
 
     // Upload a quantized GGUF weight matrix [rows, cols] into persistent TPU HBM3 as BF16
     bool upload_gguf_weight_matrix(const TensorDesc& weight, int rows, int cols,

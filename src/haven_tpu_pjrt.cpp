@@ -69,12 +69,19 @@ void HavenTpuPjrtBackend::shutdown() {
 
 PJRT_Buffer* HavenTpuPjrtBackend::upload_bf16_2d(const uint16_t*, int64_t, int64_t, int) { return nullptr; }
 PJRT_Buffer* HavenTpuPjrtBackend::upload_f32_2d(const float*, int64_t, int64_t, int) { return nullptr; }
+PJRT_Buffer* HavenTpuPjrtBackend::upload_bf16_nd(const uint16_t*, const std::vector<int64_t>&, int) { return nullptr; }
+PJRT_Buffer* HavenTpuPjrtBackend::upload_f32_nd(const float*, const std::vector<int64_t>&, int) { return nullptr; }
+PJRT_Buffer* HavenTpuPjrtBackend::upload_s8_nd(const int8_t*, const std::vector<int64_t>&, int) { return nullptr; }
+PJRT_Buffer* HavenTpuPjrtBackend::upload_i32_nd(const int32_t*, const std::vector<int64_t>&, int) { return nullptr; }
 bool HavenTpuPjrtBackend::download_f32(PJRT_Buffer*, float*, size_t) { return false; }
 bool HavenTpuPjrtBackend::download_bf16(PJRT_Buffer*, uint16_t*, size_t) { return false; }
+bool HavenTpuPjrtBackend::download_i32(PJRT_Buffer*, int32_t*, size_t) { return false; }
 void HavenTpuPjrtBackend::destroy_buffer(PJRT_Buffer*) {}
 PJRT_LoadedExecutable* HavenTpuPjrtBackend::compile_stablehlo(const std::string&, int) { return nullptr; }
+PJRT_LoadedExecutable* HavenTpuPjrtBackend::compile_stablehlo_replicated(const std::string&, int) { return nullptr; }
 void HavenTpuPjrtBackend::destroy_executable(PJRT_LoadedExecutable*) {}
 bool HavenTpuPjrtBackend::execute_1d(PJRT_LoadedExecutable*, int, const std::vector<PJRT_Buffer*>&, size_t, std::vector<PJRT_Buffer*>&) { return false; }
+bool HavenTpuPjrtBackend::execute_replicated(PJRT_LoadedExecutable*, int, const std::vector<std::vector<PJRT_Buffer*>>&, size_t, std::vector<std::vector<PJRT_Buffer*>>&) { return false; }
 bool HavenTpuPjrtBackend::upload_gguf_weight_matrix(const TensorDesc&, int, int, TpuMatrixHandle&, int) { return false; }
 void HavenTpuPjrtBackend::free_matrix(TpuMatrixHandle& handle) { handle = {}; }
 bool HavenTpuPjrtBackend::matmul_resident_nt(const float*, int, const TpuMatrixHandle&, float*) { return false; }
@@ -401,19 +408,17 @@ void HavenTpuPjrtBackend::shutdown() {
     initialized_ = false;
 }
 
-PJRT_Buffer* HavenTpuPjrtBackend::upload_bf16_2d(const uint16_t* host_data, int64_t rows, int64_t cols, int device_index) {
-    if (!initialized_ || !host_data || rows <= 0 || cols <= 0 ||
-        device_index < 0 || static_cast<size_t>(device_index) >= devices_.size()) {
+PJRT_Buffer* HavenTpuPjrtBackend::upload_bf16_nd(const uint16_t* host_data, const std::vector<int64_t>& dims, int device_index) {
+    if (!initialized_ || !host_data || device_index < 0 || static_cast<size_t>(device_index) >= devices_.size()) {
         return nullptr;
     }
-    int64_t dims[2] = {rows, cols};
     PJRT_Client_BufferFromHostBuffer_Args args{};
     args.struct_size = PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE;
     args.client = client_;
     args.data = host_data;
     args.type = PJRT_Buffer_Type_BF16;
-    args.dims = dims;
-    args.num_dims = 2;
+    args.dims = dims.empty() ? nullptr : dims.data();
+    args.num_dims = dims.size();
     args.host_buffer_semantics = PJRT_HostBufferSemantics_kImmutableOnlyDuringCall;
     args.device = devices_[static_cast<size_t>(device_index)];
 
@@ -427,19 +432,17 @@ PJRT_Buffer* HavenTpuPjrtBackend::upload_bf16_2d(const uint16_t* host_data, int6
     return args.buffer;
 }
 
-PJRT_Buffer* HavenTpuPjrtBackend::upload_f32_2d(const float* host_data, int64_t rows, int64_t cols, int device_index) {
-    if (!initialized_ || !host_data || rows <= 0 || cols <= 0 ||
-        device_index < 0 || static_cast<size_t>(device_index) >= devices_.size()) {
+PJRT_Buffer* HavenTpuPjrtBackend::upload_f32_nd(const float* host_data, const std::vector<int64_t>& dims, int device_index) {
+    if (!initialized_ || !host_data || device_index < 0 || static_cast<size_t>(device_index) >= devices_.size()) {
         return nullptr;
     }
-    int64_t dims[2] = {rows, cols};
     PJRT_Client_BufferFromHostBuffer_Args args{};
     args.struct_size = PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE;
     args.client = client_;
     args.data = host_data;
     args.type = PJRT_Buffer_Type_F32;
-    args.dims = dims;
-    args.num_dims = 2;
+    args.dims = dims.empty() ? nullptr : dims.data();
+    args.num_dims = dims.size();
     args.host_buffer_semantics = PJRT_HostBufferSemantics_kImmutableOnlyDuringCall;
     args.device = devices_[static_cast<size_t>(device_index)];
 
@@ -451,6 +454,64 @@ PJRT_Buffer* HavenTpuPjrtBackend::upload_f32_2d(const float* host_data, int64_t 
         await_and_destroy_event(args.done_with_host_buffer);
     }
     return args.buffer;
+}
+
+PJRT_Buffer* HavenTpuPjrtBackend::upload_s8_nd(const int8_t* host_data, const std::vector<int64_t>& dims, int device_index) {
+    if (!initialized_ || !host_data || device_index < 0 || static_cast<size_t>(device_index) >= devices_.size()) {
+        return nullptr;
+    }
+    PJRT_Client_BufferFromHostBuffer_Args args{};
+    args.struct_size = PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE;
+    args.client = client_;
+    args.data = host_data;
+    args.type = PJRT_Buffer_Type_S8;
+    args.dims = dims.empty() ? nullptr : dims.data();
+    args.num_dims = dims.size();
+    args.host_buffer_semantics = PJRT_HostBufferSemantics_kImmutableOnlyDuringCall;
+    args.device = devices_[static_cast<size_t>(device_index)];
+
+    if (PJRT_Error* err = api_->PJRT_Client_BufferFromHostBuffer(&args)) {
+        last_error_ = "BufferFromHostBuffer(S8) failed: " + consume_error(err);
+        return nullptr;
+    }
+    if (args.done_with_host_buffer) {
+        await_and_destroy_event(args.done_with_host_buffer);
+    }
+    return args.buffer;
+}
+
+PJRT_Buffer* HavenTpuPjrtBackend::upload_i32_nd(const int32_t* host_data, const std::vector<int64_t>& dims, int device_index) {
+    if (!initialized_ || !host_data || device_index < 0 || static_cast<size_t>(device_index) >= devices_.size()) {
+        return nullptr;
+    }
+    PJRT_Client_BufferFromHostBuffer_Args args{};
+    args.struct_size = PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE;
+    args.client = client_;
+    args.data = host_data;
+    args.type = PJRT_Buffer_Type_S32;
+    args.dims = dims.empty() ? nullptr : dims.data();
+    args.num_dims = dims.size();
+    args.host_buffer_semantics = PJRT_HostBufferSemantics_kImmutableOnlyDuringCall;
+    args.device = devices_[static_cast<size_t>(device_index)];
+
+    if (PJRT_Error* err = api_->PJRT_Client_BufferFromHostBuffer(&args)) {
+        last_error_ = "BufferFromHostBuffer(S32) failed: " + consume_error(err);
+        return nullptr;
+    }
+    if (args.done_with_host_buffer) {
+        await_and_destroy_event(args.done_with_host_buffer);
+    }
+    return args.buffer;
+}
+
+PJRT_Buffer* HavenTpuPjrtBackend::upload_bf16_2d(const uint16_t* host_data, int64_t rows, int64_t cols, int device_index) {
+    if (rows <= 0 || cols <= 0) return nullptr;
+    return upload_bf16_nd(host_data, {rows, cols}, device_index);
+}
+
+PJRT_Buffer* HavenTpuPjrtBackend::upload_f32_2d(const float* host_data, int64_t rows, int64_t cols, int device_index) {
+    if (rows <= 0 || cols <= 0) return nullptr;
+    return upload_f32_nd(host_data, {rows, cols}, device_index);
 }
 
 bool HavenTpuPjrtBackend::download_f32(PJRT_Buffer* buf, float* host_out, size_t num_elems) {
@@ -476,6 +537,20 @@ bool HavenTpuPjrtBackend::download_bf16(PJRT_Buffer* buf, uint16_t* host_out, si
     args.dst_size = num_elems * sizeof(uint16_t);
     if (PJRT_Error* err = api_->PJRT_Buffer_ToHostBuffer(&args)) {
         last_error_ = "ToHostBuffer(BF16) failed: " + consume_error(err);
+        return false;
+    }
+    return await_and_destroy_event(args.event);
+}
+
+bool HavenTpuPjrtBackend::download_i32(PJRT_Buffer* buf, int32_t* host_out, size_t num_elems) {
+    if (!initialized_ || !buf || !host_out || num_elems == 0) return false;
+    PJRT_Buffer_ToHostBuffer_Args args{};
+    args.struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE;
+    args.src = buf;
+    args.dst = host_out;
+    args.dst_size = num_elems * sizeof(int32_t);
+    if (PJRT_Error* err = api_->PJRT_Buffer_ToHostBuffer(&args)) {
+        last_error_ = "ToHostBuffer(S32) failed: " + consume_error(err);
         return false;
     }
     return await_and_destroy_event(args.event);
@@ -517,6 +592,38 @@ PJRT_LoadedExecutable* HavenTpuPjrtBackend::compile_stablehlo(const std::string&
 
     if (PJRT_Error* err = api_->PJRT_Client_Compile(&cargs)) {
         last_error_ = "PJRT_Client_Compile failed: " + consume_error(err);
+        return nullptr;
+    }
+    return cargs.executable;
+}
+
+PJRT_LoadedExecutable* HavenTpuPjrtBackend::compile_stablehlo_replicated(const std::string& mlir_code, int num_replicas) {
+    if (!initialized_ || mlir_code.empty() || num_replicas <= 0 ||
+        static_cast<size_t>(num_replicas) > devices_.size()) {
+        last_error_ = "Invalid num_replicas for compile_stablehlo_replicated.";
+        return nullptr;
+    }
+
+    std::string code_copy = mlir_code;
+    static constexpr const char kFormat[] = "mlir";
+    PJRT_Program prog{};
+    prog.struct_size = PJRT_Program_STRUCT_SIZE;
+    prog.code = code_copy.data();
+    prog.code_size = code_copy.size();
+    prog.format = kFormat;
+    prog.format_size = 4;
+
+    std::string compile_opts = encode_compile_options_proto(-1, num_replicas, 1, /*portable=*/false);
+
+    PJRT_Client_Compile_Args cargs{};
+    cargs.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
+    cargs.client = client_;
+    cargs.program = &prog;
+    cargs.compile_options = compile_opts.data();
+    cargs.compile_options_size = compile_opts.size();
+
+    if (PJRT_Error* err = api_->PJRT_Client_Compile(&cargs)) {
+        last_error_ = "PJRT_Client_Compile(replicated) failed: " + consume_error(err);
         return nullptr;
     }
     return cargs.executable;
@@ -569,6 +676,73 @@ bool HavenTpuPjrtBackend::execute_1d(PJRT_LoadedExecutable* exec,
         for (auto*& b : outputs) {
             destroy_buffer(b);
             b = nullptr;
+        }
+        return false;
+    }
+    return true;
+}
+
+bool HavenTpuPjrtBackend::execute_replicated(PJRT_LoadedExecutable* exec,
+                                             int num_replicas,
+                                             const std::vector<std::vector<PJRT_Buffer*>>& inputs_per_replica,
+                                             size_t num_outputs,
+                                             std::vector<std::vector<PJRT_Buffer*>>& outputs_per_replica) {
+    if (!initialized_ || !exec || num_replicas <= 0 ||
+        static_cast<size_t>(num_replicas) > devices_.size() ||
+        inputs_per_replica.size() != static_cast<size_t>(num_replicas) || num_outputs == 0) {
+        last_error_ = "Invalid arguments to execute_replicated.";
+        return false;
+    }
+
+    const size_t R = static_cast<size_t>(num_replicas);
+    const size_t num_args = inputs_per_replica[0].size();
+    std::vector<PJRT_Buffer* const*> arg_ptrs(R, nullptr);
+    for (size_t r = 0; r < R; ++r) {
+        if (inputs_per_replica[r].size() != num_args) {
+            last_error_ = "Mismatched input argument count across replicas.";
+            return false;
+        }
+        arg_ptrs[r] = inputs_per_replica[r].empty() ? nullptr : inputs_per_replica[r].data();
+    }
+
+    outputs_per_replica.assign(R, std::vector<PJRT_Buffer*>(num_outputs, nullptr));
+    std::vector<PJRT_Buffer**> out_ptrs(R, nullptr);
+    for (size_t r = 0; r < R; ++r) {
+        out_ptrs[r] = outputs_per_replica[r].data();
+    }
+    std::vector<PJRT_Event*> done_evs(R, nullptr);
+
+    PJRT_ExecuteOptions opts{};
+    opts.struct_size = PJRT_STRUCT_SIZE(PJRT_ExecuteOptions, call_location);
+
+    PJRT_LoadedExecutable_Execute_Args eargs{};
+    eargs.struct_size = PJRT_LoadedExecutable_Execute_Args_STRUCT_SIZE;
+    eargs.executable = exec;
+    eargs.options = &opts;
+    eargs.argument_lists = arg_ptrs.data();
+    eargs.num_devices = R;
+    eargs.num_args = num_args;
+    eargs.output_lists = out_ptrs.data();
+    eargs.device_complete_events = done_evs.data();
+    eargs.execute_device = nullptr; // Execute across all R compiled replicas simultaneously
+
+    if (PJRT_Error* err = api_->PJRT_LoadedExecutable_Execute(&eargs)) {
+        last_error_ = "PJRT_LoadedExecutable_Execute(replicated) failed: " + consume_error(err);
+        return false;
+    }
+
+    bool all_ok = true;
+    for (size_t r = 0; r < R; ++r) {
+        if (done_evs[r] && !await_and_destroy_event(done_evs[r])) {
+            all_ok = false;
+        }
+    }
+    if (!all_ok) {
+        for (size_t r = 0; r < R; ++r) {
+            for (auto*& b : outputs_per_replica[r]) {
+                destroy_buffer(b);
+                b = nullptr;
+            }
         }
         return false;
     }
