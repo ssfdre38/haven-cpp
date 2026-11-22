@@ -113,22 +113,25 @@ static void append_int64_field(std::string& out, uint32_t field_num, int64_t val
     append_varint(out, static_cast<uint64_t>(val));
 }
 
-static std::string encode_compile_options_proto(int device_ordinal, int num_replicas = 1, int num_partitions = 1) {
+static std::string encode_compile_options_proto(int device_ordinal, int num_replicas = 1, int num_partitions = 1, bool portable = false) {
     std::string build_opts;
-    if (device_ordinal >= 0) {
-        append_int64_field(build_opts, 2, device_ordinal);
+    if (!portable && device_ordinal >= 0) {
+        append_int64_field(build_opts, 1, device_ordinal); // ExecutableBuildOptionsProto.device_ordinal = 1
     }
     if (num_replicas > 0) {
-        append_int64_field(build_opts, 4, num_replicas);
+        append_int64_field(build_opts, 4, num_replicas);   // num_replicas = 4
     }
     if (num_partitions > 0) {
-        append_int64_field(build_opts, 5, num_partitions);
+        append_int64_field(build_opts, 5, num_partitions); // num_partitions = 5
     }
     std::string compile_opts;
     if (!build_opts.empty()) {
-        append_varint(compile_opts, (3ULL << 3) | 2ULL); // field 3, length-delimited
+        append_varint(compile_opts, (3ULL << 3) | 2ULL); // CompileOptionsProto.executable_build_options = 3
         append_varint(compile_opts, build_opts.size());
         compile_opts.append(build_opts);
+    }
+    if (portable) {
+        append_int64_field(compile_opts, 4, 1);          // CompileOptionsProto.compile_portable_executable = 4
     }
     return compile_opts;
 }
@@ -500,10 +503,10 @@ PJRT_LoadedExecutable* HavenTpuPjrtBackend::compile_stablehlo(const std::string&
     prog.format = kFormat;
     prog.format_size = 4;
 
-    std::string compile_opts;
-    if (device_ordinal >= 0) {
-        compile_opts = encode_compile_options_proto(device_ordinal, 1, 1);
-    }
+    // When device_ordinal == -1, compile a portable executable usable on ANY addressable TPU chip!
+    std::string compile_opts = (device_ordinal < 0)
+        ? encode_compile_options_proto(-1, 1, 1, /*portable=*/true)
+        : encode_compile_options_proto(device_ordinal, 1, 1, /*portable=*/false);
 
     PJRT_Client_Compile_Args cargs{};
     cargs.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
@@ -618,7 +621,8 @@ void HavenTpuPjrtBackend::free_matrix(TpuMatrixHandle& handle) {
 }
 
 PJRT_LoadedExecutable* HavenTpuPjrtBackend::get_or_compile_matmul_nt(int batch_m, int N, int K, int device_index) {
-    std::string key = "mm_nt_" + std::to_string(batch_m) + "_" + std::to_string(N) + "_" + std::to_string(K) + "_d" + std::to_string(device_index);
+    (void)device_index;
+    std::string key = "mm_nt_" + std::to_string(batch_m) + "_" + std::to_string(N) + "_" + std::to_string(K);
     {
         std::lock_guard<std::mutex> lock(cache_mutex_);
         auto it = exec_cache_.find(key);
@@ -636,7 +640,8 @@ PJRT_LoadedExecutable* HavenTpuPjrtBackend::get_or_compile_matmul_nt(int batch_m
          << "  }\n"
          << "}\n";
 
-    PJRT_LoadedExecutable* exec = compile_stablehlo(mlir.str(), device_index);
+    // Compile portable executable once; runs on any of the addressable TPU chips!
+    PJRT_LoadedExecutable* exec = compile_stablehlo(mlir.str(), -1);
     if (!exec) return nullptr;
 
     std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -645,7 +650,8 @@ PJRT_LoadedExecutable* HavenTpuPjrtBackend::get_or_compile_matmul_nt(int batch_m
 }
 
 PJRT_LoadedExecutable* HavenTpuPjrtBackend::get_or_compile_geglu_ffn(int batch_m, int hidden_dim, int emb_dim, int device_index) {
-    std::string key = "geglu_" + std::to_string(batch_m) + "_" + std::to_string(hidden_dim) + "_" + std::to_string(emb_dim) + "_d" + std::to_string(device_index);
+    (void)device_index;
+    std::string key = "geglu_" + std::to_string(batch_m) + "_" + std::to_string(hidden_dim) + "_" + std::to_string(emb_dim);
     {
         std::lock_guard<std::mutex> lock(cache_mutex_);
         auto it = exec_cache_.find(key);
@@ -688,7 +694,8 @@ PJRT_LoadedExecutable* HavenTpuPjrtBackend::get_or_compile_geglu_ffn(int batch_m
          << "  }\n"
          << "}\n";
 
-    PJRT_LoadedExecutable* exec = compile_stablehlo(mlir.str(), device_index);
+    // Compile portable executable once; runs on any of the addressable TPU chips!
+    PJRT_LoadedExecutable* exec = compile_stablehlo(mlir.str(), -1);
     if (!exec) return nullptr;
 
     std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -778,14 +785,11 @@ TpuGemmBenchResult HavenTpuPjrtBackend::benchmark_bf16_gemm(int M, int N, int K,
     const std::string mlir_str = mlir.str();
 
     auto t_comp0 = std::chrono::high_resolution_clock::now();
-    std::vector<PJRT_LoadedExecutable*> execs(static_cast<size_t>(use_devs), nullptr);
-    for (int d = 0; d < use_devs; ++d) {
-        execs[static_cast<size_t>(d)] = compile_stablehlo(mlir_str, d);
-        if (!execs[static_cast<size_t>(d)]) {
-            res.error = last_error_;
-            for (auto* e : execs) destroy_executable(e);
-            return res;
-        }
+    // Compile ONE portable executable and launch in parallel across all active TPU TensorCores!
+    PJRT_LoadedExecutable* portable_exec = compile_stablehlo(mlir_str, -1);
+    if (!portable_exec) {
+        res.error = last_error_;
+        return res;
     }
     auto t_comp1 = std::chrono::high_resolution_clock::now();
     res.compile_ms = std::chrono::duration<double, std::milli>(t_comp1 - t_comp0).count();
@@ -808,8 +812,8 @@ TpuGemmBenchResult HavenTpuPjrtBackend::benchmark_bf16_gemm(int M, int N, int K,
             for (int k = 0; k < use_devs; ++k) {
                 destroy_buffer(dev_a[static_cast<size_t>(k)]);
                 destroy_buffer(dev_b[static_cast<size_t>(k)]);
-                destroy_executable(execs[static_cast<size_t>(k)]);
             }
+            destroy_executable(portable_exec);
             return res;
         }
     }
@@ -823,7 +827,7 @@ TpuGemmBenchResult HavenTpuPjrtBackend::benchmark_bf16_gemm(int M, int N, int K,
         for (int d = 0; d < use_devs; ++d) {
             threads.emplace_back([&, d]() {
                 std::vector<PJRT_Buffer*> outs;
-                if (!execute_1d(execs[static_cast<size_t>(d)], d,
+                if (!execute_1d(portable_exec, d,
                                 {dev_a[static_cast<size_t>(d)], dev_b[static_cast<size_t>(d)]}, 1, outs)) {
                     return;
                 }
@@ -869,8 +873,8 @@ TpuGemmBenchResult HavenTpuPjrtBackend::benchmark_bf16_gemm(int M, int N, int K,
     for (int d = 0; d < use_devs; ++d) {
         destroy_buffer(dev_a[static_cast<size_t>(d)]);
         destroy_buffer(dev_b[static_cast<size_t>(d)]);
-        destroy_executable(execs[static_cast<size_t>(d)]);
     }
+    destroy_executable(portable_exec);
     return res;
 }
 
