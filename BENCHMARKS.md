@@ -3,28 +3,30 @@
 **Repository**: [`ssfdre38/haven-cpp`](https://github.com/ssfdre38/haven-cpp)  
 **Architecture**: Bare-Metal C++20, Zero-Copy GGUF V3 mmap, AVX2/FMA/F16C SIMD, In-Attention Direct Memory Access (DMA), 64-Bit Haven Memory Bank (`.hmb`)  
 **Target Hardware Context**: Windows x86_64, Native AVX2/FMA CPU, Mechanical Magnetic Platter HDD ("Spinners") Storage  
-**Date**: August 2026  
+**Date**: November 2026  
 
 ---
 
 ## 📋 Executive Summary
 
-This document presents the official empirical benchmarks for `haven-cpp`—a sovereign, self-contained, bare-metal C++20 companion inference engine and cognitive substrate. 
+This document presents the official empirical benchmarks for `haven-cpp`—a sovereign, self-contained, bare-metal C++20 inference engine, native Cloud TPU StableHLO runtime, and cognitive substrate.
 
-All tests were conducted on standard host hardware with **mechanical spinning hard drives (HDDs)** to evaluate worst-case random I/O conditions and prove that bare-metal SIMD algorithms and contiguous binary memory mapping eliminate traditional disk and runtime bottlenecks.
+Tests span both **worst-case local host hardware** (6-core Xeon CPU + mechanical HDDs) and **bare-metal Google Cloud TPU v6e-4 Trillium silicon** (4x TensorCores, 128 GB HBM3, 2x2 Optical ICI Torus, 180-vCPU AMD EPYC 9B14 host, zero Python runtime).
 
 ```
 +-----------------------------------------------------------------------------------+
-| 🌟 KEY PERFORMANCE HIGHLIGHTS                                                     |
+| KEY PERFORMANCE HIGHLIGHTS (VERIFIED ON REAL HARDWARE)                            |
 +-----------------------------------------------------------------------------------+
-| • 64-Bit Memory Scaling:    100,000 memories scanned in 9.86 ms on CPU (AVX2)     |
-| • Memory Storage Density:   71.3 MB total footprint for 100,000 full records      |
-| • Zero-Copy Mmap Loading:   0.458 ms cold-start latency to first token            |
-| • AVX2 Vector Math Kernel:  9.57 GFLOPS (0.86 µs per 4096-dim vector)             |
-| • In-Attention DMA Access:  5.90 µs intermediate transformer attention recall    |
-| • Sequence Forking (CoW):   0.00 µs (Zero duplicate memory overhead)              |
-| • Long-Context Attention:   32,768 tokens (4.0x YaRN RoPE scaling)                |
-| • Sovereign Plugin Substrate: 17/17 Plugins, 24/24 Actions verified (100.0% Pass) |
+| • Cloud TPU v6e-4 MXU Peak: 2,864.69 TFLOPS (2.865 PFLOPS BF16, 4 chips, C++20)  |
+| • TPU Continuous Batching:  9,180.0 tok/s end-to-end (B=128, INT8, OnChipEmb)     |
+| • TPU Batched MXU Prefill:  30,181 tok/s (4.24 ms for 128 tokens, 4-chip INT8)    |
+| • TPU Interactive Decode:   330.8 tok/s (3.02 ms/step, 24.81 ms 133-tok TTFT)     |
+| • Live TPU HTTP/SSE Server: 248.3 tok/s live streaming (full persona sampling)    |
+| • 262k Top-Tail Sampler:    0.15 ms/tok (150x speedup vs 22.6 ms full-vocab sort) |
+| • AVX2/F16C SIMD Kernel:    34.81 GFLOPS (3.64x speedup over 9.57 GFLOPS)         |
+| • 64-Bit Memory Scaling:    100,000 memories scanned in 9.86 ms on CPU (71.3 MB)  |
+| • Security & Fuzz Suite:    6/6 adversarial KAT, SHCP v2 AEAD & fuzz suites PASS  |
+| • Sovereign Plugins:        17/17 Plugins, 24/24 Actions verified (100.0% Pass)   |
 +-----------------------------------------------------------------------------------+
 ```
 
@@ -131,6 +133,56 @@ Every dynamically loaded `.dll` plugin was tested via the live HTTP API (`/api/t
 | **Search Latency** | 20–80 ms (HTTP / gRPC network overhead) | **1.6 µs – 9.8 ms** (AVX2 SIMD CPU registers) |
 | **Integration** | Prompt text stuffing (RAG context bloat) | **In-Attention DMA ($Q M^T$)** attention biasing |
 | **Portability** | Multi-file distributed databases | **Single file (`aura_vault.hmb`)** portable to any device |
+
+---
+
+---
+
+## 6. Cloud TPU v6e-4 (Trillium) Native C++20 PJRT & Live HTTP/SSE Benchmarks (November 2026)
+
+All TPU benchmarks were compiled directly from pure C++20 (`src/haven_tpu_pjrt.cpp`, `src/haven_tpu_gemma4.cpp`, `src/haven_server.cpp`) via `dlopen("libtpu.so")` (OpenXLA PJRT C ABI `0.75`, zero Python runtime) on a real 4-chip `v6e-4` slice in `europe-west4-a` using `haven-chat-v5.0.gguf` (42-layer Gemma 4, 262,144 vocab).
+
+### 6A. Raw StableHLO BF16 MXU Compute (`test-tpu-pjrt-bench`)
+
+| Shape | Active Silicon | Avg Step | Sustained Compute | Per-Chip TFLOPS | Checksum |
+| :--- | :--- | ---: | ---: | ---: | :---: |
+| `4096 x 4096` | 1 / 4 Chips | `0.40 / 0.44 ms` | `344.90 / 1,241.28 TFLOPS` | `344.90 / 310.32` | `1.00 == 1.00` |
+| `8192 x 8192` | 1 / 4 Chips | `1.63 / 1.70 ms` | `673.53 / 2,585.77 TFLOPS` | `673.53 / 646.44` | `2.00 == 2.00` |
+| `16384 x 16384` | **1 / 4 Chips** | **`12.00 / 12.28 ms`** | **`732.98 / 2,864.69 TFLOPS`** | **`732.98 / 716.17`** | `4.00 == 4.00` |
+
+### 6B. Full On-Chip 42-Layer Gemma 4 Engine (`test-tpu-gemma4-onchip`, `T=2048`)
+
+CPU Ground Truth (`180-vCPU EPYC 9B14`, `OMP=48`): 133-token prompt prefill in `4,140.6 ms`, `Top1 = 12932 ("Oh")`. All 16 tested TPU configurations matched `Top1 = 12932 == 12932` (`100%`).
+
+| Config | Silicon & Precision | Emb Mode | Parity / Top-1 | `S=128` MXU Prefill | Step Latency (H2D / TPU / D2H) | Per-User | Aggregate |
+| :--- | :--- | :--- | :---: | ---: | :--- | ---: | ---: |
+| `1A/2A` | 1-Chip BF16 | HostEmb | `0.982747` / Exact | `11.94 ms` (`10,717 tok/s`) | `8.68 ms` (`0.04 / 8.53 / 0.09`) | **115.2 tok/s** | **115.2 tok/s** |
+| `2B` | 1-Chip W8A16 INT8 | HostEmb | Exact Top-1 | `8.99 ms` (`14,238 tok/s`) | `6.38 ms` (`0.04 / 6.23 / 0.08`) | **156.8 tok/s** | **156.8 tok/s** |
+| `1B/2C` | 4-Chip Optical ICI TP BF16 | HostEmb | **`0.982857`** / Exact | `11.09 ms` (`11,538 tok/s`) | `4.33 ms` (`0.14 / 4.06 / 0.12`) | **230.9 tok/s** | **230.9 tok/s** |
+| `2D` | **4-Chip Optical ICI TP INT8** | HostEmb | Exact Top-1 | `10.22 ms` (`12,526 tok/s`) | **`3.02 ms`** (`0.13 / 2.76 / 0.11`) | **330.8 tok/s** | **330.8 tok/s** |
+| `3A` | 4-Chip TP `B=1` BF16 (Logits) | OnChipEmb | `0.982825` / Exact | **`6.33 ms` (`20,231 tok/s`)** | `4.58 ms` (`0.09 / 4.03 / 0.46`) | **218.2 tok/s** | **218.2 tok/s** |
+| `3B` | 4-Chip TP `B=1` INT8 | OnChipEmb | Exact Top-1 | **`4.24 ms` (`30,181 tok/s`)** | `4.16 ms` (`0.08 / 3.96 / 0.11`) | **240.4 tok/s** | **240.4 tok/s** |
+| `Batch-16` | 4-Chip TP `B=16` INT8 | HostEmb | Exact Top-1 | — | `4.53 ms` (`0.30 / 3.84 / 0.11`) | **220.9 tok/s** | **3,533.9 tok/s** |
+| `Batch-32` | 4-Chip TP `B=32` INT8 | HostEmb | Exact Top-1 | — | `6.21 ms` (`0.50 / 5.05 / 0.12`) | **161.0 tok/s** | **5,153.6 tok/s** |
+| `3C` | 4-Chip TP `B=64` BF16 | OnChipEmb | Exact Top-1 | — | `8.53 ms` (`0.09 / 8.33 / 0.11`) | **117.2 tok/s** | **7,503.6 tok/s** |
+| `3E` | 4-Chip TP `B=128` BF16 | OnChipEmb | Exact Top-1 | — | `14.71 ms` (`0.09 / 14.49 / 0.13`) | **68.0 tok/s** | **8,699.3 tok/s** |
+| **`3D`** | **4-Chip TP `B=128` INT8** | **OnChipEmb** | **Exact Top-1** | — | **`13.94 ms`** (`0.09 / 13.73 / 0.12`) | **71.7 tok/s** | **9,180.0 tok/s** |
+
+### 6C. Live OpenAI HTTP/SSE Server (`haven-server --tpu`, Full Persona Sampling)
+
+| Server Configuration | Endpoint Mode (`temp=0.45, top_p=0.90, min_p=0.05`) | HTTP TTFT | Total HTTP Time | Live Throughput |
+| :--- | :--- | ---: | ---: | ---: |
+| `--tpu --tpu-int8` (OnChipEmb) | Non-Streaming JSON (80 tokens) | — | `568.2 ms` | **140.8 tok/s** |
+| `--tpu --tpu-int8` (OnChipEmb) | Streaming SSE (78–81 tokens, T1 & Prefix T2) | `148.3 ms` | `541.1 ms` | **196.1 tok/s** |
+| `--tpu --tpu-int8 --tpu-host-emb` | Non-Streaming JSON (80 tokens) | — | **`445.3 ms`** | **179.6 tok/s** |
+| **`--tpu --tpu-int8 --tpu-host-emb`** | **Streaming SSE (69–74 tokens, T1 & Prefix T2)** | **`114.8 ms`** | **`408.8 ms`** | **248.3 tok/s** |
+
+### 6D. Adversarial Security, Cryptography & Fuzz Verification (`test-security-fuzz`)
+
+- **Crypto KATs**: FIPS 180-4 SHA-256, RFC 4231 HMAC-SHA256, RFC 8439 ChaCha20-Poly1305 bit-exact PASS.
+- **SHCP v2 Live Wire Attacks**: Replay counter rejection, Poly1305 ciphertext tamper rejection, and plaintext-downgrade rejection PASS.
+- **Parser & Binary Fuzzing**: RFC 8259 JSON (150 mutants), GGUF v3 binary loader (150 mutants), `.hmb` binary vault (100 mutants) — 0 crashes, 0 ASan/UBSan findings.
+- **Hardened Plugin Defenses**: Win32 Job Object terminal sandbox, canonical workspace/vault containment, and DNS-SSRF browser defense PASS.
 
 ---
 

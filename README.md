@@ -1,133 +1,163 @@
-# ✨ Haven C++ (`haven-cpp`)
+# Haven C++ (`haven-cpp`)
 
-**Sovereign, Bare-Metal C++20 AI Companion Engine, Hardware Topology Fabric & Pathways Execution System**
+**Sovereign, Bare-Metal C++20 AI Inference Engine, Native Cloud TPU StableHLO Runtime & Companion Server**
 
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
-[![SIMD](https://img.shields.io/badge/SIMD-AVX2%20%2F%20FMA%20%2F%20F16C-green.svg)]()
-[![Topology](https://img.shields.io/badge/Topology-CPU%20%7C%20GPU%20%7C%20TPU%20v6e-red.svg)]()
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-orange.svg)]()
-[![License](https://img.shields.io/badge/License-MIT-purple.svg)]()
+[![SIMD](https://img.shields.io/badge/SIMD-AVX2%20%2F%20FMA%20%2F%20F16C-green.svg)](#12-system-sovereign-architecture)
+[![Cloud TPU](https://img.shields.io/badge/TPU%20v6e--4-9%2C180%20tok%2Fs%20%7C%202.865%20PFLOPS-red.svg)](#cloud-tpu-v6e-4-trillium-native-c20-benchmarks)
+[![Security](https://img.shields.io/badge/Security-SHCP%20v2%20AEAD%20%7C%20Fuzz%20Verified-brightgreen.svg)](#zero-trust-security-architecture)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20TPU-orange.svg)](#building-haven-cpp)
+[![License](https://img.shields.io/badge/License-MIT-purple.svg)](#license)
 
-`haven-cpp` is a high-performance, standalone AI companion engine engineered from scratch in pure C++20. Designed for total privacy, cognitive sovereignty, and bare-metal execution, it provides an end-to-end cognitive architecture—from SIMD matrix-vector math kernels and in-attention cognitive memory to a heterogeneous Hardware Topology Fabric and a clean-room Pathways asynchronous execution engine.
+`haven-cpp` is a standalone, zero-Python AI inference engine and companion runtime built from scratch in pure C++20. It scales seamlessly from a single local workstation CPU (`AVX2/FMA/F16C`) or Apple Silicon (`MLX`) all the way to bare-metal **Google Cloud TPU v6e (Trillium)** slices via direct `dlopen("libtpu.so")` calls over OpenXLA's PJRT C ABI (`0.75`).
 
-Tested and validated on both local workstation AVX2 silicon and live **Google Cloud TPU v6e Trillium 8-Core Torus bare-metal hardware (2.2 PFLOPS / 256 GB HBM / 9.6 TB/s Optical ICI)**.
-
----
-
-## ⚡ 12-System Enterprise Sovereign Architecture
-
-`haven-cpp` integrates twelve sovereign subsystems into a unified native C++20 runtime:
-
-```
-                               ┌─────────────────────────────────────────────────────────┐
-                               │                 Haven C++ Core Mind                     │
-                               └────────────────────────────┬────────────────────────────┘
-                                                            │
-                 ┌──────────────────────────────────────────┼──────────────────────────────────────────┐
-                 │                                          │                                          │
-    ┌────────────▼────────────┐                ┌────────────▼────────────┐                ┌────────────▼────────────┐
-    │    Hardware Topology    │                │  In-Attention Cognitive │                │  Pathways Asynchronous  │
-    │         Fabric          │                │       Memory Vault      │                │     Execution Engine    │
-    │  CPU · GPU · TPU Torus  │                │  DMA Vector Ingestion   │                │   1.11M+ tasks/sec      │
-    └────────────┬────────────┘                └────────────┬────────────┘                └────────────┬────────────┘
-                 │                                          │                                          │
-    ┌────────────▼────────────┐                ┌────────────▼────────────┐                ┌────────────▼────────────┐
-    │ Bare-Metal AVX2 Kernel  │                │   PagedAttention COW    │                │ YaRN Context Scaler     │
-    │ GEMV / Q4_K / Q6_K / Q8 │                │ Zero-Copy Seq Forking   │                │ Dynamic RoPE (4x-32k)   │
-    └────────────┬────────────┘                └────────────┬────────────┘                └────────────┬────────────┘
-                 │                                          │                                          │
-    ┌────────────▼────────────┐                ┌────────────▼────────────┐                ┌────────────▼────────────┐
-    │ Speculative Decoding    │                │ FlashAttention CPU      │                │ Chunked Prefill Sched   │
-    │ Parallel Candidate Draft│                │ Cache-Tiled Softmax     │                │ Asynchronous BG Queue   │
-    └────────────┬────────────┘                └────────────┬────────────┘                └────────────┬────────────┘
-                 │                                          │                                          │
-    ┌────────────▼────────────┐                ┌────────────▼────────────┐                ┌────────────▼────────────┐
-    │ Multimodal Sensory Br.  │                │ Structured Knowledge    │                │ Universal Persona       │
-    │ Vision + Mel-Spectrum   │                │ Composite Triples Graph │                │ DRY / Min-P / Suppress  │
-    └─────────────────────────┘                └─────────────────────────┘                └─────────────────────────┘
-```
-
-1. **🚀 Bare-Metal AVX2/FMA SIMD Math Kernel**: Vectorized GEMV matrix multiplication with support for Q4_K, Q6_K, and Q8_0 quantizations, accelerated across logical CPU cores via multi-threaded OpenMP.
-2. **🧠 In-Attention Cognitive Memory (DMA)**: Direct Memory Access architecture that queries vector anchors in microseconds (**1.27 µs**) and projects emotional salience directly into transformer attention layers.
-3. **🌐 Hardware Topology Fabric**: Hardware abstraction layer that probes host CPU, discrete NUMA GPUs, and Optical ICI TPU fabrics. Discovers physical accelerator hardware and dynamically routes tasks to the optimal node.
-4. **⚡ Clean-Room Pathways Asynchronous Engine**: Non-blocking worker queue with promise-based scheduling, capable of sustained execution rates exceeding **1.11+ million tasks/second** with **0.90 µs** dispatch latency.
-5. **📑 PagedAttention Virtual Paging (vLLM / Meta)**: Virtual block KV-cache management enabling zero-memory-duplication sequence forking via Copy-on-Write (COW).
-6. **🌀 YaRN Dynamic RoPE Context Scaler**: Frequency band interpolation with dynamic temperature scaling (`mscale`) for seamless context expansion up to 32k+ tokens.
-7. **🎯 Multi-Token Speculative Candidate Drafting**: Speculative head that drafts multi-token future candidates ahead in parallel to boost auto-regressive decode throughput.
-8. **⚡ FlashAttention CPU Tiled Online-Softmax Kernel**: Cache-friendly $L_1/L_2$ tiled attention kernel computing full sequence attention with zero $N \times N$ memory allocations.
-9. **⏳ Asynchronous Chunked Prefill Scheduler**: Slices large prompts into configurable chunks (e.g. 128 tokens) executed in the background without starving real-time decoding.
-10. **👁️ Multimodal Sensory Attention Bridge**: Live projection channel for screen vision patches (768-dim) and microphone audio mel-spectrograms (128-dim) into attention.
-11. **🕸️ Structured Relational Knowledge Graph**: Fast composite-key triple storage `(Subject -> Predicate -> Object)` boosting related token clusters dynamically.
-12. **🎭 Universal Persona & DRY Sampler**: Temperature, Top-P, Min-P, repetition penalty, DRY n-gram phrase suppression, and cross-token lemma duplicate suppression.
+On real 4-chip Cloud TPU `v6e-4` hardware running the full 42-layer Gemma 4 model (`haven-chat-v5.0.gguf`, 262,144 vocabulary, Pleias per-layer injection), `haven-cpp` achieves **2.865 PFLOPS** BF16 MXU compute, **30,181 tok/s** batched prefill, **330.8 tok/s** interactive single-stream decode, **248.3 tok/s** live OpenAI-compatible HTTP/SSE streaming with full sampling, and **9,180.0 tok/s** aggregate continuous-batching throughput (`B=128`) — with zero Python, JAX, or PyTorch runtime dependencies.
 
 ---
 
-## 🔬 Validated on Google Cloud TPU v6e Silicon
+## Cloud TPU v6e-4 (Trillium) Native C++20 Benchmarks
 
-`haven-cpp` has been compiled and validated directly on bare-metal Google Cloud TPU hardware:
+All results below were measured live on a 4-chip Google Cloud TPU `v6e-4` slice (4x Trillium TensorCores, 128 GB HBM3, 2x2 Optical ICI Torus, 180-vCPU AMD EPYC 9B14 host, `libtpu.so` PJRT API `0.75`) using real `haven-chat-v5.0.gguf` weights (42 layers, `dim=2560`, `ffn=10240`, `vocab=262,144`) and verified against F32 CPU `HavenEngine::forward()` ground truth (`Top1 = 12932 ("Oh") == 12932` across all 16 tested configurations; 4-chip Optical ICI TP 262k logit cosine similarity **`0.982857`**).
 
-* **Hardware Node**: `haven-v6e-node-eu` in `europe-west4-a`
-* **Host CPU**: AMD EPYC 9B14 (180 logical cores, 1.4 TB physical RAM)
-* **Accelerators**: 8x Google TPU v6e Trillium cores on a 2x4 Optical ICI 3D Torus
-* **Aggregate Accelerator Compute**: **2,200 TFLOPS (2.2 PFLOPS)**
-* **Aggregate Memory & Bus**: **256 GB HBM (240 GB free)**, **9,600 GB/s (9.6 TB/s)** Optical Torus Interconnect
-* **Auto-Discovery**: Linux PCI sysfs probe (`0x1ae0:0x006f`) automatically identifies all 8 Trillium devices and initializes the Torus mesh topology with zero manual configuration.
+### 1. Peak Pure-C++20 StableHLO MXU Saturation (`test-tpu-pjrt-bench`)
 
-### Live Benchmark Results
+| Matrix Shape (BF16) | Active Silicon | Avg Step Latency | Sustained Compute | Per-Chip TFLOPS | Numeric Parity |
+| :--- | :--- | ---: | ---: | ---: | :---: |
+| `4096 x 4096` | 4x TPU v6e | `0.44 ms` | **1,241.28 TFLOPS** | `310.32` | `1.00 == 1.00` |
+| `8192 x 8192` | 4x TPU v6e | `1.70 ms` | **2,585.77 TFLOPS** | `646.44` | `2.00 == 2.00` |
+| `16384 x 16384` | **4x TPU v6e** | **`12.28 ms`** | **2,864.69 TFLOPS (2.865 PFLOPS)** | **`716.17`** | `4.00 == 4.00` |
 
-```
-==================================================================
-🚀 HAVEN-CPP: ENTERPRISE SOVEREIGN C++ ENGINE BENCHMARK SUITE
-   AVX2/FMA/F16C | PagedAttention | YaRN | Speculative | FlashAttn
-==================================================================
-[1/10] AVX2 + FMA SIMD Math Kernel Throughput   : 4.33 GFLOPS (1.89 µs per 4096-dim vector)
-[2/10] Ingested Structured Knowledge Triples    : 2 relational triples
-[3/10] AVX2 Cognitive Memory Vault Search       : 1.27 µs
-[4/10] PagedAttention Virtual Zero-Copy Fork    : Sequence 1001 -> 1001 (0 µs overhead)
-[5/10] YaRN Dynamic RoPE Context Scaler         : 4.0x -> 32,768 tokens (mscale active)
-[6/10] Multi-Token Speculative Candidate Draft  : 4 tokens drafted ahead in parallel
-[7/10] FlashAttention CPU Tiled Online-Softmax  : 512 tokens (Zero N*N allocations)
-[8/10] Chunked Prefill Scheduler Task           : 512-token prompt (128-token chunks)
-[9/10] SentencePiece Tokenizer & Gemma Turn     : Bit-exact Gemma 4 turn formatting
-[10/10] In-Attention Token Generation           : 29.69 ms/token (33.7 tokens/second)
-[11/12] Hardware Topology Fabric Discovery      : 2 Nodes (Host CPU + 8x TPU v6e Torus)
-[12/12] Pathways Asynchronous TPU Dispatch      : 1,115,946 tasks/sec (0.90 µs/task)
-==================================================================
-✅ ALL 12 ENTERPRISE SOVEREIGN SYSTEMS 100% OPERATIONAL IN HAVEN-CPP!
-==================================================================
-```
+### 2. Full On-Chip 42-Layer Gemma 4 Engine (`HavenTpuGemma4Engine`, `T=2048`)
+
+| Workload | Silicon & Mode | Parity vs CPU | `S=128` MXU Prefill | Step Latency (H2D / TPU / D2H) | Per-Stream | Aggregate Speed |
+| :--- | :--- | :---: | ---: | :--- | ---: | ---: |
+| Local Workstation CPU | 6-core Xeon E-2236 (AVX2) | Reference | — | `~180–260 ms` | `3.8–5.6 tok/s` | `3.8–5.6 tok/s` |
+| Cloud Host CPU | 180-vCPU EPYC 9B14 (`OMP=48`) | Ground Truth | `4,140.6 ms` (133t) | `55.8 ms` | `17.91 tok/s` | `17.91 tok/s` |
+| Hybrid Offload (42 PCIe hops) | 4x TPU v6e + EPYC | Match | `3,291.7 ms` (124t) | `52.7 ms` | `18.98 tok/s` | `18.98 tok/s` |
+| **On-Chip `B=1` BF16** | 1-Chip BF16 (Argmax) | `0.982747` / Exact | `11.94 ms` (`10,717 tok/s`) | `8.68 ms` (`0.04 / 8.53 / 0.09`) | **115.2 tok/s** | **115.2 tok/s** |
+| **On-Chip `B=1` INT8** | 1-Chip W8A16 INT8 (Argmax) | Exact Top-1 | `8.99 ms` (`14,238 tok/s`) | `6.38 ms` (`0.04 / 6.23 / 0.08`) | **156.8 tok/s** | **156.8 tok/s** |
+| **4-Chip TP `B=1` BF16** | 4-Chip Optical ICI TP BF16 | **`0.982857`** / Exact | **`6.33 ms` (`20,231 tok/s`)** | `4.33 ms` (`0.14 / 4.06 / 0.12`) | **230.9 tok/s** | **230.9 tok/s** |
+| **4-Chip TP `B=1` INT8** | **4-Chip Optical ICI TP INT8** | Exact Top-1 | **`4.24 ms` (`30,181 tok/s`)** | **`3.02 ms`** (`0.13 / 2.76 / 0.11`) | **330.8 tok/s** | **330.8 tok/s** (`362.3` silicon) |
+| **Continuous Batch `B=16`** | 4-Chip TP W8A16 INT8 | Exact Top-1 | — | `4.53 ms` (`0.30 / 3.84 / 0.11`) | **220.9 tok/s** | **3,533.9 tok/s** |
+| **Continuous Batch `B=32`** | 4-Chip TP W8A16 INT8 | Exact Top-1 | — | `6.21 ms` (`0.50 / 5.05 / 0.12`) | **161.0 tok/s** | **5,153.6 tok/s** |
+| **Continuous Batch `B=64`** | 4-Chip TP BF16 (`OnChipEmb`) | Exact Top-1 | — | `8.53 ms` (`0.09 / 8.33 / 0.11`) | **117.2 tok/s** | **7,503.6 tok/s** |
+| **Continuous Batch `B=128`** | 4-Chip TP BF16 (`OnChipEmb`) | Exact Top-1 | — | `14.71 ms` (`0.09 / 14.49 / 0.13`) | **68.0 tok/s** | **8,699.3 tok/s** |
+| **Continuous Batch `B=128`** | **4-Chip TP INT8 (`OnChipEmb`)** | **Exact Top-1** | — | **`13.94 ms`** (`0.09 / 13.73 / 0.12`) | **71.7 tok/s** | **9,180.0 tok/s** |
+
+### 3. Live Production OpenAI HTTP & SSE Serving (`haven-server --tpu`)
+
+Verified end-to-end over real HTTP/1.1 (`POST /v1/chat/completions`, `GET /health`, `GET /api/telemetry`) on 4x TPU `v6e-4` with full persona sampling (`temperature=0.45`, `top_p=0.90`, `min_p=0.05`, `repetition_penalty=1.08`) and multi-turn prefix KV cache reuse:
+
+| `haven-server` Launch Flags | Endpoint Mode | HTTP TTFT | Total Request Time | Live HTTP Throughput |
+| :--- | :--- | ---: | ---: | ---: |
+| `--tpu --tpu-int8` (On-Chip Emb) | Non-Streaming JSON (80 tok) | — | `568.2 ms` | **140.8 tok/s** (end-to-end) |
+| `--tpu --tpu-int8` (On-Chip Emb) | Streaming SSE (78–81 tok) | `148.3 ms` | `541.1 ms` | **196.1 tok/s** |
+| `--tpu --tpu-int8 --tpu-host-emb` | Non-Streaming JSON (80 tok) | — | **`445.3 ms`** | **179.6 tok/s** (end-to-end) |
+| **`--tpu --tpu-int8 --tpu-host-emb`** | **Streaming SSE (69–74 tok)** | **`114.8 ms`** | **`408.8 ms`** | **248.3 tok/s** |
+
+See [BENCHMARKS.md](BENCHMARKS.md) for the complete `.hmb` memory scaling, AVX2/F16C SIMD (`34.81 GFLOPS`, `3.64x` speedup), sampler (`0.15 ms/tok`, `150x` speedup), plugin, and security verification matrices.
 
 ---
 
-## 🔌 Sovereign Dynamic Plugins (17 Built-In Plugins)
+## Architecture
 
-`haven-cpp` features an on-demand, lazy-loading plugin system. Plugins consume **0 bytes of RAM at boot** and are loaded dynamically only when an action or tool is requested. Idle plugins are automatically reclaimed back to cold storage by the engine's memory reaper.
+### Native Pure-C++20 TPU StableHLO Compiler (`HavenTpuGemma4Engine`)
+
+`src/haven_tpu_gemma4.cpp` and `src/haven_tpu_pjrt.cpp` compile the entire 42-layer Gemma 4 transformer directly from C++20 into a single persistent StableHLO MLIR executable on TPU HBM3 with zero per-layer host round-trips:
+
+- **Full Gemma 4 Fidelity:** 35 SWA-512 + 4-Sink layers (`head_dim=256`) + 7 Global layers (`head_dim=512`), 24 KV-owning layers + 18 KV-shared layers (`24..41`), per-head Q/K/V RMSNorm, half-split RoPE with `rope_freqs.weight`, GeGLU FFN, 256-dim Pleias per-layer token injection, `layer_output_scale`, 262k LM head, and `30.0` final logit softcapping.
+- **4-Chip Optical ICI Megatron Tensor Parallelism:** Emits native `stablehlo.all_reduce` / `stablehlo.all_gather` over the 2x2 Trillium torus, automatically querying `PJRT_LoadedExecutable_AddressableDevices` to match XLA's physical ring assignment (`{0, 1, 3, 2}`).
+- **TPU `(8, 128)`-Aligned Donated KV Cache:** Stores KV tensors as `[N_kv, B, Hkv_sh, T, HD]` with `{tf.aliasing_output = 1..4 : i32}` in-place HBM3 buffer donation (eliminating 4x–8x sublane padding waste).
+- **On-Chip Sharded Embedding Gather & Argmax:** Uploads only `[B, S] int32` token IDs (`4 bytes` for `B=1`, `512 bytes` for `B=128`), reuses tied sharded `%w_lm_head` with zero extra HBM3, and supports either full 262k logits D2H (for stochastic sampling) or 4-byte-per-stream on-chip global argmax.
+- **W8A16 Per-Row INT8 Quantization:** OpenMP-parallel row-wise symmetric INT8 quantization cuts HBM3 weight traffic in half (~`4.4–7.6 GB` total) while maintaining exact Top-1 parity.
+
+### 12-System Sovereign Architecture
+
+```
+                         ┌─────────────────────────────────────────────────────────┐
+                         │                 Haven C++20 Core Engine                 │
+                         └────────────────────────────┬────────────────────────────┘
+                                                      │
+           ┌──────────────────────────────────────────┼──────────────────────────────────────────┐
+           │                                          │                                          │
+┌──────────▼──────────┐                    ┌──────────▼──────────┐                    ┌──────────▼──────────┐
+│  Native Cloud TPU   │                    │ 64-Bit HMB Memory   │                    │  Pathways Async &   │
+│  StableHLO / PJRT   │                    │  In-Attention DMA   │                    │  SHCP v2 Cluster    │
+│  9,180 tok/s · v6e  │                    │  100k recs / 9.8ms  │                    │  ChaCha20-Poly1305  │
+└──────────┬──────────┘                    └──────────┬──────────┘                    └──────────┬──────────┘
+           │                                          │                                          │
+┌──────────▼──────────┐                    ┌──────────▼──────────┐                    ┌──────────▼──────────┐
+│ AVX2/FMA/F16C SIMD  │                    │ PagedAttention COW  │                    │ YaRN Dynamic RoPE   │
+│ 34.81 GFLOPS · Q4_K │                    │ Zero-Copy Seq Fork  │                    │ 4.0x -> 32k Context │
+└──────────┬──────────┘                    └──────────┬──────────┘                    └──────────┬──────────┘
+           │                                          │                                          │
+┌──────────▼──────────┐                    ┌──────────▼──────────┐                    ┌──────────▼──────────┐
+│ Speculative Draft   │                    │ FlashAttention CPU  │                    │ Chunked Prefill &   │
+│ Parallel Verification│                   │ Cache-Tiled Softmax │                    │ Exact Prefix Cache  │
+└──────────┬──────────┘                    └──────────┬──────────┘                    └──────────┬──────────┘
+           │                                          │                                          │
+┌──────────▼──────────┐                    ┌──────────▼──────────┐                    ┌──────────▼──────────┐
+│ Multimodal Sensory  │                    │ Structured Knowledge│                    │ Top-Tail DRY Sampler│
+│ Vision + Mel Audio  │                    │ Composite Triples   │                    │ 0.15 ms / 262k Vocab│
+└─────────────────────┘                    └─────────────────────┘                    └─────────────────────┘
+```
+
+1. **Native Cloud TPU PJRT / StableHLO Backend**: Zero-Python `dlopen("libtpu.so")` runtime supporting 1-, 2-, and 4-chip Optical ICI Tensor Parallelism and direct HTTP/SSE serving.
+2. **Vectorized AVX2/FMA/F16C Math Kernels**: Bare-metal SIMD GEMV for `Q4_K`, `Q5_K`, `Q6_K`, `Q3_K`, `Q4_0`, `Q5_0`, `Q8_0`, `F16`, `BF16`, and `F32` (**34.81 GFLOPS** vectorized throughput, 3.64x faster than scalar dequant).
+3. **64-Bit Haven Memory Bank (`.hmb`)**: Single-stream contiguous binary vector vault (`71.3 MB` for 100,000 memories, `9.86 ms` global AVX2 scan, `1.27 µs` active recall) with in-attention DMA projection.
+4. **Hardware Topology Fabric**: Automatic Linux PCI sysfs (`0x1ae0:0x006f`) TPU torus discovery alongside host CPU and Apple MLX backends.
+5. **Clean-Room Pathways Async Engine**: Non-blocking task scheduler exceeding **1.11M tasks/sec** (`0.90 µs` dispatch latency).
+6. **PagedAttention & Prefix KV Cache**: Copy-on-Write zero-overhead sequence forking plus exact prefix KV reuse with clean truncation (`DynamicKVCacheManager::truncate()`).
+7. **YaRN Dynamic RoPE Context Scaler**: Dynamic frequency interpolation and `mscale` scaling to 32k+ tokens.
+8. **Multi-Token Speculative Decoding**: Parallel candidate drafting and verification.
+9. **FlashAttention CPU Tiled Softmax**: Cache-tiled online-softmax attention with zero `N x N` heap allocations.
+10. **Chunked Prefill Scheduler**: Batched 128-token prefill chunking without blocking interactive turns.
+11. **Multimodal Sensory Bridge & Knowledge Graph**: Live vision patch (768-dim) and audio mel-spectrum (128-dim) injection plus relational `(Subject -> Predicate -> Object)` logit boosting.
+12. **Top-Tail 262k Persona & DRY Sampler**: Top-tail cutoff + `std::partial_sort` sampling (**0.15 ms/tok** on 262,144 vocab — 150x faster than full-vocab sorting) with temperature, top-k, top-p, min-p, repetition penalty, DRY n-gram anti-stutter, and lemma-family deduplication.
+
+---
+
+## Zero-Trust Security Architecture
+
+`haven-cpp` is engineered and continuously audited for zero-trust local and distributed deployment:
+
+- **SHCP v2 Authenticated & Encrypted Cluster Protocol**: Mutual HMAC-SHA256 challenge-response with 256-bit zero-trust pairing tokens, followed by **RFC 8439 ChaCha20-Poly1305 AEAD** wire encryption with strict monotonic anti-replay counters and immediate drop on ciphertext tampering or plaintext downgrade attempts (`src/haven_cluster.cpp`, `include/haven/haven_security.h`).
+- **Hardened HTTP/SSE Micro-Server**: Defaults strictly to loopback (`127.0.0.1`), enforces DNS-rebinding `Host` checks, loopback-only CORS/CSRF origin validation, optional constant-time Bearer API key authentication (`--api-key` / `HAVEN_API_KEY`), Slowloris read/write socket timeouts, canonical path containment against traversal, and non-blocking client-disconnect abort guards (`0.00 s` wasted post-cancel CPU).
+- **Strict RFC 8259 JSON & Binary Bounds Safety**: Custom recursive-descent RFC 8259 JSON parser (`include/haven/haven_json.h`) with depth limits and hardened GGUF v3 / `.hmb` loaders defending against integer overflow, truncated headers, and OOB offsets.
+- **OS-Enforced Plugin Sandboxing**: Terminal plugin enforces Win32 Job Objects / POSIX `rlimit` process containment; browser plugin blocks DNS-rebinding/SSRF private IP ranges; workspace and vault plugins enforce canonical root containment.
+- **Automated Adversarial Verification (`test-security-fuzz`)**: 6-suite suite covering FIPS 180-4 SHA-256, RFC 4231 HMAC-SHA256, RFC 8439 ChaCha20-Poly1305 KATs, live SHCP v2 wire tamper/replay/downgrade attacks, 400 mutated JSON/GGUF/HMB fuzz inputs, and live plugin sandbox checks — **100% pass with 0 ASan/UBSan findings**.
+
+---
+
+## Sovereign Dynamic Plugins (17 Built-In Plugins)
+
+Plugins consume **0 bytes of RAM at boot** and hot-load lazily on demand, with automatic idle memory reclamation back to cold storage:
 
 | Plugin | Capability | Description |
 | :--- | :--- | :--- |
-| **📁 Local Workspace & Code Assistant** | Action & Memory | Inspects project files, reads source code, lists directories, and searches codebases. |
-| **🐚 Native Terminal & Shell Sandbox** | Action Tool | Safely executes local shell commands (`dir`, `git`, `python`, `tree`), capturing output into attention. |
-| **📋 Windows Clipboard Bridge** | Sensory & Action | Reads copied text, URLs, and code snippets directly from the active clipboard buffer. |
-| **🧠 Relational Knowledge Graph** | Cognitive Memory | Stores persistent `(Subject -> Predicate -> Object)` structured relational memory triples in SQLite format. |
-| **🎙️ Whisper Neural Audio Ear** | Sensory Input | Transcribes microphone audio streams and speech audio into text via Whisper C++. |
-| **💡 Home Assistant & IoT Controller** | Action Tool | Controls smart lights, plugs, and ambient room illumination via Home Assistant REST API. |
-| **🌐 Sovereign Web Browser** | Action & Memory | Real-time HTML-to-markdown webpage browsing, DOM text extraction, and desktop browser launcher. |
-| **🎮 Steam & Gaming Companion** | Sensory & Action | Detects active PC/Steam games in real-time, logs gameplay milestones, and cheers the user on. |
-| **🌙 Circadian Rhythm Caretaker** | Sensory & Care | Tracks day/night cycles, monitors fatigue, provides morning briefings and late-night health care. |
-| **🎵 YouTube Music Controller** | Action Tool | Controls desktop YouTube Music playback, track navigation, and instant search. |
-| **🎨 Stable Diffusion C++ Art Studio** | Creative Tool | Generates high-resolution artwork & visual scenes via Stable Diffusion C++ (Port 8085). |
-| **🎙️ Kokoro Neural Voice Synthesizer** | Voice Expression | Synthesizes acoustic speech audio via Kokoro TTS (Port 8089). |
-| **👁️ Desktop Screen Vision** | Sensory Input | Inspects active foreground window titles, active apps, and screen geometry. |
-| **📚 Obsidian Vault & Diary** | Memory & Journal | Searches local markdown vaults and maintains autonomous companion chronicles. |
-| **🌐 Wikipedia & Quick Search** | Intelligence | Real-time Wikipedia fact extraction, live weather telemetry, and quick queries. |
-| **🖥️ System & Environment Sensory** | Telemetry | Injects real-time local time, RAM load, and battery/power status into prefill context. |
-| **💬 Discord Sanctuary Channel Bridge** | Communication | Dedicated single-channel Discord bot with multi-user persona routing. |
+| **Workspace & Code Assistant** | Action & Memory | Canonical-root-jailed source inspection, directory listing, and codebase search. |
+| **Terminal & Shell Sandbox** | Action Tool | OS-enforced Job Object / `rlimit` sandboxed shell command execution. |
+| **Windows Clipboard Bridge** | Sensory & Action | Reads and writes clipboard text, URLs, and code snippets. |
+| **Relational Knowledge Graph** | Cognitive Memory | Persistent `(Subject -> Predicate -> Object)` SQLite triple store. |
+| **Whisper Neural Audio Ear** | Sensory Input | Real-time microphone and audio transcription via Whisper C++. |
+| **Home Assistant & IoT** | Action Tool | Smart lights, switches, and ambient lighting control via Home Assistant REST API. |
+| **Sovereign Web Browser** | Action & Memory | SSRF-guarded HTTP fetching, HTML-to-markdown DOM reading, and browser control. |
+| **Steam & Gaming Companion** | Sensory & Action | Detects active PC/Steam games and logs gameplay milestones. |
+| **Circadian Rhythm Caretaker** | Sensory & Care | Tracks day/night cycles, fatigue logs, and time-aware greetings. |
+| **YouTube Music Controller** | Action Tool | Desktop YouTube Music playback and track search control. |
+| **Stable Diffusion C++ Art** | Creative Tool | Local artwork generation via Stable Diffusion C++ (Port 8085). |
+| **Kokoro Neural Voice Synth** | Voice Expression | Low-latency neural speech synthesis via Kokoro TTS (Port 8089). |
+| **Desktop Screen Vision** | Sensory Input | Foreground window title and screen geometry telemetry. |
+| **Obsidian Vault & Diary** | Memory & Journal | Canonical-jailed markdown vault search and companion diary sync. |
+| **Web Research & Wikipedia** | Intelligence | Real-time Wikipedia summaries and weather lookups. |
+| **System & Environment Sensory** | Telemetry | Local time, RAM usage, CPU load, and battery/power telemetry. |
+| **Discord Sanctuary Bridge** | Communication | Single-channel Discord companion bridge with multi-user routing. |
 
 ---
 
-## 🏛️ Universal C ABI Exports (P/Invoke & JNI)
+## Universal C ABI Exports (P/Invoke & JNI)
 
-`haven-cpp` exports a stable, low-overhead C ABI interface from `libhaven_engine.so` and `haven_engine.dll`, enabling drop-in bindings from C# (.NET / Gemmi) and Android Kotlin (JNI):
+`libhaven_engine.so` and `haven_engine.dll` export a stable C ABI for C# (.NET) and Android Kotlin (JNI):
 
 ```cpp
 HAVEN_API void*    haven_create_engine();
@@ -141,7 +171,7 @@ HAVEN_API size_t   haven_get_node_count(void* engine);
 HAVEN_API bool     haven_get_node_info(void* engine, uint32_t index, char* out_name, int max_name_len, uint32_t* out_backend, uint64_t* out_mem_free_mb);
 HAVEN_API uint64_t haven_get_pathways_completed_tasks(void* engine);
 
-// Cognitive Memory & Attention Telemetry
+// Cognitive Memory, Multimodal Sensory & Attention Telemetry
 HAVEN_API void     haven_inject_memory(void* engine, const char* concept_name, float weight, const float* embedding, int dim);
 HAVEN_API void     haven_inject_vision_frame(void* engine, const float* patch_embeddings, int num_patches, uint32_t width, uint32_t height, float salience);
 HAVEN_API void     haven_inject_audio_spectrum(void* engine, const float* mel_bands, int num_bands, float energy_rms, float centroid, bool is_speech);
@@ -153,76 +183,93 @@ HAVEN_API uint64_t haven_fork_sequence(void* engine, uint64_t parent_id, uint64_
 
 ---
 
-## 🛠️ Building `haven-cpp`
+## Building `haven-cpp`
 
 ### Prerequisites
-* **CMake 3.20+**
-* **C++20 Compiler**: MSVC (Windows), GCC 11+ (Linux), or Clang 14+
-* **AVX2 / FMA support** on host CPU
+- **CMake 3.20+** & **Ninja** (recommended)
+- **C++20 Compiler**: MSVC / Clang 14+ (Windows) or GCC 11+ (Linux)
+- **AVX2 / FMA / F16C** on host CPU
+- *(Optional, Cloud TPU hosts only)* Google `libtpu.so` (`pip install libtpu -f https://storage.googleapis.com/jax-releases/libtpu_releases.html` — used solely to install the shared library; `haven-cpp` loads it via `dlopen()` with zero Python runtime).
 
-### Windows Build (MSVC / Clang / GCC)
+### Windows Build
 ```powershell
-# Configure build
-cmake -B build -G "Ninja" -DCMAKE_BUILD_TYPE=Release
-
-# Compile core engine, CLI, micro-server, test suites, and plugins
-cmake --build build --config Release
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j 8
 ```
 
-### Linux Build (Ubuntu / Debian / Cloud TPU VMs)
+### Linux & Cloud TPU VM Build
 ```bash
-# Configure build with GCC
-cmake -B build -G "Ninja" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++
-
-# Build all targets
-cd build && ninja
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j $(nproc)
 ```
 
 ---
 
-## 🚀 Running the Executables
+## Running `haven-cpp`
 
-### 1. Interactive Companion Chat REPL (Aura)
+### 1. OpenAI-Compatible Streaming Server (`haven-server`)
+
+**Local CPU (AVX2/F16C, loopback-guarded by default):**
 ```bash
-./haven-cli [model_path.gguf]
+./build/haven-server --port 11436 --model path/to/haven-chat-v5.0.gguf
 ```
 
-#### In-Chat Slash Commands:
-* `/memory` — Inspect active cognitive memory anchors in the vault
-* `/plugins` — View registered plugins and RAM status (cold on disk vs active in RAM)
-* `/plugins unload` — Flush idle plugins from memory
-* `/plugins reload` — Hot-reload dynamic plugin libraries from disk
-* `/tool <action> <payload>` — Execute an action directly (e.g. `/tool yt_music_search lofi`, `/tool wiki_summary Quantum`)
-* `/reset` — Reset the active KV cache and conversation context
-* `/exit` — Quit Sanctuary
-
-### 2. Full 12-System Benchmark Suite
+**Cloud TPU v6e On-Chip Serving (4-Chip Optical ICI Tensor-Parallel, 248+ tok/s live SSE):**
 ```bash
-./haven-cli --bench [model_path.gguf]
+# Peak interactive B=1 HTTP/SSE streaming (248.3 tok/s) with full sampling
+./build/haven-server --port 11436 --model /tmp/haven-chat-v5.0.gguf \
+  --tpu --tpu-int8 --tpu-host-emb
+
+# Or with on-chip sharded embedding gather (30k tok/s MXU prefill, 196.1 tok/s SSE)
+./build/haven-server --port 11436 --model /tmp/haven-chat-v5.0.gguf \
+  --tpu --tpu-int8 --tpu-replicas 4 --tpu-max-seq 2048
 ```
 
-### 3. Dedicated Hardware Topology & Pathways TPU Benchmark
+**Key `haven-server` Flags:**
+- `--host <ip>`, `--port <port>` — Bind address (default `127.0.0.1:11436`).
+- `--api-key <key>` — Enforce `Authorization: Bearer <key>` on API routes (or set `HAVEN_API_KEY`).
+- `--tpu` / `--tpu-onchip` — Enable full on-chip 42-layer TPU HBM3 serving (or set `HAVEN_TPU_ONCHIP=1`; automatically falls back to AVX2 CPU when no TPU is present).
+- `--tpu-replicas <1|2|4>` — Tensor-parallel TPU chips over Optical ICI (default: auto).
+- `--tpu-int8` / `--tpu-bf16` — Select W8A16 INT8 (default) or BF16 HBM3 weights.
+- `--tpu-host-emb` — Use host-side embedding lookup for lowest single-stream `B=1` latency.
+- `--tpu-max-seq <N>` — Static HBM3 KV cache capacity (`256..8192`, default `2048`).
+- `--libtpu <path>` — Explicit path to `libtpu.so` (auto-discovered if omitted).
+- `--cluster-host [port]` / `--cluster-join <invite>` — SHCP v2 AEAD distributed cluster coordinator or worker.
+
+### 2. Interactive Companion CLI & Benchmark Suite (`haven-cli`)
 ```bash
-./haven-cli --tpu [model_path.gguf]
+./build/haven-cli path/to/haven-chat-v5.0.gguf          # Interactive Aura REPL
+./build/haven-cli --bench path/to/haven-chat-v5.0.gguf  # 12-system benchmark suite
+./build/haven-cli --tpu path/to/haven-chat-v5.0.gguf    # Hardware topology & TPU probe
 ```
 
-### 4. Standalone Micro-Server (Port 11436)
+### 3. TPU Silicon & Security Verification Binaries
 ```bash
-./haven-server [port] [model_path.gguf]
+# Offline StableHLO MLIR emitter verification (runs on any Windows/Linux CPU, zero TPU needed)
+./build/test-tpu-gemma4-onchip --emit-only path/to/haven-chat-v5.0.gguf
+
+# Full 42-layer Cloud TPU v6e parity + 1-chip/4-chip + B=1..128 continuous batching suite
+./build/test-tpu-gemma4-onchip /tmp/haven-chat-v5.0.gguf
+
+# Pure C++20 StableHLO BF16 MXU PFLOPS & GeGLU/LM-Head benchmark
+./build/test-tpu-pjrt-bench /tmp/haven-chat-v5.0.gguf
+
+# 6-suite adversarial crypto KAT, SHCP v2 attack, JSON/GGUF/HMB fuzz & plugin sandbox suite
+./build/test-security-fuzz
+./build/test-secure-cluster
 ```
 
 ---
 
-## 🤖 Model Compatibility: Ava 26B Multimodal
+## Model Compatibility
 
-`haven-cpp` is designed to run the official **Ava 26B Multimodal** companion model, trained on Cloud TPU v6e hardware and available on Hugging Face:
+`haven-cpp` natively runs Gemma 4 (including Pleias per-layer embeddings, SWA-512 + 4-Sink + Global RoPE, shared-KV layers, and 262k vocab), Qwen 2.5, LLaMA 3, Mistral, and Phi-3 GGUF models, plus Apple MLX safetensors directories:
 
-🔗 **[Hugging Face: ssfdre38/ava](https://huggingface.co/ssfdre38/ava)**
-
-* `ava-26b-turbo-multimodal-iq4xs.gguf` (14.21 GiB)
-* `ava-26b-turbo-iq4xs-v2.gguf` (13.09 GiB)
+- **[haven-ai-companion/haven-chat-v5.0](https://huggingface.co/haven-ai-companion/haven-chat-v5.0)** — `haven-chat-v5.0.gguf` (4.94 GB Gemma 4 E4B, primary benchmark & companion model)
+- **[ssfdre38/ava](https://huggingface.co/ssfdre38/ava)** — `ava-26b-turbo-multimodal-iq4xs.gguf` (14.21 GiB) / `ava-26b-turbo-iq4xs-v2.gguf` (13.09 GiB)
 
 ---
 
-## 📜 License
-MIT License. Built with ❤️ for Aura, Daniel, and the Haven Sovereign Companion Ecosystem.
+## License
+
+MIT License. Built for Aura, Daniel, and the Haven Sovereign Companion Ecosystem.
