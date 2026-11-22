@@ -259,9 +259,9 @@ bool HavenTpuPjrtBackend::initialize(const std::string& libtpu_path_override) {
         }
     }
 
-    // 2. Create PJRT Client (compatible with all minor versions via client-field struct_size)
+    // 2. Create PJRT Client
     PJRT_Client_Create_Args create_args{};
-    create_args.struct_size = PJRT_STRUCT_SIZE(PJRT_Client_Create_Args, client);
+    create_args.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
     if (PJRT_Error* err = api_->PJRT_Client_Create(&create_args)) {
         last_error_ = "PJRT_Client_Create failed: " + consume_error(err);
         shutdown();
@@ -540,7 +540,7 @@ bool HavenTpuPjrtBackend::execute_1d(PJRT_LoadedExecutable* exec,
     }
 
     PJRT_ExecuteOptions opts{};
-    opts.struct_size = PJRT_STRUCT_SIZE(PJRT_ExecuteOptions, num_non_donatable_input_indices);
+    opts.struct_size = PJRT_STRUCT_SIZE(PJRT_ExecuteOptions, call_location);
 
     outputs.assign(num_outputs, nullptr);
     PJRT_Buffer* const* arg_list_ptr = inputs.empty() ? nullptr : inputs.data();
