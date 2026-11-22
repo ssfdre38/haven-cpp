@@ -14,6 +14,7 @@
 #include <charconv>
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstring>
 #include <cstdlib>
 
@@ -27,6 +28,7 @@ typedef SOCKET socket_t;
 #define HAVEN_INVALID_SOCKET INVALID_SOCKET
 #else
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -636,6 +638,39 @@ private:
         return true;
     }
 
+    static bool is_client_disconnected(socket_t sock) {
+        if (sock == HAVEN_INVALID_SOCKET) return true;
+        fd_set read_fds;
+        fd_set except_fds;
+        FD_ZERO(&read_fds);
+        FD_ZERO(&except_fds);
+        FD_SET(sock, &read_fds);
+        FD_SET(sock, &except_fds);
+        timeval tv{0, 0};
+#ifdef _WIN32
+        int sel = select(0, &read_fds, nullptr, &except_fds, &tv);
+#else
+        int sel = select(sock + 1, &read_fds, nullptr, &except_fds, &tv);
+#endif
+        if (sel < 0) return true;
+        if (sel == 0) return false;
+        if (FD_ISSET(sock, &except_fds)) return true;
+        if (FD_ISSET(sock, &read_fds)) {
+            char probe = 0;
+            int r = recv(sock, &probe, 1, MSG_PEEK);
+            if (r == 0) return true;
+            if (r < 0) {
+#ifdef _WIN32
+                int err = WSAGetLastError();
+                if (err != WSAEWOULDBLOCK && err != WSAEINTR) return true;
+#else
+                if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return true;
+#endif
+            }
+        }
+        return false;
+    }
+
     static std::string url_decode(const std::string& in) {
         std::string out;
         out.reserve(in.size());
@@ -1036,6 +1071,45 @@ private:
 
         bool stream = (body.find("\"stream\": true") != std::string::npos || body.find("\"stream\":true") != std::string::npos);
 
+        // Parse request parameters strictly via HavenJson with RAII sampler restoration
+        HavenJson req_json;
+        const bool req_parsed = HavenJson::parse(body, req_json) && req_json.is_object();
+        if (req_parsed) {
+            if (const HavenJson* st = req_json.find("stream"); st && st->is_bool()) {
+                stream = st->as_bool();
+            }
+        }
+
+        bool enable_tools = true;
+        if (req_parsed) {
+            if (const HavenJson* et = req_json.find("enable_tools"); et && et->is_bool()) {
+                enable_tools = et->as_bool();
+            }
+        }
+
+        struct SamplerGuard {
+            PersonaSampler& sampler;
+            SamplerParams saved;
+            explicit SamplerGuard(PersonaSampler& s) : sampler(s), saved(s.get_params()) {}
+            ~SamplerGuard() { sampler.get_params() = saved; }
+        } sampler_guard(haven_engine_.get_sampler());
+
+        if (req_parsed) {
+            auto& sp = haven_engine_.get_sampler().get_params();
+            if (const HavenJson* v = req_json.find("temperature"); v && v->is_number()) {
+                sp.temperature = std::clamp(static_cast<float>(v->as_double()), 0.0f, 2.0f);
+            }
+            if (const HavenJson* v = req_json.find("top_p"); v && v->is_number()) {
+                sp.top_p = std::clamp(static_cast<float>(v->as_double()), 0.01f, 1.0f);
+            }
+            if (const HavenJson* v = req_json.find("min_p"); v && v->is_number()) {
+                sp.min_p = std::clamp(static_cast<float>(v->as_double()), 0.0f, 1.0f);
+            }
+            if (const HavenJson* v = req_json.find("repetition_penalty"); v && v->is_number()) {
+                sp.repetition_penalty = std::clamp(static_cast<float>(v->as_double()), 1.0f, 2.0f);
+            }
+        }
+
         int max_tokens = 512;
         std::string mt_str = extract_json_scalar(body, "max_tokens");
         if (mt_str.empty()) mt_str = extract_json_scalar(body, "n_predict");
@@ -1049,10 +1123,10 @@ private:
         max_tokens = std::clamp(max_tokens, 1, 8192);
 
         std::string prompt = extract_json_string(body, "prompt");
+        const bool raw_prompt_mode = !prompt.empty();
         if (prompt.empty()) {
             std::string last_user_msg = "";
-            HavenJson req_json;
-            if (HavenJson::parse(body, req_json) && req_json.is_object()) {
+            if (req_parsed) {
                 if (const HavenJson* msgs = req_json.find("messages"); msgs && msgs->is_array()) {
                     for (const auto& m : msgs->as_array()) {
                         if (!m.is_object()) continue;
@@ -1089,10 +1163,12 @@ private:
             prompt += "<|turn>model\n";
         }
 
-        // Autonomous Native System Tools & Persona Prompt Injection
-        std::string tools_desc = haven_engine_.get_plugin_manager().get_tools_prompt_description();
+        // Compact Autonomous Native Tools & Persona Prompt Injection
+        std::string tools_desc = (enable_tools && !raw_prompt_mode)
+            ? haven_engine_.get_plugin_manager().get_tools_prompt_description()
+            : "";
         bool has_system_turn = (prompt.find("<|turn>system\n") != std::string::npos);
-        if (!has_system_turn) {
+        if (!has_system_turn && !raw_prompt_mode) {
             std::string sys_prompt = haven::HavenEngine::get_default_system_prompt();
             if (!tools_desc.empty()) {
                 size_t close_t = sys_prompt.rfind("<turn|>");
@@ -1103,8 +1179,11 @@ private:
                 }
             }
             prompt = sys_prompt + prompt;
-        } else if (!tools_desc.empty()) {
-            prompt = "<|turn>system\n" + tools_desc + "<turn|>\n" + prompt;
+        } else if (has_system_turn && !tools_desc.empty()) {
+            size_t sys_close = prompt.find("<turn|>");
+            if (sys_close != std::string::npos) {
+                prompt.insert(sys_close, "\n" + tools_desc);
+            }
         }
 
         const int max_ctx = static_cast<int>(cfg.max_context_length);
@@ -1115,6 +1194,7 @@ private:
         }
 
         std::string accumulated_response = "";
+        int completion_token_count = 0;
 
         // Prefix KV Caching: Reuse already computed KV states for prefix tokens
         size_t common_prefix = 0;
@@ -1123,17 +1203,36 @@ private:
                cached_tokens_[common_prefix] == tokens[common_prefix]) {
             common_prefix++;
         }
+        // Always evaluate at least the final prompt token so logits are freshly populated
+        if (common_prefix > 0 && common_prefix == tokens.size()) {
+            common_prefix--;
+        }
 
         int active_pos = static_cast<int>(common_prefix);
         if (common_prefix == 0) {
             haven_engine_.get_kv_cache().reset();
+        } else {
+            haven_engine_.get_kv_cache().truncate(active_pos);
         }
 
         std::vector<float> logits(cfg.vocab_size, 0.0f);
 
+        bool aborted_during_prefill = false;
+        size_t prefilled_count = common_prefix;
         for (size_t i = common_prefix; i < tokens.size() && active_pos < max_ctx; ++i) {
+            if (is_client_disconnected(client_sock)) {
+                aborted_during_prefill = true;
+                break;
+            }
             bool is_last = (i + 1 == tokens.size());
             haven_engine_.forward(tokens[i], active_pos++, is_last ? logits.data() : nullptr);
+            prefilled_count = i + 1;
+        }
+
+        if (aborted_during_prefill) {
+            cached_tokens_.assign(tokens.begin(), tokens.begin() + prefilled_count);
+            haven_engine_.get_kv_cache().truncate(active_pos);
+            return;
         }
 
         cached_tokens_ = tokens;
@@ -1161,11 +1260,32 @@ private:
                 size_t stream_cursor = 0;
                 bool client_disconnected = false;
 
+                // Returns trailing byte count if `s` ends with a proper prefix of `<|tool_call|>` or `<tool_call>`
+                auto trailing_tool_prefix_len = [](const std::string& s) -> size_t {
+                    static constexpr const char* kTags[] = {"<|tool_call|>", "<tool_call>"};
+                    size_t best = 0;
+                    for (const char* tag : kTags) {
+                        const size_t tlen = std::strlen(tag);
+                        const size_t max_check = std::min(s.size(), tlen - 1);
+                        for (size_t k = max_check; k > best; --k) {
+                            if (s.compare(s.size() - k, k, tag, k) == 0) {
+                                best = k;
+                                break;
+                            }
+                        }
+                    }
+                    return best;
+                };
+
                 for (int gen = 0; gen < max_tokens && active_pos < max_ctx; ++gen) {
+                    if (is_client_disconnected(client_sock)) {
+                        client_disconnected = true;
+                        break;
+                    }
                     uint32_t next_tok = haven_engine_.get_sampler().sample(
                         logits.data(), cfg.vocab_size, context_history);
                     context_history.push_back(next_tok);
-                    cached_tokens_.push_back(next_tok);
+                    completion_token_count++;
 
                     // Stop conditions
                     if (next_tok == haven_engine_.get_tokenizer().eos_token() || next_tok == 1 || next_tok == 106 || next_tok == 212) {
@@ -1182,7 +1302,6 @@ private:
                     }
 
                     phase_output += piece;
-                    haven_engine_.forward(next_tok, active_pos++, logits.data());
 
                     // Check if tool call is starting or in-flight
                     size_t tc_start = phase_output.find("<|tool_call|>");
@@ -1191,39 +1310,48 @@ private:
                         tc_start = phase_output.find("<tool_call>");
                         tag_len = 11;
                     }
+                    bool tool_call_complete = false;
                     if (tc_start != std::string::npos) {
-                        size_t act_start = tc_start + tag_len;
-                        size_t tc_end = phase_output.find("<|tool_call|>", act_start);
-                        if (tc_end == std::string::npos) tc_end = phase_output.find("</tool_call>", act_start);
-                        if (tc_end == std::string::npos) tc_end = phase_output.find("<tool_call>", act_start);
-                        if (tc_end != std::string::npos) {
-                            break;
-                        }
-                    } else {
-                        // Stream text before any tool call, buffering when a potential tag starts
-                        std::string unstreamed = phase_output.substr(stream_cursor);
-                        size_t tag_pos = unstreamed.find("<|");
-                        if (tag_pos == std::string::npos) tag_pos = unstreamed.find("<tool_call");
-                        if (tag_pos == std::string::npos) {
-                            if (!unstreamed.empty() && unstreamed.back() != '<') {
-                                std::string esc_text = escape_json_string(unstreamed);
-                                std::string chunk = "data: {\"content\":\"" + esc_text + "\",\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion.chunk\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" + esc_text + "\"},\"finish_reason\":null}]}\n\n";
-                                if (!send_all(client_sock, chunk.c_str(), static_cast<int>(chunk.length()))) {
-                                    client_disconnected = true;
-                                    break;
-                                }
-                                stream_cursor = phase_output.length();
-                            }
-                        } else if (tag_pos > 0) {
-                            std::string safe = unstreamed.substr(0, tag_pos);
+                        // Stream any non-tool text strictly before the tool call tag
+                        if (stream_cursor < tc_start) {
+                            std::string safe = phase_output.substr(stream_cursor, tc_start - stream_cursor);
                             std::string esc_text = escape_json_string(safe);
                             std::string chunk = "data: {\"content\":\"" + esc_text + "\",\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion.chunk\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" + esc_text + "\"},\"finish_reason\":null}]}\n\n";
                             if (!send_all(client_sock, chunk.c_str(), static_cast<int>(chunk.length()))) {
                                 client_disconnected = true;
                                 break;
                             }
-                            stream_cursor += tag_pos;
+                            stream_cursor = tc_start;
                         }
+                        size_t act_start = tc_start + tag_len;
+                        size_t tc_end = phase_output.find("<|tool_call|>", act_start);
+                        if (tc_end == std::string::npos) tc_end = phase_output.find("</tool_call>", act_start);
+                        if (tc_end == std::string::npos) tc_end = phase_output.find("<tool_call>", act_start);
+                        if (tc_end != std::string::npos) {
+                            tool_call_complete = true;
+                        }
+                    } else {
+                        // Stream immediately, holding back ONLY an exact trailing prefix of `<|tool_call|>` / `<tool_call>`
+                        std::string unstreamed = phase_output.substr(stream_cursor);
+                        size_t hold = trailing_tool_prefix_len(unstreamed);
+                        size_t emit_len = unstreamed.size() - hold;
+                        if (emit_len > 0) {
+                            std::string safe = unstreamed.substr(0, emit_len);
+                            std::string esc_text = escape_json_string(safe);
+                            std::string chunk = "data: {\"content\":\"" + esc_text + "\",\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion.chunk\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" + esc_text + "\"},\"finish_reason\":null}]}\n\n";
+                            if (!send_all(client_sock, chunk.c_str(), static_cast<int>(chunk.length()))) {
+                                client_disconnected = true;
+                                break;
+                            }
+                            stream_cursor += emit_len;
+                        }
+                    }
+
+                    haven_engine_.forward(next_tok, active_pos++, logits.data());
+                    cached_tokens_.push_back(next_tok);
+
+                    if (tool_call_complete) {
+                        break;
                     }
                 }
 
@@ -1319,13 +1447,18 @@ private:
             std::string done_chunk = "data: {\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion.chunk\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
             send_all(client_sock, done_chunk.c_str(), static_cast<int>(done_chunk.length()));
         } else {
-            while (tool_depth < MAX_TOOL_DEPTH && active_pos < max_ctx) {
+            bool client_disconnected = false;
+            while (tool_depth < MAX_TOOL_DEPTH && active_pos < max_ctx && !client_disconnected) {
                 std::string phase_output = "";
                 for (int gen = 0; gen < max_tokens && active_pos < max_ctx; ++gen) {
+                    if (is_client_disconnected(client_sock)) {
+                        client_disconnected = true;
+                        break;
+                    }
                     uint32_t next_tok = haven_engine_.get_sampler().sample(
                         logits.data(), cfg.vocab_size, context_history);
                     context_history.push_back(next_tok);
-                    cached_tokens_.push_back(next_tok);
+                    completion_token_count++;
 
                     if (next_tok == haven_engine_.get_tokenizer().eos_token() || next_tok == 1 || next_tok == 106 || next_tok == 212) {
                         break;
@@ -1342,6 +1475,7 @@ private:
 
                     phase_output += piece;
                     haven_engine_.forward(next_tok, active_pos++, logits.data());
+                    cached_tokens_.push_back(next_tok);
 
                     size_t tc_start = phase_output.find("<|tool_call|>");
                     size_t tag_len = 13;
@@ -1359,6 +1493,8 @@ private:
                         }
                     }
                 }
+
+                if (client_disconnected) break;
 
                 // Inspect phase_output for tool calls
                 size_t tc_pos = phase_output.find("<|tool_call|>");
@@ -1434,10 +1570,12 @@ private:
                 break;
             }
 
-            std::string esc_content = escape_json_string(accumulated_response);
-            std::string json_resp = "{\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"content\":\"" + esc_content + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" + esc_content + "\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(tokens.size()) + ",\"completion_tokens\":" + std::to_string(accumulated_response.length() / 4) + ",\"total_tokens\":" + std::to_string(tokens.size() + accumulated_response.length() / 4) + "}}";
+            if (!client_disconnected) {
+                std::string esc_content = escape_json_string(accumulated_response);
+                std::string json_resp = "{\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"content\":\"" + esc_content + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" + esc_content + "\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(tokens.size()) + ",\"completion_tokens\":" + std::to_string(completion_token_count) + ",\"total_tokens\":" + std::to_string(tokens.size() + static_cast<size_t>(completion_token_count)) + "}}";
 
-            send_http_response(client_sock, "200 OK", "application/json; charset=utf-8", json_resp, cors_hdr);
+                send_http_response(client_sock, "200 OK", "application/json; charset=utf-8", json_resp, cors_hdr);
+            }
         }
 
 #ifdef _WIN32

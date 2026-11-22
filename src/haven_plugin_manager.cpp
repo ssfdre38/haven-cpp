@@ -579,37 +579,16 @@ size_t PluginManager::reload_all(const std::string& plugins_directory, PluginExe
 
 std::string PluginManager::get_tools_prompt_description() const {
     std::lock_guard<std::recursive_mutex> lock(plugins_mutex_);
-    if (plugins_.empty()) return "";
-    std::string s = "\n[Autonomous Sovereign Capabilities & Native Tools]:\n"
-                    "You have direct native system execution and workspace inspection capabilities via C++20 bare-metal plugins.\n"
-                    "Active Sovereign Plugins:\n";
-    for (const auto& [id, record] : plugins_) {
-        std::string status = record.is_loaded ? "ACTIVE" : "ON-DEMAND";
-        s += " • " + record.metadata.name + " [" + status + "]: " + record.metadata.description + "\n";
-    }
-    s += "\nSupported Native Action Tools:\n"
-         " • run_command <cmd>          : Run local shell, bash, zsh, PowerShell, compiler, or diagnostic commands (Windows, Linux, macOS).\n"
-         " • read_file <path>           : Read source code or text files from the local filesystem.\n"
-         " • write_file <path>\n<content>: Create or overwrite a local project file.\n"
-         " • edit_file {\"path\": \"...\", \"target\": \"...\", \"replacement\": \"...\"} : Replace exact text block in a file.\n"
-         " • list_directory <path>      : List folder contents and file sizes.\n"
-         " • search_code <query>        : Recursive pattern/code search across files.\n"
-         " • process_list               : List active processes and thread counts (via Windows Toolhelp32 / Linux /proc / macOS libproc).\n"
-         " • volume_info                : Inspect storage drives, mount points, file systems (NTFS/APFS/ext4/btrfs/xfs/etc.), and free space.\n"
-         " • hardware_vitals            : Bare-metal CPU architecture, threads, RAM metrics (Unified Memory on Apple Silicon), load averages, and uptime.\n"
-         " • system_telemetry           : Real-time local clock, memory pressure, and AC/battery state.\n"
-         " • clipboard_get              : Inspect current clipboard text.\n"
-         "\nTo invoke a tool to inspect or act on the system, output immediately:\n"
-         "<|tool_call|> tool_name payload <|tool_call|>\n"
-         "Example:\n"
-         "<|tool_call|> volume_info <|tool_call|>\n"
-         "Example:\n"
-         "<|tool_call|> run_command git status <|tool_call|>\n";
-
+    if (plugins_.empty() && (!mcp_manager_ || mcp_manager_->get_tool_count() == 0)) return "";
+    std::string s = "Native tools (call via `<|tool_call|> name args <|tool_call|>`): "
+                    "run_command, read_file, write_file, edit_file, list_directory, search_code, "
+                    "process_list, volume_info, hardware_vitals, system_telemetry, get_clipboard.";
     if (mcp_manager_) {
-        s += mcp_manager_->get_tools_prompt_description();
+        std::string mcp_desc = mcp_manager_->get_tools_prompt_description();
+        if (!mcp_desc.empty()) {
+            s += "\n" + mcp_desc;
+        }
     }
-
     return s;
 }
 

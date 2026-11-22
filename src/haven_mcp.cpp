@@ -796,22 +796,17 @@ std::string McpManager::get_tools_prompt_description() const {
     if (tools_.empty()) return "";
 
     std::ostringstream ss;
-    ss << "\n[External Model Context Protocol (MCP) Connected Tools]:\n"
-          "You have live access to external MCP servers running via JSON-RPC stdio bridges.\n";
-
+    ss << "MCP tools: ";
     std::unordered_set<std::string> seen_tools;
+    bool first = true;
     for (const auto& [action_name, info] : tools_) {
         if (seen_tools.count(info.full_action_name)) continue;
         seen_tools.insert(info.full_action_name);
-
-        ss << " • " << info.full_action_name;
-        if (!info.description.empty()) {
-            ss << " : " << info.description;
-        }
-        ss << "\n";
+        if (!first) ss << ", ";
+        first = false;
+        ss << info.full_action_name;
     }
-
-    ss << "To invoke an MCP tool, use: <|tool_call|> " << (tools_.begin()->first) << " {\"param\": \"value\"} <|tool_call|>\n";
+    ss << ".";
     return ss.str();
 }
 

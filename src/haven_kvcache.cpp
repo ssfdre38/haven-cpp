@@ -140,6 +140,21 @@ size_t DynamicKVCacheManager::prune_all_layers() {
     return total_pruned;
 }
 
+void DynamicKVCacheManager::truncate(int new_len) {
+    if (new_len <= 0) {
+        reset();
+        return;
+    }
+    if (new_len < current_length_) {
+        current_length_ = new_len;
+    }
+    for (auto& lay : layers_) {
+        if (lay.current_len > new_len) {
+            lay.current_len = new_len;
+        }
+    }
+}
+
 void DynamicKVCacheManager::reset() {
     current_length_ = 0;
     for (auto& lay : layers_) {

@@ -461,7 +461,6 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         }
 
         // Residual Addition 1
-        #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < cfg.embedding_dim; ++i) {
             embedding_scratch_[i] += attn_out_scratch_[i];
         }
@@ -479,7 +478,6 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
             } else {
                 Avx2Math::silu(ffn_gate_scratch_.data(), cfg.hidden_dim);
             }
-            #pragma omp parallel for schedule(static)
             for (size_t i = 0; i < cfg.hidden_dim; ++i) {
                 ffn_gate_scratch_[i] *= ffn_up_scratch_[i];
             }
@@ -501,7 +499,6 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         }
 
         // Residual Addition 2
-        #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < cfg.embedding_dim; ++i) {
             embedding_scratch_[i] += ffn_down_scratch_[i];
         }
@@ -525,7 +522,6 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
                 Avx2Math::rms_norm(pleias_proj, pleias_proj, post_w, cfg.embedding_dim, cfg.rms_norm_eps);
             }
 
-            #pragma omp parallel for schedule(static)
             for (size_t i = 0; i < cfg.embedding_dim; ++i) {
                 embedding_scratch_[i] += pleias_proj[i];
             }

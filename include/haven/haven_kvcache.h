@@ -47,6 +47,7 @@ public:
 
     int get_current_length() const { return current_length_; }
     void advance_position() { }
+    void truncate(int new_len);
     void reset();
     void reinit(uint32_t num_layers, uint32_t max_context_length, uint32_t num_kv_heads, uint32_t head_dim);
 
