@@ -33,9 +33,83 @@ HavenEngine::HavenEngine()
 }
 
 HavenEngine::~HavenEngine() {
+    disable_tpu_offload();
     if (pathways_) {
         pathways_->shutdown();
     }
+}
+
+bool HavenEngine::enable_tpu_offload(HavenTpuPjrtBackend* external_backend) {
+    disable_tpu_offload();
+    const auto& cfg = loader_.get_config();
+    if (cfg.num_layers == 0 || cfg.embedding_dim == 0 || cfg.hidden_dim == 0 || cfg.vocab_size == 0) {
+        return false;
+    }
+
+    if (external_backend) {
+        if (!external_backend->is_initialized()) return false;
+        tpu_backend_ = external_backend;
+    } else {
+        owned_tpu_backend_ = std::make_unique<HavenTpuPjrtBackend>();
+        if (!owned_tpu_backend_->initialize()) {
+            owned_tpu_backend_.reset();
+            return false;
+        }
+        tpu_backend_ = owned_tpu_backend_.get();
+    }
+
+    const int n_devs = std::max(1, static_cast<int>(tpu_backend_->get_device_count()));
+    tpu_layers_.resize(cfg.num_layers);
+    size_t total_bytes = 0;
+
+    // Upload all layer FFN weights (GeGLU) across available TPU HBM3 chips (round-robin shard by layer)
+    if (cfg.ffn_activation == FfnActivation::GELU) {
+        for (uint32_t l = 0; l < cfg.num_layers && l < layers_.size(); ++l) {
+            const auto& lt = layers_[l];
+            if (!lt.ffn_gate || !lt.ffn_up || !lt.ffn_down) continue;
+            const int dev_idx = static_cast<int>(l % static_cast<uint32_t>(n_devs));
+            bool ok = tpu_backend_->upload_gguf_weight_matrix(*lt.ffn_gate, static_cast<int>(cfg.hidden_dim), static_cast<int>(cfg.embedding_dim), tpu_layers_[l].ffn_gate, dev_idx)
+                   && tpu_backend_->upload_gguf_weight_matrix(*lt.ffn_up,   static_cast<int>(cfg.hidden_dim), static_cast<int>(cfg.embedding_dim), tpu_layers_[l].ffn_up, dev_idx)
+                   && tpu_backend_->upload_gguf_weight_matrix(*lt.ffn_down, static_cast<int>(cfg.embedding_dim), static_cast<int>(cfg.hidden_dim), tpu_layers_[l].ffn_down, dev_idx);
+            if (ok) {
+                tpu_layers_[l].has_ffn = true;
+                total_bytes += tpu_layers_[l].ffn_gate.bytes + tpu_layers_[l].ffn_up.bytes + tpu_layers_[l].ffn_down.bytes;
+            } else {
+                tpu_backend_->free_matrix(tpu_layers_[l].ffn_gate);
+                tpu_backend_->free_matrix(tpu_layers_[l].ffn_up);
+                tpu_backend_->free_matrix(tpu_layers_[l].ffn_down);
+                tpu_layers_[l].has_ffn = false;
+            }
+        }
+    }
+
+    // Upload LM head (e.g. 262,144 x 2,560) to TPU HBM3 Device 0
+    if (output_tensor_) {
+        if (tpu_backend_->upload_gguf_weight_matrix(*output_tensor_, static_cast<int>(cfg.vocab_size), static_cast<int>(cfg.embedding_dim), tpu_lm_head_, 0)) {
+            total_bytes += tpu_lm_head_.bytes;
+        }
+    }
+
+    tpu_resident_bytes_ = total_bytes;
+    tpu_offload_active_ = (total_bytes > 0);
+    return tpu_offload_active_;
+}
+
+void HavenEngine::disable_tpu_offload() {
+    if (tpu_backend_) {
+        for (auto& tl : tpu_layers_) {
+            tpu_backend_->free_matrix(tl.ffn_gate);
+            tpu_backend_->free_matrix(tl.ffn_up);
+            tpu_backend_->free_matrix(tl.ffn_down);
+            tl.has_ffn = false;
+        }
+        tpu_backend_->free_matrix(tpu_lm_head_);
+    }
+    tpu_layers_.clear();
+    tpu_backend_ = nullptr;
+    owned_tpu_backend_.reset();
+    tpu_offload_active_ = false;
+    tpu_resident_bytes_ = 0;
 }
 
 bool HavenEngine::load_model(const std::string& gguf_filepath) {
@@ -469,27 +543,34 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         const float* ffn_norm_w = safe_f32_weights(lt.ffn_norm, cfg.embedding_dim);
         Avx2Math::rms_norm(norm_scratch_.data(), embedding_scratch_.data(), ffn_norm_w, cfg.embedding_dim, cfg.rms_norm_eps);
 
-        // 2h. FFN Gate & Up Projections (SwiGLU for LLaMA / Qwen / Mistral, GeGLU for Gemma)
-        if (lt.ffn_gate && lt.ffn_up) {
-            Avx2Math::gemv(ffn_gate_scratch_.data(), *lt.ffn_gate, norm_scratch_.data(), cfg.hidden_dim, cfg.embedding_dim);
-            Avx2Math::gemv(ffn_up_scratch_.data(), *lt.ffn_up, norm_scratch_.data(), cfg.hidden_dim, cfg.embedding_dim);
-            if (cfg.ffn_activation == FfnActivation::GELU) {
-                Avx2Math::gelu(ffn_gate_scratch_.data(), cfg.hidden_dim);
+        // 2h + 2i. FFN Gate/Up/Activation/Down (Fused TPU MXU GeGLU when offload active, else AVX2 CPU)
+        if (tpu_offload_active_ && tpu_backend_ && l < tpu_layers_.size() && tpu_layers_[l].has_ffn &&
+            tpu_backend_->fused_geglu_ffn(norm_scratch_.data(), 1,
+                                          tpu_layers_[l].ffn_gate, tpu_layers_[l].ffn_up, tpu_layers_[l].ffn_down,
+                                          ffn_down_scratch_.data())) {
+            // Computed directly on TPU HBM3 + MXU systolic array
+        } else {
+            if (lt.ffn_gate && lt.ffn_up) {
+                Avx2Math::gemv(ffn_gate_scratch_.data(), *lt.ffn_gate, norm_scratch_.data(), cfg.hidden_dim, cfg.embedding_dim);
+                Avx2Math::gemv(ffn_up_scratch_.data(), *lt.ffn_up, norm_scratch_.data(), cfg.hidden_dim, cfg.embedding_dim);
+                if (cfg.ffn_activation == FfnActivation::GELU) {
+                    Avx2Math::gelu(ffn_gate_scratch_.data(), cfg.hidden_dim);
+                } else {
+                    Avx2Math::silu(ffn_gate_scratch_.data(), cfg.hidden_dim);
+                }
+                for (size_t i = 0; i < cfg.hidden_dim; ++i) {
+                    ffn_gate_scratch_[i] *= ffn_up_scratch_[i];
+                }
             } else {
-                Avx2Math::silu(ffn_gate_scratch_.data(), cfg.hidden_dim);
+                for (size_t i = 0; i < cfg.hidden_dim; ++i) ffn_gate_scratch_[i] = norm_scratch_[i % cfg.embedding_dim] * 0.1f;
             }
-            for (size_t i = 0; i < cfg.hidden_dim; ++i) {
-                ffn_gate_scratch_[i] *= ffn_up_scratch_[i];
-            }
-        } else {
-            for (size_t i = 0; i < cfg.hidden_dim; ++i) ffn_gate_scratch_[i] = norm_scratch_[i % cfg.embedding_dim] * 0.1f;
-        }
 
-        // 2i. FFN Down Projection
-        if (lt.ffn_down) {
-            Avx2Math::gemv(ffn_down_scratch_.data(), *lt.ffn_down, ffn_gate_scratch_.data(), cfg.embedding_dim, cfg.hidden_dim);
-        } else {
-            for (size_t i = 0; i < cfg.embedding_dim; ++i) ffn_down_scratch_[i] = ffn_gate_scratch_[i % cfg.hidden_dim] * 0.05f;
+            // 2i. FFN Down Projection
+            if (lt.ffn_down) {
+                Avx2Math::gemv(ffn_down_scratch_.data(), *lt.ffn_down, ffn_gate_scratch_.data(), cfg.embedding_dim, cfg.hidden_dim);
+            } else {
+                for (size_t i = 0; i < cfg.embedding_dim; ++i) ffn_down_scratch_[i] = ffn_gate_scratch_[i % cfg.hidden_dim] * 0.05f;
+            }
         }
 
         // 2i-2. Post-FFN Norm (Gemma 2 / 4)
@@ -552,7 +633,10 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
     const float* out_norm_w = safe_f32_weights(output_norm_tensor_, cfg.embedding_dim);
     Avx2Math::rms_norm(norm_scratch_.data(), embedding_scratch_.data(), out_norm_w, cfg.embedding_dim, cfg.rms_norm_eps);
 
-    if (output_tensor_) {
+    if (tpu_offload_active_ && tpu_backend_ && tpu_lm_head_.buffer &&
+        tpu_backend_->matmul_resident_nt(norm_scratch_.data(), 1, tpu_lm_head_, out_logits)) {
+        // Computed 262k LM head directly on TPU HBM3 + MXU
+    } else if (output_tensor_) {
         Avx2Math::gemv(out_logits, *output_tensor_, norm_scratch_.data(), cfg.vocab_size, cfg.embedding_dim);
     } else {
         for (size_t v = 0; v < cfg.vocab_size; ++v) {

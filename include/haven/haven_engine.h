@@ -19,6 +19,7 @@
 #include "haven_mcp.h"
 #include "haven_topology.h"
 #include "haven_pathways.h"
+#include "haven_tpu_pjrt.h"
 #include <string>
 #include <vector>
 #include <functional>
@@ -112,6 +113,12 @@ public:
     std::shared_ptr<const TopologyManager> get_topology() const { return topology_; }
     std::shared_ptr<PathwaysEngine> get_pathways() { return pathways_; }
     std::shared_ptr<const PathwaysEngine> get_pathways() const { return pathways_; }
+
+    // Real Cloud TPU HBM3 + MXU offload via native C++20 PJRT (libtpu.so)
+    bool enable_tpu_offload(HavenTpuPjrtBackend* external_backend = nullptr);
+    void disable_tpu_offload();
+    bool is_tpu_offload_active() const { return tpu_offload_active_; }
+    size_t get_tpu_resident_bytes() const { return tpu_resident_bytes_; }
 
     const ModelConfig& get_config() const { return loader_.get_config(); }
     const TensorDesc* get_token_embd_tensor() const { return token_embd_tensor_; }
@@ -223,6 +230,19 @@ private:
 
     std::shared_ptr<TopologyManager> topology_;
     std::shared_ptr<PathwaysEngine> pathways_;
+
+    struct TpuLayerHandles {
+        TpuMatrixHandle ffn_gate;
+        TpuMatrixHandle ffn_up;
+        TpuMatrixHandle ffn_down;
+        bool has_ffn = false;
+    };
+    std::unique_ptr<HavenTpuPjrtBackend> owned_tpu_backend_;
+    HavenTpuPjrtBackend* tpu_backend_ = nullptr;
+    std::vector<TpuLayerHandles> tpu_layers_;
+    TpuMatrixHandle tpu_lm_head_;
+    bool tpu_offload_active_ = false;
+    size_t tpu_resident_bytes_ = 0;
 };
 
 } // namespace haven

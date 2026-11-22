@@ -60,6 +60,7 @@ set(HAVEN_CORE_SRCS
     src/haven_plugin_manager.cpp
     src/haven_topology.cpp
     src/haven_pathways.cpp
+    src/haven_tpu_pjrt.cpp
     src/haven_mlx.cpp
     src/haven_mcp.cpp
     src/haven_cluster.cpp
@@ -141,6 +142,10 @@ target_link_libraries(test-live-cluster-generation PRIVATE haven_core)
 # TPU Live Multi-Node Generation Test (Ava 4-Node Sovereign Cluster)
 add_executable(test-tpu-live-generation tests/test_tpu_live_generation.cpp)
 target_link_libraries(test-tpu-live-generation PRIVATE haven_core)
+
+# Native C++20 PJRT (libtpu.so) Cloud TPU Silicon Benchmark
+add_executable(test-tpu-pjrt-bench tests/test_tpu_pjrt_bench.cpp)
+target_link_libraries(test-tpu-pjrt-bench PRIVATE haven_core)
 
 # Secure Cluster Protocol Verification Test (SHCP Mutual Authentication & Crypto Handshake)
 add_executable(test-secure-cluster tests/test_secure_cluster.cpp)
