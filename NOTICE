@@ -1,0 +1,22 @@
+Haven C++ (haven-cpp)
+Copyright (C) 2026 Daniel Elliott
+
+This software is dual-licensed under the GNU Affero General Public License v3.0
+(AGPLv3, see LICENSE) and the Haven-CPP Commercial License (see COMMERCIAL_LICENSE.md).
+
+===============================================================================
+Third-Party Notices & Attributions
+===============================================================================
+
+1. OpenXLA PJRT C API Header
+   File:      include/haven/third_party/pjrt_c_api.h
+   Copyright: Copyright 2022 The OpenXLA Authors
+   License:   Apache License, Version 2.0
+              http://www.apache.org/licenses/LICENSE-2.0
+   Source:    https://github.com/openxla/xla
+
+2. Optional Runtime / Platform Libraries (not redistributed in source tree)
+   - Google Cloud TPU PJRT Plugin (libtpu.so): Dynamically loaded at runtime via
+     dlopen() on Linux Cloud TPU hosts when TPU acceleration is enabled.
+   - Apple MLX C/C++ Libraries (optional Windows/macOS builds): MIT License.
+   - OpenBLAS (optional Windows builds): BSD 3-Clause License.

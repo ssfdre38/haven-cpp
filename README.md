@@ -7,7 +7,7 @@
 [![Cloud TPU](https://img.shields.io/badge/TPU%20v6e--4-9%2C180%20tok%2Fs%20%7C%202.865%20PFLOPS-red.svg)](#cloud-tpu-v6e-4-trillium-native-c20-benchmarks)
 [![Security](https://img.shields.io/badge/Security-SHCP%20v2%20AEAD%20%7C%20Fuzz%20Verified-brightgreen.svg)](#zero-trust-security-architecture)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20TPU-orange.svg)](#building-haven-cpp)
-[![License](https://img.shields.io/badge/License-MIT-purple.svg)](#license)
+[![License](https://img.shields.io/badge/License-AGPLv3%20%7C%20Commercial-purple.svg)](#license)
 
 `haven-cpp` is a standalone, zero-Python AI inference engine and companion runtime built from scratch in pure C++20. It scales seamlessly from a single local workstation CPU (`AVX2/FMA/F16C`) or Apple Silicon (`MLX`) all the way to bare-metal **Google Cloud TPU v6e (Trillium)** slices via direct `dlopen("libtpu.so")` calls over OpenXLA's PJRT C ABI (`0.75`).
 
@@ -272,4 +272,11 @@ cmake --build build -j $(nproc)
 
 ## License
 
-MIT License. Built for Aura, Daniel, and the Haven Sovereign Companion Ecosystem.
+**Copyright (C) 2026 Daniel Elliott.**
+
+`haven-cpp` is **dual-licensed**:
+
+- **Open Source — GNU Affero General Public License v3.0 (AGPLv3):** Free to use, modify, and distribute for personal, academic, research, and AGPLv3-compliant open-source projects. See [LICENSE](LICENSE).
+- **Commercial License:** Required for closed-source embedding (`haven_engine.dll` / `libhaven_engine.so`), proprietary SaaS / Cloud TPU inference APIs without AGPLv3 source disclosure, commercial OEM appliances, or enterprise support and SLAs. See [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md).
+
+Third-party attributions (including OpenXLA's Apache-2.0 `pjrt_c_api.h`) are listed in [NOTICE](NOTICE). Contribution and CLA terms are in [CONTRIBUTING.md](CONTRIBUTING.md).
