@@ -96,6 +96,7 @@ public:
     // Compile textual StableHLO MLIR module (portable single-device, ordinal-bound, or multi-replica SPMD)
     PJRT_LoadedExecutable* compile_stablehlo(const std::string& mlir_code, int device_ordinal = -1);
     PJRT_LoadedExecutable* compile_stablehlo_replicated(const std::string& mlir_code, int num_replicas);
+    std::vector<int> get_executable_device_indices(PJRT_LoadedExecutable* exec);
     void destroy_executable(PJRT_LoadedExecutable* exec);
 
     // Execute a compiled StableHLO executable on a single addressable TPU device

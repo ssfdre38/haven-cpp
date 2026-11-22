@@ -24,6 +24,9 @@ struct TpuGemma4Metrics {
     double prefill_compile_ms = 0.0;
     size_t total_hbm_weight_bytes = 0;
     size_t total_hbm_kv_bytes = 0;
+    double last_h2d_ms = 0.0;
+    double last_exec_ms = 0.0;
+    double last_d2h_ms = 0.0;
 };
 
 // Full On-Chip 42-Layer Gemma 4 StableHLO Compiler & Persistent HBM3 Runtime.
@@ -86,6 +89,7 @@ private:
     // Compiled executables (1-chip portable or R-chip SPMD replicated)
     PJRT_LoadedExecutable* decode_exec_ = nullptr;
     PJRT_LoadedExecutable* prefill_exec_ = nullptr;
+    std::vector<int> replica_dev_indices_; // Exact XLA torus device assignment per replica (e.g. {0,1,3,2})
 
     // Per-replica persistent HBM3 weight buffers (constant across all steps)
     std::vector<std::vector<PJRT_Buffer*>> replica_weight_bufs_;

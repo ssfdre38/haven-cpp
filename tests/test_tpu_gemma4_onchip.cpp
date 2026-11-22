@@ -134,9 +134,12 @@ int main(int argc, char** argv) {
                   << " | Upload=" << std::setprecision(1) << m.weight_upload_ms << " ms"
                   << " | Compile(dec/pre)=" << m.decode_compile_ms << "/" << m.prefill_compile_ms << " ms\n";
 
-        // Warmup 1 decode + 1 prefill
+        // Warmup 1 decode step (abort cleanly on error so device queue never desyncs)
         std::vector<uint32_t> warm_out;
-        gemma_tpu.decode_step(std::vector<uint32_t>(static_cast<size_t>(B), prompt_toks[0]), 0, nullptr, warm_out);
+        if (!gemma_tpu.decode_step(std::vector<uint32_t>(static_cast<size_t>(B), prompt_toks[0]), 0, nullptr, warm_out)) {
+            std::cerr << "  WARMUP FAILED: " << gemma_tpu.get_last_error() << "\n";
+            return;
+        }
         gemma_tpu.reset_kv_cache();
 
         // Optional dedicated S=prefill_chunk MXU batched prefill measurement (e.g. 128 tokens in 1 single TPU launch!)
@@ -203,12 +206,16 @@ int main(int argc, char** argv) {
 
         auto d0 = std::chrono::high_resolution_clock::now();
         int actual_steps = 0;
+        double sum_h2d = 0.0, sum_exec = 0.0, sum_d2h = 0.0;
         for (int s = 0; s < gen_steps; ++s) {
             if (!gemma_tpu.decode_step(cur_toks, pos++, nullptr, next_toks)) {
                 std::cerr << "  DECODE FAILED at step " << s << ": " << gemma_tpu.get_last_error() << "\n";
                 break;
             }
             actual_steps++;
+            sum_h2d  += gemma_tpu.get_metrics().last_h2d_ms;
+            sum_exec += gemma_tpu.get_metrics().last_exec_ms;
+            sum_d2h  += gemma_tpu.get_metrics().last_d2h_ms;
             cur_toks = next_toks;
             if (B == 1) {
                 uint32_t nt = next_toks[0];
@@ -233,6 +240,9 @@ int main(int argc, char** argv) {
                   << prompt_toks.size() << " tokens -> " << std::setprecision(0)
                   << (static_cast<double>(prompt_toks.size()) / (prefill_ms / 1000.0)) << " tok/s prefill)\n";
         std::cout << "  On-Chip Decode : " << std::setprecision(2) << ms_per_step << " ms/step"
+                  << " (H2D=" << (sum_h2d / std::max(1, actual_steps))
+                  << " / TPU=" << (sum_exec / std::max(1, actual_steps))
+                  << " / D2H=" << (sum_d2h / std::max(1, actual_steps)) << " ms)"
                   << " | Per-Stream: " << std::setprecision(1) << stream_tok_s << " tok/s"
                   << " | Aggregate (B=" << B << "): " << agg_tok_s << " tok/s\n";
         if (B == 1) {

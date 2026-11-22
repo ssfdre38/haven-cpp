@@ -30,9 +30,10 @@ static std::string replica_group_attr(int R) {
     return ss.str();
 }
 
-// Quantize a [rows, cols] float row-major slice into symmetric INT8 + per-row F32 scales
+// Quantize a [rows, cols] float row-major slice into symmetric INT8 + per-row F32 scales (OpenMP parallel)
 static void quantize_f32_to_s8_per_row(const float* src, int rows, int cols,
                                        int8_t* dst_q, float* dst_scale) {
+    #pragma omp parallel for schedule(static)
     for (int r = 0; r < rows; ++r) {
         const float* row = src + static_cast<size_t>(r) * static_cast<size_t>(cols);
         int8_t* qrow = dst_q + static_cast<size_t>(r) * static_cast<size_t>(cols);
@@ -332,8 +333,9 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const ModelConfig& mc,
     }
 
     MlirEmitter em;
-    const std::string kv_ks_t = "tensor<" + std::to_string(N_swa_kv)  + "x" + std::to_string(B) + "x" + std::to_string(T) + "x" + std::to_string(Hkv_sh) + "x" + std::to_string(HD_swa)  + "xbf16>";
-    const std::string kv_kg_t = "tensor<" + std::to_string(N_glob_kv) + "x" + std::to_string(B) + "x" + std::to_string(T) + "x" + std::to_string(Hkv_sh) + "x" + std::to_string(HD_glob) + "xbf16>";
+    // Zero-padding TPU (8,128)-aligned KV Cache layout: [N_kv, B, Hkv_sh, T, HD] (T=2048 % 8 == 0, HD % 128 == 0)
+    const std::string kv_ks_t = "tensor<" + std::to_string(N_swa_kv)  + "x" + std::to_string(B) + "x" + std::to_string(Hkv_sh) + "x" + std::to_string(T) + "x" + std::to_string(HD_swa)  + "xbf16>";
+    const std::string kv_kg_t = "tensor<" + std::to_string(N_glob_kv) + "x" + std::to_string(B) + "x" + std::to_string(Hkv_sh) + "x" + std::to_string(T) + "x" + std::to_string(HD_glob) + "xbf16>";
     const std::string out0_t  = tc.return_full_logits
         ? ("tensor<" + std::to_string(B) + "x" + std::to_string(V) + "xf32>")
         : ("tensor<" + std::to_string(B) + "xi32>");
@@ -522,7 +524,8 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const ModelConfig& mc,
             const std::string t_kv3 = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "x" + std::to_string(KV_sh) + "xf32>";
             const std::string t_kv4 = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "x" + std::to_string(Hkv_sh) + "x" + std::to_string(HD) + "xf32>";
             const std::string t_kv4_bf = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "x" + std::to_string(Hkv_sh) + "x" + std::to_string(HD) + "xbf16>";
-            const std::string t_kv5_bf = "tensor<1x" + std::to_string(B) + "x" + std::to_string(S) + "x" + std::to_string(Hkv_sh) + "x" + std::to_string(HD) + "xbf16>";
+            const std::string t_kv4t_bf = "tensor<" + std::to_string(B) + "x" + std::to_string(Hkv_sh) + "x" + std::to_string(S) + "x" + std::to_string(HD) + "xbf16>";
+            const std::string t_kv5_bf = "tensor<1x" + std::to_string(B) + "x" + std::to_string(Hkv_sh) + "x" + std::to_string(S) + "x" + std::to_string(HD) + "xbf16>";
 
             std::string k_4d = em.tmp("k4"), v_4d = em.tmp("v4");
             em.ss << "    " << k_4d << " = stablehlo.reshape " << k_flat << " : (" << t_kv3 << ") -> " << t_kv4 << "\n"
@@ -532,27 +535,29 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const ModelConfig& mc,
             std::string v_n = em.emit_rms_norm_4d(v_4d, "", B, S, Hkv_sh, HD, mc.rms_norm_eps, c0_f32);
             std::string k_rot = em.emit_rope_4d(k_n, is_swa ? "%cos_swa_s" : "%cos_glob_s", is_swa ? "%sin_swa_s" : "%sin_glob_s", B, S, Hkv_sh, HD);
 
-            std::string k_bf = em.tmp("kbf"), v_bf = em.tmp("vbf"), k_5 = em.tmp("k5"), v_5 = em.tmp("v5");
+            std::string k_bf = em.tmp("kbf"), v_bf = em.tmp("vbf"), k_tr = em.tmp("ktr"), v_tr = em.tmp("vtr"), k_5 = em.tmp("k5"), v_5 = em.tmp("v5");
             std::string c_kvi = em.tmp("kvi"), nk = em.tmp("kvk"), nv = em.tmp("kvv");
             em.ss << "    " << k_bf << " = stablehlo.convert " << k_rot << " : (" << t_kv4 << ") -> " << t_kv4_bf << "\n"
                   << "    " << v_bf << " = stablehlo.convert " << v_n   << " : (" << t_kv4 << ") -> " << t_kv4_bf << "\n"
-                  << "    " << k_5  << " = stablehlo.reshape " << k_bf << " : (" << t_kv4_bf << ") -> " << t_kv5_bf << "\n"
-                  << "    " << v_5  << " = stablehlo.reshape " << v_bf << " : (" << t_kv4_bf << ") -> " << t_kv5_bf << "\n"
+                  << "    " << k_tr << " = stablehlo.transpose " << k_bf << ", dims = [0, 2, 1, 3] : (" << t_kv4_bf << ") -> " << t_kv4t_bf << "\n"
+                  << "    " << v_tr << " = stablehlo.transpose " << v_bf << ", dims = [0, 2, 1, 3] : (" << t_kv4_bf << ") -> " << t_kv4t_bf << "\n"
+                  << "    " << k_5  << " = stablehlo.reshape " << k_tr << " : (" << t_kv4t_bf << ") -> " << t_kv5_bf << "\n"
+                  << "    " << v_5  << " = stablehlo.reshape " << v_tr << " : (" << t_kv4t_bf << ") -> " << t_kv5_bf << "\n"
                   << "    " << c_kvi << " = stablehlo.constant dense<" << kvi << "> : tensor<i32>\n"
                   << "    " << nk << " = stablehlo.dynamic_update_slice " << kv_k_stack << ", " << k_5 << ", "
-                  << c_kvi << ", " << c0_i32 << ", %pos, " << c0_i32 << ", " << c0_i32
+                  << c_kvi << ", " << c0_i32 << ", " << c0_i32 << ", %pos, " << c0_i32
                   << " : (" << kv_stack_t << ", " << t_kv5_bf << ", tensor<i32>, tensor<i32>, tensor<i32>, tensor<i32>, tensor<i32>) -> " << kv_stack_t << "\n"
                   << "    " << nv << " = stablehlo.dynamic_update_slice " << kv_v_stack << ", " << v_5 << ", "
-                  << c_kvi << ", " << c0_i32 << ", %pos, " << c0_i32 << ", " << c0_i32
+                  << c_kvi << ", " << c0_i32 << ", " << c0_i32 << ", %pos, " << c0_i32
                   << " : (" << kv_stack_t << ", " << t_kv5_bf << ", tensor<i32>, tensor<i32>, tensor<i32>, tensor<i32>, tensor<i32>) -> " << kv_stack_t << "\n";
             if (is_swa) { kv_ks = nk; kv_vs = nv; } else { kv_kg = nk; kv_vg = nv; }
         }
 
-        // 2e. GQA Attention directly on HBM3 KV Cache (zero KV head duplication!)
+        // 2e. GQA Attention directly on zero-padded [B, Hkv_sh, T, HD] HBM3 KV Cache!
         const std::string& cur_k_stack = is_swa ? kv_ks : kv_kg;
         const std::string& cur_v_stack = is_swa ? kv_vs : kv_vg;
-        const std::string t_kv1_t = "tensor<1x" + std::to_string(B) + "x" + std::to_string(T) + "x" + std::to_string(Hkv_sh) + "x" + std::to_string(HD) + "xbf16>";
-        const std::string t_kv4_t = "tensor<" + std::to_string(B) + "x" + std::to_string(T) + "x" + std::to_string(Hkv_sh) + "x" + std::to_string(HD) + "xbf16>";
+        const std::string t_kv1_t = "tensor<1x" + std::to_string(B) + "x" + std::to_string(Hkv_sh) + "x" + std::to_string(T) + "x" + std::to_string(HD) + "xbf16>";
+        const std::string t_kv4_t = "tensor<" + std::to_string(B) + "x" + std::to_string(Hkv_sh) + "x" + std::to_string(T) + "x" + std::to_string(HD) + "xbf16>";
         const std::string t_q5_bf = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "x" + std::to_string(Hkv_sh) + "x" + std::to_string(G_sh) + "x" + std::to_string(HD) + "xbf16>";
         const std::string t_sc5   = "tensor<" + std::to_string(B) + "x" + std::to_string(Hkv_sh) + "x" + std::to_string(S) + "x" + std::to_string(G_sh) + "x" + std::to_string(T) + "xf32>";
         const std::string t_sc5_i1 = "tensor<" + std::to_string(B) + "x" + std::to_string(Hkv_sh) + "x" + std::to_string(S) + "x" + std::to_string(G_sh) + "x" + std::to_string(T) + "xi1>";
@@ -570,15 +575,15 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const ModelConfig& mc,
         std::string ao_f32 = em.tmp("aof"), ao_bf = em.tmp("aob");
 
         em.ss << "    " << ks1  << " = stablehlo.slice " << cur_k_stack << " [" << kvi << ":" << (kvi + 1)
-              << ", 0:" << B << ", 0:" << T << ", 0:" << Hkv_sh << ", 0:" << HD << "] : (" << kv_stack_t << ") -> " << t_kv1_t << "\n"
+              << ", 0:" << B << ", 0:" << Hkv_sh << ", 0:" << T << ", 0:" << HD << "] : (" << kv_stack_t << ") -> " << t_kv1_t << "\n"
               << "    " << klay << " = stablehlo.reshape " << ks1 << " : (" << t_kv1_t << ") -> " << t_kv4_t << "\n"
               << "    " << vs1  << " = stablehlo.slice " << cur_v_stack << " [" << kvi << ":" << (kvi + 1)
-              << ", 0:" << B << ", 0:" << T << ", 0:" << Hkv_sh << ", 0:" << HD << "] : (" << kv_stack_t << ") -> " << t_kv1_t << "\n"
+              << ", 0:" << B << ", 0:" << Hkv_sh << ", 0:" << T << ", 0:" << HD << "] : (" << kv_stack_t << ") -> " << t_kv1_t << "\n"
               << "    " << vlay << " = stablehlo.reshape " << vs1 << " : (" << t_kv1_t << ") -> " << t_kv4_t << "\n"
               << "    " << qbf4 << " = stablehlo.convert " << q_rot << " : (" << t_q4 << ") -> tensor<" << B << "x" << S << "x" << H_sh << "x" << HD << "xbf16>\n"
               << "    " << q5   << " = stablehlo.reshape " << qbf4 << " : (tensor<" << B << "x" << S << "x" << H_sh << "x" << HD << "xbf16>) -> " << t_q5_bf << "\n"
               << "    " << sc   << " = stablehlo.dot_general " << q5 << ", " << klay
-              << ", batching_dims = [0, 2] x [0, 2], contracting_dims = [4] x [3] : (" << t_q5_bf << ", " << t_kv4_t << ") -> " << t_sc5 << "\n"
+              << ", batching_dims = [0, 2] x [0, 1], contracting_dims = [4] x [3] : (" << t_q5_bf << ", " << t_kv4_t << ") -> " << t_sc5 << "\n"
               << "    " << mb   << " = stablehlo.broadcast_in_dim " << (is_swa ? "%mask_swa" : "%mask_glob")
               << ", dims = [2, 4] : (" << t_st_i1 << ") -> " << t_sc5_i1 << "\n"
               << "    " << nib  << " = stablehlo.broadcast_in_dim " << c_ninf << ", dims = [] : (tensor<f32>) -> " << t_sc5 << "\n"
@@ -602,7 +607,7 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const ModelConfig& mc,
               << "    " << pr   << " = stablehlo.divide " << ex << ", " << seb << " : " << t_sc5 << "\n"
               << "    " << prbf << " = stablehlo.convert " << pr << " : (" << t_sc5 << ") -> " << t_sc5_bf << "\n"
               << "    " << ctx  << " = stablehlo.dot_general " << prbf << ", " << vlay
-              << ", batching_dims = [0, 1] x [0, 2], contracting_dims = [4] x [1] : (" << t_sc5_bf << ", " << t_kv4_t << ") -> " << t_ctx5 << "\n"
+              << ", batching_dims = [0, 1] x [0, 1], contracting_dims = [4] x [2] : (" << t_sc5_bf << ", " << t_kv4_t << ") -> " << t_ctx5 << "\n"
               << "    " << ctxt << " = stablehlo.transpose " << ctx << ", dims = [0, 2, 1, 3, 4] : (" << t_ctx5 << ") -> " << t_ctx5t << "\n"
               << "    " << ao_f32 << " = stablehlo.reshape " << ctxt << " : (" << t_ctx5t << ") -> " << t_q3 << "\n"
               << "    " << ao_bf  << " = stablehlo.convert " << ao_f32 << " : (" << t_q3 << ") -> " << t_ao_bf << "\n";
@@ -911,13 +916,14 @@ bool HavenTpuGemma4Engine::build_and_upload_weights(const HavenEngine& host_engi
         }
 
         for (int rep = 0; rep < R; ++rep) {
+            const int dev = replica_dev_indices_[static_cast<size_t>(rep)];
             PJRT_Buffer* wb = nullptr;
             if (!i8) {
-                wb = backend_->upload_bf16_nd(bf16_shards[static_cast<size_t>(rep)].data(), {cnt, r_sh, c_sh}, rep);
+                wb = backend_->upload_bf16_nd(bf16_shards[static_cast<size_t>(rep)].data(), {cnt, r_sh, c_sh}, dev);
                 total_bytes += shard_elems * sizeof(uint16_t);
             } else {
-                wb = backend_->upload_s8_nd(s8_shards[static_cast<size_t>(rep)].data(), {cnt, r_sh, c_sh}, rep);
-                PJRT_Buffer* sb = backend_->upload_f32_nd(sc_shards[static_cast<size_t>(rep)].data(), {cnt, r_sh}, rep);
+                wb = backend_->upload_s8_nd(s8_shards[static_cast<size_t>(rep)].data(), {cnt, r_sh, c_sh}, dev);
+                PJRT_Buffer* sb = backend_->upload_f32_nd(sc_shards[static_cast<size_t>(rep)].data(), {cnt, r_sh}, dev);
                 if (!sb) { backend_->destroy_buffer(wb); return false; }
                 replica_scale_bufs[static_cast<size_t>(rep)].push_back(sb);
                 total_bytes += shard_elems + static_cast<size_t>(cnt) * static_cast<size_t>(r_sh) * sizeof(float);
@@ -951,20 +957,21 @@ bool HavenTpuGemma4Engine::build_and_upload_weights(const HavenEngine& host_engi
         std::vector<float> lm_f32;
         dequantize_full_matrix_f32(lm, V, D, lm_f32);
         for (int rep = 0; rep < R; ++rep) {
+            const int dev = replica_dev_indices_[static_cast<size_t>(rep)];
             const float* shard_ptr = lm_f32.data() + static_cast<size_t>(rep) * static_cast<size_t>(V_sh) * static_cast<size_t>(D);
             const size_t elems = static_cast<size_t>(V_sh) * static_cast<size_t>(D);
             PJRT_Buffer* wb = nullptr;
             if (!i8) {
                 std::vector<uint16_t> bf(elems);
                 HavenTpuPjrtBackend::convert_f32_to_bf16(shard_ptr, bf.data(), elems);
-                wb = backend_->upload_bf16_nd(bf.data(), {V_sh, D}, rep);
+                wb = backend_->upload_bf16_nd(bf.data(), {V_sh, D}, dev);
                 total_bytes += elems * sizeof(uint16_t);
             } else {
                 std::vector<int8_t> sq(elems);
                 std::vector<float> sc(static_cast<size_t>(V_sh));
                 quantize_f32_to_s8_per_row(shard_ptr, V_sh, D, sq.data(), sc.data());
-                wb = backend_->upload_s8_nd(sq.data(), {V_sh, D}, rep);
-                PJRT_Buffer* sb = backend_->upload_f32_nd(sc.data(), {V_sh}, rep);
+                wb = backend_->upload_s8_nd(sq.data(), {V_sh, D}, dev);
+                PJRT_Buffer* sb = backend_->upload_f32_nd(sc.data(), {V_sh}, dev);
                 if (!sb) { backend_->destroy_buffer(wb); return false; }
                 replica_scale_bufs[static_cast<size_t>(rep)].push_back(sb);
                 total_bytes += elems + static_cast<size_t>(V_sh) * sizeof(float);
@@ -995,7 +1002,8 @@ bool HavenTpuGemma4Engine::build_and_upload_weights(const HavenEngine& host_engi
             HavenTpuPjrtBackend::convert_f32_to_bf16(mat.data(), bf.data() + static_cast<size_t>(idx) * mat.size(), mat.size());
         }
         for (int rep = 0; rep < R; ++rep) {
-            PJRT_Buffer* b = backend_->upload_bf16_nd(bf.data(), {cnt, rows, cols}, rep);
+            const int dev = replica_dev_indices_[static_cast<size_t>(rep)];
+            PJRT_Buffer* b = backend_->upload_bf16_nd(bf.data(), {cnt, rows, cols}, dev);
             if (!b) return false;
             replica_weight_bufs_[static_cast<size_t>(rep)].push_back(b);
             total_bytes += bf.size() * sizeof(uint16_t);
@@ -1012,7 +1020,8 @@ bool HavenTpuGemma4Engine::build_and_upload_weights(const HavenEngine& host_engi
         std::vector<uint16_t> mp_bf(mp_f32.size());
         HavenTpuPjrtBackend::convert_f32_to_bf16(mp_f32.data(), mp_bf.data(), mp_f32.size());
         for (int rep = 0; rep < R; ++rep) {
-            PJRT_Buffer* b = backend_->upload_bf16_nd(mp_bf.data(), {L * P_dim, D}, rep);
+            const int dev = replica_dev_indices_[static_cast<size_t>(rep)];
+            PJRT_Buffer* b = backend_->upload_bf16_nd(mp_bf.data(), {L * P_dim, D}, dev);
             if (!b) return false;
             replica_weight_bufs_[static_cast<size_t>(rep)].push_back(b);
             total_bytes += mp_bf.size() * sizeof(uint16_t);
@@ -1022,7 +1031,8 @@ bool HavenTpuGemma4Engine::build_and_upload_weights(const HavenEngine& host_engi
     // 4. Upload all F32 norm stacks & layer scales (replicated across replicas)
     auto upload_rep_f32 = [&](const std::vector<float>& data, const std::vector<int64_t>& dims) -> bool {
         for (int rep = 0; rep < R; ++rep) {
-            PJRT_Buffer* b = backend_->upload_f32_nd(data.data(), dims, rep);
+            const int dev = replica_dev_indices_[static_cast<size_t>(rep)];
+            PJRT_Buffer* b = backend_->upload_f32_nd(data.data(), dims, dev);
             if (!b) return false;
             replica_weight_bufs_[static_cast<size_t>(rep)].push_back(b);
             total_bytes += data.size() * sizeof(float);
@@ -1113,10 +1123,11 @@ bool HavenTpuGemma4Engine::allocate_zero_kv_cache() {
         if (l % 6 != 5) N_swa_kv++; else N_glob_kv++;
     }
 
-    const std::vector<int64_t> swa_dims  = {N_swa_kv,  B, T, Hkv_sh, 256};
-    const std::vector<int64_t> glob_dims = {N_glob_kv, B, T, Hkv_sh, 512};
-    const size_t swa_elems  = static_cast<size_t>(N_swa_kv)  * B * T * Hkv_sh * 256ULL;
-    const size_t glob_elems = static_cast<size_t>(N_glob_kv) * B * T * Hkv_sh * 512ULL;
+    // Zero-padding TPU (8,128)-aligned KV Cache layout: [N_kv, B, Hkv_sh, T, HD]
+    const std::vector<int64_t> swa_dims  = {N_swa_kv,  B, Hkv_sh, T, 256};
+    const std::vector<int64_t> glob_dims = {N_glob_kv, B, Hkv_sh, T, 512};
+    const size_t swa_elems  = static_cast<size_t>(N_swa_kv)  * B * Hkv_sh * T * 256ULL;
+    const size_t glob_elems = static_cast<size_t>(N_glob_kv) * B * Hkv_sh * T * 512ULL;
 
     std::vector<uint16_t> z_swa(swa_elems, 0);
     std::vector<uint16_t> z_glob(glob_elems, 0);
@@ -1124,10 +1135,11 @@ bool HavenTpuGemma4Engine::allocate_zero_kv_cache() {
     replica_kv_bufs_.assign(static_cast<size_t>(R), {});
     size_t kv_bytes = 0;
     for (int rep = 0; rep < R; ++rep) {
-        PJRT_Buffer* ks = backend_->upload_bf16_nd(z_swa.data(),  swa_dims,  rep);
-        PJRT_Buffer* vs = backend_->upload_bf16_nd(z_swa.data(),  swa_dims,  rep);
-        PJRT_Buffer* kg = backend_->upload_bf16_nd(z_glob.data(), glob_dims, rep);
-        PJRT_Buffer* vg = backend_->upload_bf16_nd(z_glob.data(), glob_dims, rep);
+        const int dev = replica_dev_indices_[static_cast<size_t>(rep)];
+        PJRT_Buffer* ks = backend_->upload_bf16_nd(z_swa.data(),  swa_dims,  dev);
+        PJRT_Buffer* vs = backend_->upload_bf16_nd(z_swa.data(),  swa_dims,  dev);
+        PJRT_Buffer* kg = backend_->upload_bf16_nd(z_glob.data(), glob_dims, dev);
+        PJRT_Buffer* vg = backend_->upload_bf16_nd(z_glob.data(), glob_dims, dev);
         if (!ks || !vs || !kg || !vg) {
             backend_->destroy_buffer(ks); backend_->destroy_buffer(vs);
             backend_->destroy_buffer(kg); backend_->destroy_buffer(vg);
@@ -1174,22 +1186,7 @@ bool HavenTpuGemma4Engine::initialize(HavenTpuPjrtBackend* backend,
     cfg_ = cfg;
     metrics_ = {};
 
-    // 1. Upload all 42 layers + LM head + norms + RoPE tables to TPU HBM3
-    auto t0 = std::chrono::high_resolution_clock::now();
-    if (!build_and_upload_weights(host_engine)) {
-        last_error_ = "Weight upload failed: " + backend_->get_last_error();
-        shutdown();
-        return false;
-    }
-    if (!allocate_zero_kv_cache()) {
-        last_error_ = "KV cache HBM3 allocation failed: " + backend_->get_last_error();
-        shutdown();
-        return false;
-    }
-    auto t1 = std::chrono::high_resolution_clock::now();
-    metrics_.weight_upload_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-
-    // 2. Compile full 42-layer decode graph (S = 1)
+    // 1. Compile full 42-layer decode graph (S = 1) FIRST so we discover XLA's exact torus replica-to-device assignment!
     auto dc0 = std::chrono::high_resolution_clock::now();
     std::string decode_mlir = emit_stablehlo_mlir(model_cfg_, cfg_, 1);
     decode_exec_ = (cfg_.num_replicas == 1)
@@ -1203,7 +1200,18 @@ bool HavenTpuGemma4Engine::initialize(HavenTpuPjrtBackend* backend,
         return false;
     }
 
-    // 3. Optionally compile batched prefill graph (S = prefill_chunk_size)
+    // Query exact physical TPU device index per logical replica (e.g. {0, 1, 3, 2} on 2x2 v6e-4 torus!)
+    if (cfg_.num_replicas == 1) {
+        replica_dev_indices_ = {0};
+    } else {
+        replica_dev_indices_ = backend_->get_executable_device_indices(decode_exec_);
+        if (static_cast<int>(replica_dev_indices_.size()) != cfg_.num_replicas) {
+            replica_dev_indices_.resize(static_cast<size_t>(cfg_.num_replicas));
+            for (int r = 0; r < cfg_.num_replicas; ++r) replica_dev_indices_[static_cast<size_t>(r)] = r;
+        }
+    }
+
+    // 2. Optionally compile batched prefill graph (S = prefill_chunk_size)
     if (cfg_.prefill_chunk_size > 1) {
         auto pc0 = std::chrono::high_resolution_clock::now();
         std::string prefill_mlir = emit_stablehlo_mlir(model_cfg_, cfg_, cfg_.prefill_chunk_size);
@@ -1218,6 +1226,21 @@ bool HavenTpuGemma4Engine::initialize(HavenTpuPjrtBackend* backend,
             return false;
         }
     }
+
+    // 3. Upload all 42 layers + LM head + norms + RoPE tables + zero KV cache directly onto each replica's assigned TPU chip!
+    auto t0 = std::chrono::high_resolution_clock::now();
+    if (!build_and_upload_weights(host_engine)) {
+        last_error_ = "Weight upload failed: " + backend_->get_last_error();
+        shutdown();
+        return false;
+    }
+    if (!allocate_zero_kv_cache()) {
+        last_error_ = "KV cache HBM3 allocation failed: " + backend_->get_last_error();
+        shutdown();
+        return false;
+    }
+    auto t1 = std::chrono::high_resolution_clock::now();
+    metrics_.weight_upload_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
     initialized_ = true;
     return true;
@@ -1278,16 +1301,18 @@ bool HavenTpuGemma4Engine::execute_graph(PJRT_LoadedExecutable* exec,
 
     int32_t pos_i32 = static_cast<int32_t>(std::clamp(start_pos, 0, std::max(0, cfg_.max_seq_len - S)));
 
-    // Upload tiny per-step inputs (26 KB for B=1, S=1!) to each replica
+    auto th0 = std::chrono::high_resolution_clock::now();
+    // Upload tiny per-step inputs (26 KB for B=1, S=1!) to each replica's assigned TPU chip
     std::vector<PJRT_Buffer*> step_emb(static_cast<size_t>(R), nullptr);
     std::vector<PJRT_Buffer*> step_pl(static_cast<size_t>(R), nullptr);
     std::vector<PJRT_Buffer*> step_pos(static_cast<size_t>(R), nullptr);
     std::vector<std::vector<PJRT_Buffer*>> args_per_rep(static_cast<size_t>(R));
 
     for (int rep = 0; rep < R; ++rep) {
-        step_emb[static_cast<size_t>(rep)] = backend_->upload_bf16_nd(emb_bf16_scratch_.data(), {B, S, D}, rep);
-        step_pl[static_cast<size_t>(rep)]  = backend_->upload_bf16_nd(pleias_bf16_scratch_.data(), {B, S, L, P_dim}, rep);
-        step_pos[static_cast<size_t>(rep)] = backend_->upload_i32_nd(&pos_i32, {}, rep);
+        const int dev = replica_dev_indices_[static_cast<size_t>(rep)];
+        step_emb[static_cast<size_t>(rep)] = backend_->upload_bf16_nd(emb_bf16_scratch_.data(), {B, S, D}, dev);
+        step_pl[static_cast<size_t>(rep)]  = backend_->upload_bf16_nd(pleias_bf16_scratch_.data(), {B, S, L, P_dim}, dev);
+        step_pos[static_cast<size_t>(rep)] = backend_->upload_i32_nd(&pos_i32, {}, dev);
         if (!step_emb[static_cast<size_t>(rep)] || !step_pl[static_cast<size_t>(rep)] || !step_pos[static_cast<size_t>(rep)]) {
             for (int k = 0; k <= rep; ++k) {
                 backend_->destroy_buffer(step_emb[static_cast<size_t>(k)]);
@@ -1306,15 +1331,17 @@ bool HavenTpuGemma4Engine::execute_graph(PJRT_LoadedExecutable* exec,
         for (auto* kv : replica_kv_bufs_[static_cast<size_t>(rep)]) a.push_back(kv);
     }
 
+    auto te0 = std::chrono::high_resolution_clock::now();
     // Execute ALL 42 layers + HBM3 KV update + LM head + Argmax in ONE SINGLE TPU LAUNCH!
     std::vector<std::vector<PJRT_Buffer*>> outs_per_rep;
     bool ok = false;
     if (R == 1) {
         outs_per_rep.resize(1);
-        ok = backend_->execute_1d(exec, 0, args_per_rep[0], 5, outs_per_rep[0]);
+        ok = backend_->execute_1d(exec, replica_dev_indices_[0], args_per_rep[0], 5, outs_per_rep[0]);
     } else {
         ok = backend_->execute_replicated(exec, R, args_per_rep, 5, outs_per_rep);
     }
+    auto td0 = std::chrono::high_resolution_clock::now();
 
     for (int rep = 0; rep < R; ++rep) {
         backend_->destroy_buffer(step_emb[static_cast<size_t>(rep)]);
@@ -1362,6 +1389,10 @@ bool HavenTpuGemma4Engine::execute_graph(PJRT_LoadedExecutable* exec,
     for (int rep = 0; rep < R; ++rep) {
         backend_->destroy_buffer(outs_per_rep[static_cast<size_t>(rep)][0]);
     }
+    auto td1 = std::chrono::high_resolution_clock::now();
+    metrics_.last_h2d_ms  = std::chrono::duration<double, std::milli>(te0 - th0).count();
+    metrics_.last_exec_ms = std::chrono::duration<double, std::milli>(td0 - te0).count();
+    metrics_.last_d2h_ms  = std::chrono::duration<double, std::milli>(td1 - td0).count();
     return ok;
 }
 

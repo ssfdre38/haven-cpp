@@ -79,6 +79,7 @@ bool HavenTpuPjrtBackend::download_i32(PJRT_Buffer*, int32_t*, size_t) { return 
 void HavenTpuPjrtBackend::destroy_buffer(PJRT_Buffer*) {}
 PJRT_LoadedExecutable* HavenTpuPjrtBackend::compile_stablehlo(const std::string&, int) { return nullptr; }
 PJRT_LoadedExecutable* HavenTpuPjrtBackend::compile_stablehlo_replicated(const std::string&, int) { return nullptr; }
+std::vector<int> HavenTpuPjrtBackend::get_executable_device_indices(PJRT_LoadedExecutable*) { return {}; }
 void HavenTpuPjrtBackend::destroy_executable(PJRT_LoadedExecutable*) {}
 bool HavenTpuPjrtBackend::execute_1d(PJRT_LoadedExecutable*, int, const std::vector<PJRT_Buffer*>&, size_t, std::vector<PJRT_Buffer*>&) { return false; }
 bool HavenTpuPjrtBackend::execute_replicated(PJRT_LoadedExecutable*, int, const std::vector<std::vector<PJRT_Buffer*>>&, size_t, std::vector<std::vector<PJRT_Buffer*>>&) { return false; }
@@ -627,6 +628,32 @@ PJRT_LoadedExecutable* HavenTpuPjrtBackend::compile_stablehlo_replicated(const s
         return nullptr;
     }
     return cargs.executable;
+}
+
+std::vector<int> HavenTpuPjrtBackend::get_executable_device_indices(PJRT_LoadedExecutable* exec) {
+    std::vector<int> out;
+    if (!initialized_ || !exec || !api_ || !api_->PJRT_LoadedExecutable_AddressableDevices) return out;
+
+    PJRT_LoadedExecutable_AddressableDevices_Args dargs{};
+    dargs.struct_size = PJRT_LoadedExecutable_AddressableDevices_Args_STRUCT_SIZE;
+    dargs.executable = exec;
+    if (PJRT_Error* err = api_->PJRT_LoadedExecutable_AddressableDevices(&dargs)) {
+        (void)consume_error(err);
+        return out;
+    }
+    out.reserve(dargs.num_addressable_devices);
+    for (size_t i = 0; i < dargs.num_addressable_devices; ++i) {
+        PJRT_Device* dev = dargs.addressable_devices[i];
+        int found = -1;
+        for (size_t j = 0; j < devices_.size(); ++j) {
+            if (devices_[j] == dev) {
+                found = static_cast<int>(j);
+                break;
+            }
+        }
+        out.push_back(found);
+    }
+    return out;
 }
 
 void HavenTpuPjrtBackend::destroy_executable(PJRT_LoadedExecutable* exec) {
