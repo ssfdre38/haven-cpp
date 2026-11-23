@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  linux-gcc:
+    name: Linux (GCC 13 + Ninja)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build cmake g++
+
+      - name: Configure CMake
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build core binaries and test suites
+        run: |
+          cmake --build build --target \
+            haven-cli \
+            haven-server \
+            test-security-fuzz \
+            test-secure-cluster \
+            test-multi-model-arch \
+            test-tpu-scheduler \
+            test-tpu-gemma4-onchip \
+            -j$(nproc)
+
+      - name: Run zero-GGUF security, architecture, scheduler & TPU StableHLO tests
+        run: |
+          ./build/test-security-fuzz
+          ./build/test-secure-cluster
+          ./build/test-multi-model-arch
+          ./build/test-tpu-scheduler
+          ./build/test-tpu-gemma4-onchip --emit-only-synthetic
+
+  windows-msvc:
+    name: Windows (MSVC + Ninja)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure CMake
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build core binaries and test suites
+        run: |
+          cmake --build build --target `
+            haven-cli `
+            haven-server `
+            test-security-fuzz `
+            test-secure-cluster `
+            test-multi-model-arch `
+            test-tpu-scheduler `
+            test-tpu-gemma4-onchip
+
+      - name: Run zero-GGUF security, architecture, scheduler & TPU StableHLO tests
+        run: |
+          .\build\test-security-fuzz.exe
+          .\build\test-secure-cluster.exe
+          .\build\test-multi-model-arch.exe
+          .\build\test-tpu-scheduler.exe
+          .\build\test-tpu-gemma4-onchip.exe --emit-only-synthetic

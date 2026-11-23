@@ -4,6 +4,7 @@
 #include "haven/haven_json.h"
 #include "haven/haven_tpu_pjrt.h"
 #include "haven/haven_tpu_gemma4.h"
+#include "haven/haven_tpu_scheduler.h"
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -45,7 +46,9 @@ struct TpuServerOptions {
     bool enable_onchip = false;
     bool use_int8 = true;
     bool use_onchip_embeddings = true;
+    bool use_onchip_argmax = false; // true = 4B/slot on-chip argmax for max multi-tenant throughput
     int num_replicas = 0; // 0 = auto (max power-of-2 <= addressable TPU chips, capped at 4)
+    int batch_size = 1;   // 1 = interactive w/ prefix cache; 2..128 = multi-tenant continuous batching
     int max_seq_len = 2048;
     std::string libtpu_path = "";
 };
@@ -115,6 +118,7 @@ public:
 
     ~HavenMicroServer() {
         stop();
+        tpu_scheduler_.stop();
         tpu_gemma4_.shutdown();
         tpu_backend_.shutdown();
 #ifdef _WIN32
@@ -163,8 +167,10 @@ private:
     HavenMLXEngine mlx_engine_;
     HavenTpuPjrtBackend tpu_backend_;
     HavenTpuGemma4Engine tpu_gemma4_;
+    TpuContinuousBatchScheduler tpu_scheduler_;
     bool is_mlx_active_ = false;
     bool tpu_onchip_active_ = false;
+    std::atomic<bool> tpu_scheduler_active_{false};
     std::mutex engine_mutex_;
     std::vector<uint32_t> cached_tokens_;
     bool model_loaded_;
@@ -327,6 +333,8 @@ private:
         std::cout << "[HavenServer] Loading Sovereign Model into Memory: " << target_path << "...\n" << std::flush;
         cached_tokens_.clear();
         is_mlx_active_ = false;
+        tpu_scheduler_active_.store(false, std::memory_order_release);
+        tpu_scheduler_.stop();
         tpu_onchip_active_ = false;
         tpu_gemma4_.shutdown();
         mlx_engine_.unload();
@@ -342,59 +350,7 @@ private:
         model_loaded_ = true;
         std::cout << "[HavenServer] ✓ Sovereign Model Loaded in-process (" << current_model_name_ << ")! Standalone generation active.\n" << std::flush;
 
-        // Optional Full On-Chip 42-Layer Cloud TPU HBM3 Acceleration (--tpu / HAVEN_TPU_ONCHIP=1)
-        if (tpu_opts_.enable_onchip) {
-            const auto& mc = haven_engine_.get_config();
-            if (mc.is_gemma && mc.num_layers == 42) {
-                if (!tpu_backend_.is_initialized()) {
-                    if (!tpu_backend_.initialize(tpu_opts_.libtpu_path)) {
-                        std::cout << "[HavenServer] TPU requested but unavailable (" << tpu_backend_.get_last_error()
-                                  << ") — falling back to AVX2 CPU.\n" << std::flush;
-                    }
-                }
-                if (tpu_backend_.is_initialized() && tpu_backend_.get_device_count() >= 1) {
-                    const int n_devs = static_cast<int>(tpu_backend_.get_device_count());
-                    int R = tpu_opts_.num_replicas;
-                    if (R <= 0) {
-                        R = (n_devs >= 4) ? 4 : ((n_devs >= 2) ? 2 : 1);
-                    } else if (R > n_devs || (R != 1 && R != 2 && R != 4)) {
-                        R = (n_devs >= 4) ? 4 : ((n_devs >= 2) ? 2 : 1);
-                    }
-
-                    TpuGemma4Config tcfg;
-                    tcfg.batch_size = 1;
-                    tcfg.max_seq_len = std::clamp(tpu_opts_.max_seq_len, 256, 8192);
-                    tcfg.prefill_chunk_size = 128;
-                    tcfg.num_replicas = R;
-                    tcfg.use_int8_weights = tpu_opts_.use_int8;
-                    tcfg.return_full_logits = true; // Preserve full persona sampling (temp/top_p/top_k/min_p/rep_penalty)
-                    tcfg.use_onchip_embeddings = tpu_opts_.use_onchip_embeddings;
-                    tcfg.donate_kv_cache = true;
-
-                    std::cout << "[HavenServer] Initializing Full On-Chip 42-Layer TPU Engine (R=" << R
-                              << ", " << (tcfg.use_int8_weights ? "W8A16-INT8" : "BF16")
-                              << ", max_seq=" << tcfg.max_seq_len
-                              << ", onchip_emb=" << (tcfg.use_onchip_embeddings ? "true" : "false") << ")...\n" << std::flush;
-                    if (tpu_gemma4_.initialize(&tpu_backend_, haven_engine_, tcfg)) {
-                        tpu_onchip_active_ = true;
-                        const auto& tm = tpu_gemma4_.get_metrics();
-                        std::cout << "[HavenServer] ✓ TPU On-Chip 42-Layer Engine ACTIVE ("
-                                  << tpu_backend_.get_platform_name() << ", " << R << " chip(s), Weights="
-                                  << (static_cast<double>(tm.total_hbm_weight_bytes) / (1024.0 * 1024.0 * 1024.0))
-                                  << " GB HBM3, Compile=" << tm.decode_compile_ms << "/" << tm.prefill_compile_ms << " ms).\n"
-                                  << std::flush;
-                    } else {
-                        std::cerr << "[HavenServer] TPU On-Chip init failed (" << tpu_gemma4_.get_last_error()
-                                  << ") — falling back to AVX2 CPU.\n" << std::flush;
-                    }
-                }
-            } else {
-                std::cout << "[HavenServer] Model is not 42-layer Gemma 4 (" << mc.architecture
-                          << ", " << mc.num_layers << " layers) — using AVX2 CPU.\n" << std::flush;
-            }
-        }
-
-        // Optimal default hyperparameters for Gemma 4 Sovereign Persona
+        // Optimal default hyperparameters for Sovereign Persona (configured before TPU scheduler snapshot!)
         haven_engine_.get_sampler().get_params().temperature = 0.48f;
         haven_engine_.get_sampler().get_params().top_p = 0.90f;
         haven_engine_.get_sampler().get_params().top_k = 40;
@@ -407,6 +363,73 @@ private:
             auto toks = tokenizer.encode(ast, false);
             for (uint32_t t : toks) {
                 haven_engine_.get_sampler().add_anti_robotic_penalty(t, 2.5f);
+            }
+        }
+
+        // Optional Model-General Full On-Chip Cloud TPU HBM3 Acceleration (--tpu / HAVEN_TPU_ONCHIP=1)
+        if (tpu_opts_.enable_onchip) {
+            const auto& mc = haven_engine_.get_config();
+            std::string support_err;
+            if (HavenTpuGemma4Engine::is_model_supported(haven_engine_, support_err)) {
+                if (!tpu_backend_.is_initialized()) {
+                    if (!tpu_backend_.initialize(tpu_opts_.libtpu_path)) {
+                        std::cout << "[HavenServer] TPU requested but unavailable (" << tpu_backend_.get_last_error()
+                                  << ") — falling back to AVX2 CPU.\n" << std::flush;
+                    }
+                }
+                if (tpu_backend_.is_initialized() && tpu_backend_.get_device_count() >= 1) {
+                    const int n_devs = static_cast<int>(tpu_backend_.get_device_count());
+                    int R = tpu_opts_.num_replicas;
+                    if (R <= 0 || R > n_devs || (R != 1 && R != 2 && R != 4)) {
+                        R = (n_devs >= 4) ? 4 : ((n_devs >= 2) ? 2 : 1);
+                    }
+                    // Ensure clean Megatron TP divisibility across hidden_dim, num_heads, vocab_size
+                    while (R > 1 && ((mc.hidden_dim % R) != 0 || (mc.num_heads % R) != 0 || (mc.vocab_size % R) != 0)) {
+                        R /= 2;
+                    }
+
+                    TpuGemma4Config tcfg;
+                    tcfg.batch_size = std::clamp(tpu_opts_.batch_size, 1, 128);
+                    tcfg.max_seq_len = std::clamp(tpu_opts_.max_seq_len, 256, 8192);
+                    tcfg.prefill_chunk_size = 128; // Auto-compiles slot-targeted {128, 32, 16} (+ 1 when B>1)
+                    tcfg.num_replicas = R;
+                    tcfg.use_int8_weights = tpu_opts_.use_int8;
+                    tcfg.return_full_logits = !tpu_opts_.use_onchip_argmax;
+                    tcfg.use_onchip_embeddings = tpu_opts_.use_onchip_embeddings;
+                    tcfg.donate_kv_cache = true;
+
+                    std::cout << "[HavenServer] Initializing Model-General On-Chip TPU Engine (" << mc.architecture
+                              << ", " << mc.num_layers << "L, R=" << R
+                              << ", B=" << tcfg.batch_size
+                              << ", " << (tcfg.use_int8_weights ? "W8A16-INT8" : "BF16")
+                              << ", " << (tcfg.return_full_logits ? "FullSampler" : "OnChipArgmax")
+                              << ", max_seq=" << tcfg.max_seq_len
+                              << ", onchip_emb=" << (tcfg.use_onchip_embeddings ? "true" : "false") << ")...\n" << std::flush;
+                    if (tpu_gemma4_.initialize(&tpu_backend_, haven_engine_, tcfg)) {
+                        tpu_onchip_active_ = true;
+                        const auto& tm = tpu_gemma4_.get_metrics();
+                        std::cout << "[HavenServer] ✓ TPU On-Chip Engine ACTIVE ("
+                                  << tpu_backend_.get_platform_name() << ", " << R << " chip(s), B=" << tcfg.batch_size
+                                  << ", Weights=" << (static_cast<double>(tm.total_hbm_weight_bytes) / (1024.0 * 1024.0 * 1024.0))
+                                  << " GB, KV=" << (static_cast<double>(tm.total_hbm_kv_bytes) / (1024.0 * 1024.0))
+                                  << " MB HBM3, Compile=" << tm.decode_compile_ms << "/" << tm.prefill_compile_ms << " ms).\n"
+                                  << std::flush;
+
+                        if (tcfg.batch_size > 1) {
+                            if (tpu_scheduler_.start(&tpu_gemma4_, &haven_engine_.get_tokenizer(), haven_engine_.get_sampler())) {
+                                tpu_scheduler_active_.store(true, std::memory_order_release);
+                                std::cout << "[HavenServer] ✓ Multi-Tenant Continuous-Batching TPU Scheduler ACTIVE ("
+                                          << tcfg.batch_size << " concurrent HBM3 KV slots, async pos_vec[B]).\n" << std::flush;
+                            }
+                        }
+                    } else {
+                        std::cerr << "[HavenServer] TPU On-Chip init failed (" << tpu_gemma4_.get_last_error()
+                                  << ") — falling back to AVX2 CPU.\n" << std::flush;
+                    }
+                }
+            } else {
+                std::cout << "[HavenServer] Model unsupported by TPU on-chip compiler (" << support_err
+                          << ") — using AVX2 CPU.\n" << std::flush;
             }
         }
         return true;
@@ -949,8 +972,8 @@ private:
             if (client_sock < 0) continue;
 #endif
 
-            static constexpr size_t MAX_CONCURRENT_CLIENTS = 64;
-            if (active_clients_.load(std::memory_order_relaxed) >= MAX_CONCURRENT_CLIENTS) {
+            const size_t max_concurrent_clients = std::max<size_t>(64, static_cast<size_t>(tpu_opts_.batch_size) + 64);
+            if (active_clients_.load(std::memory_order_relaxed) >= max_concurrent_clients) {
                 const char* busy_resp = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 5\r\nConnection: close\r\nContent-Length: 28\r\n\r\nServer Thread Pool Saturated";
                 send_all(client_sock, busy_resp, static_cast<int>(std::strlen(busy_resp)));
                 close_socket(client_sock);
@@ -1093,7 +1116,215 @@ private:
         }
     }
 
+    // Concurrent lock-free multi-tenant TPU path when --tpu-batch > 1:
+    // Multiple HTTP/SSE threads run concurrently into shared on-chip HBM3 KV slots [0..B-1]
+    // WITHOUT holding engine_mutex_!
+    bool try_handle_tpu_batched_chat_completions(socket_t client_sock, const std::string& request, const std::string& cors_hdr) {
+        if (!tpu_scheduler_active_.load(std::memory_order_acquire) || !tpu_scheduler_.is_running()) {
+            return false;
+        }
+
+        size_t body_pos = request.find("\r\n\r\n");
+        std::string body = (body_pos != std::string::npos) ? request.substr(body_pos + 4) : request;
+
+        std::string active_model_id;
+        SamplerParams req_sp;
+        std::string tools_desc;
+        int max_ctx = 2048;
+        uint32_t eos_tok = 1;
+
+        {
+            std::lock_guard<std::mutex> lock(engine_mutex_);
+            if (!model_loaded_ || !tpu_scheduler_active_.load(std::memory_order_acquire)) {
+                return false;
+            }
+            // If client explicitly requests switching to a different model, fall back to serialized path
+            std::string requested_model = extract_json_string(body, "model");
+            if (!requested_model.empty() && is_safe_model_token(requested_model)) {
+                std::string cur_id = current_model_name_;
+                if (cur_id.ends_with(".gguf")) cur_id = cur_id.substr(0, cur_id.length() - 5);
+                if (requested_model != current_model_name_ && requested_model != cur_id) {
+                    // Only defer to serialized switch if another matching model actually exists
+                    std::error_code ec;
+                    for (const auto& dir : model_search_dirs_) {
+                        std::string safe_cand;
+                        if ((resolve_safe_path(dir, requested_model, safe_cand) && std::filesystem::exists(safe_cand, ec) && !std::filesystem::is_directory(safe_cand, ec)) ||
+                            (!requested_model.ends_with(".gguf") && resolve_safe_path(dir, requested_model + ".gguf", safe_cand) && std::filesystem::exists(safe_cand, ec) && !std::filesystem::is_directory(safe_cand, ec))) {
+                            if (safe_cand != current_model_path_) return false;
+                        }
+                    }
+                }
+            }
+            const auto& cfg = haven_engine_.get_config();
+            if (cfg.vocab_size == 0 || cfg.max_context_length == 0) return false;
+            active_model_id = current_model_name_.empty() ? "haven-chat-v5.0" : current_model_name_;
+            if (active_model_id.ends_with(".gguf")) active_model_id = active_model_id.substr(0, active_model_id.length() - 5);
+            req_sp = haven_engine_.get_sampler().get_params();
+            max_ctx = std::min<int>(static_cast<int>(cfg.max_context_length), tpu_gemma4_.get_config().max_seq_len);
+            eos_tok = haven_engine_.get_tokenizer().eos_token();
+            tools_desc = haven_engine_.get_plugin_manager().get_tools_prompt_description();
+        }
+        // engine_mutex_ is now RELEASED — full multi-tenant HTTP concurrency below!
+
+        bool stream = (body.find("\"stream\": true") != std::string::npos || body.find("\"stream\":true") != std::string::npos);
+        HavenJson req_json;
+        const bool req_parsed = HavenJson::parse(body, req_json) && req_json.is_object();
+        if (req_parsed) {
+            if (const HavenJson* st = req_json.find("stream"); st && st->is_bool()) stream = st->as_bool();
+            if (const HavenJson* v = req_json.find("temperature"); v && v->is_number()) {
+                req_sp.temperature = std::clamp(static_cast<float>(v->as_double()), 0.0f, 2.0f);
+            }
+            if (const HavenJson* v = req_json.find("top_p"); v && v->is_number()) {
+                req_sp.top_p = std::clamp(static_cast<float>(v->as_double()), 0.01f, 1.0f);
+            }
+            if (const HavenJson* v = req_json.find("min_p"); v && v->is_number()) {
+                req_sp.min_p = std::clamp(static_cast<float>(v->as_double()), 0.0f, 1.0f);
+            }
+            if (const HavenJson* v = req_json.find("repetition_penalty"); v && v->is_number()) {
+                req_sp.repetition_penalty = std::clamp(static_cast<float>(v->as_double()), 1.0f, 2.0f);
+            }
+        }
+        bool enable_tools = true;
+        if (req_parsed) {
+            if (const HavenJson* et = req_json.find("enable_tools"); et && et->is_bool()) enable_tools = et->as_bool();
+        }
+        if (!enable_tools) tools_desc.clear();
+
+        int max_tokens = 512;
+        std::string mt_str = extract_json_scalar(body, "max_tokens");
+        if (mt_str.empty()) mt_str = extract_json_scalar(body, "n_predict");
+        if (!mt_str.empty()) {
+            int parsed_mt = 512;
+            auto [p, ec] = std::from_chars(mt_str.data(), mt_str.data() + mt_str.size(), parsed_mt);
+            if (ec == std::errc() && p == mt_str.data() + mt_str.size()) max_tokens = parsed_mt;
+        }
+        max_tokens = std::clamp(max_tokens, 1, std::max(1, max_ctx - 1));
+
+        std::string prompt = extract_json_string(body, "prompt");
+        const bool raw_prompt_mode = !prompt.empty();
+        if (prompt.empty()) {
+            std::string last_user_msg;
+            if (req_parsed) {
+                if (const HavenJson* msgs = req_json.find("messages"); msgs && msgs->is_array()) {
+                    for (const auto& m : msgs->as_array()) {
+                        if (!m.is_object()) continue;
+                        std::string role = m.get_string("role");
+                        std::string content = m.get_string("content");
+                        if (!role.empty() && !content.empty()) {
+                            prompt += "<|turn>" + role + "\n" + content + "<turn|>\n";
+                            if (role == "user") last_user_msg = content;
+                        }
+                    }
+                }
+            }
+            if (prompt.empty()) {
+                if (last_user_msg.empty()) last_user_msg = "Hello Aura!";
+                prompt = "<|turn>user\n" + last_user_msg + "<turn|>\n";
+            }
+            prompt += "<|turn>model\n";
+        }
+
+        bool has_system_turn = (prompt.find("<|turn>system\n") != std::string::npos);
+        if (!has_system_turn && !raw_prompt_mode) {
+            std::string sys_prompt = haven::HavenEngine::get_default_system_prompt();
+            if (!tools_desc.empty()) {
+                size_t close_t = sys_prompt.rfind("<turn|>");
+                if (close_t != std::string::npos) sys_prompt.insert(close_t, "\n" + tools_desc + "\n");
+                else sys_prompt += "\n<|turn>system\n" + tools_desc + "<turn|>\n";
+            }
+            prompt = sys_prompt + prompt;
+        } else if (has_system_turn && !tools_desc.empty()) {
+            size_t sys_close = prompt.find("<turn|>");
+            if (sys_close != std::string::npos) prompt.insert(sys_close, "\n" + tools_desc);
+        }
+
+        auto tokens = haven_engine_.tokenize(prompt, true);
+        const size_t max_prompt_tokens = static_cast<size_t>(std::max(1, max_ctx - 1));
+        if (tokens.size() > max_prompt_tokens) {
+            tokens.erase(tokens.begin(), tokens.begin() + static_cast<std::ptrdiff_t>(tokens.size() - max_prompt_tokens));
+        }
+
+        TpuGenerationRequest treq;
+        treq.prompt_tokens = tokens;
+        treq.max_tokens = max_tokens;
+        treq.sampler_params = req_sp;
+        treq.use_custom_sampler = true;
+
+        std::string accumulated_response;
+        int completion_token_count = 0;
+        bool client_disconnected = false;
+        std::string sched_err;
+
+        if (stream) {
+            std::string sse_hdr = "HTTP/1.1 200 OK\r\n"
+                                  "Content-Type: text/event-stream\r\n"
+                                  "Cache-Control: no-cache\r\n"
+                                  "X-Content-Type-Options: nosniff\r\n"
+                                  "Connection: close\r\n"
+                                  + cors_hdr + "\r\n";
+            if (!send_all(client_sock, sse_hdr.c_str(), static_cast<int>(sse_hdr.length()))) {
+                return true;
+            }
+        }
+
+        bool ok = tpu_scheduler_.generate_streaming(
+            treq,
+            [&](uint32_t next_tok) -> bool {
+                if (is_client_disconnected(client_sock)) {
+                    client_disconnected = true;
+                    return false;
+                }
+                completion_token_count++;
+                if (next_tok == eos_tok || next_tok == 1 || next_tok == 106 || next_tok == 212) {
+                    return false;
+                }
+                std::string piece = haven_engine_.detokenize(next_tok);
+                if (piece.find("<turn|>") != std::string::npos ||
+                    piece.find("<end_of_turn>") != std::string::npos ||
+                    piece.find("<eos>") != std::string::npos ||
+                    piece.find("<|turn") != std::string::npos ||
+                    piece.find("<start_of_turn>") != std::string::npos) {
+                    return false;
+                }
+                accumulated_response += piece;
+                if (stream) {
+                    std::string esc_text = escape_json_string(piece);
+                    std::string chunk = "data: {\"content\":\"" + esc_text + "\",\"id\":\"chatcmpl-haven-tpu\",\"object\":\"chat.completion.chunk\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" + esc_text + "\"},\"finish_reason\":null}]}\n\n";
+                    if (!send_all(client_sock, chunk.c_str(), static_cast<int>(chunk.length()))) {
+                        client_disconnected = true;
+                        return false;
+                    }
+                }
+                return true;
+            },
+            [&]() -> bool { return is_client_disconnected(client_sock); },
+            &sched_err);
+
+        if (!ok && !client_disconnected) {
+            if (!stream) {
+                std::string err_body = "{\"error\":{\"message\":\"TPU batched generation failed: " + escape_json_string(sched_err) + "\",\"type\":\"tpu_engine_error\"}}";
+                send_http_response(client_sock, "500 Internal Server Error", "application/json; charset=utf-8", err_body, cors_hdr);
+            }
+            return true;
+        }
+
+        if (!client_disconnected) {
+            if (stream) {
+                std::string done_chunk = "data: {\"id\":\"chatcmpl-haven-tpu\",\"object\":\"chat.completion.chunk\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                send_all(client_sock, done_chunk.c_str(), static_cast<int>(done_chunk.length()));
+            } else {
+                std::string esc_content = escape_json_string(accumulated_response);
+                std::string json_resp = "{\"id\":\"chatcmpl-haven-tpu\",\"object\":\"chat.completion\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"content\":\"" + esc_content + "\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"" + esc_content + "\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":" + std::to_string(tokens.size()) + ",\"completion_tokens\":" + std::to_string(completion_token_count) + ",\"total_tokens\":" + std::to_string(tokens.size() + static_cast<size_t>(completion_token_count)) + "}}";
+                send_http_response(client_sock, "200 OK", "application/json; charset=utf-8", json_resp, cors_hdr);
+            }
+        }
+        return true;
+    }
+
     void handle_native_chat_completions(socket_t client_sock, const std::string& request, const std::string& cors_hdr) {
+        if (try_handle_tpu_batched_chat_completions(client_sock, request, cors_hdr)) {
+            return;
+        }
         std::lock_guard<std::mutex> lock(engine_mutex_);
         if (!model_loaded_) {
             std::string err_body = "{\"error\":{\"message\":\"No model loaded in Haven Sovereign Engine. Pass a model path on startup.\",\"type\":\"sovereign_engine_error\"}}";
@@ -2102,10 +2333,20 @@ private:
                 }
             } catch (...) {}
 
-            std::string active_backend = tpu_active ? "tpu_onchip_42L" : (is_mlx_active_ ? "apple_mlx" : "cpu_avx2");
+            std::string active_backend = tpu_active
+                ? (tpu_scheduler_active_.load(std::memory_order_relaxed) ? "tpu_onchip_batched" : "tpu_onchip")
+                : (is_mlx_active_ ? "apple_mlx" : "cpu_avx2");
+            TpuSchedulerStats sstats = tpu_scheduler_active_.load(std::memory_order_relaxed)
+                ? tpu_scheduler_.get_stats() : TpuSchedulerStats{};
+            int tpu_batch_cap = tpu_active ? tpu_gemma4_.get_config().batch_size : 0;
             std::string json = "{\"ok\":true,\"status\":\"sovereign_online\",\"engine\":\"haven-cpp-v2.0\",\"active_backend\":\"" + active_backend
                              + "\",\"tpu_onchip_active\":" + std::string(tpu_active ? "true" : "false")
                              + ",\"tpu_replicas\":" + std::to_string(tpu_reps)
+                             + ",\"tpu_batch_capacity\":" + std::to_string(tpu_batch_cap)
+                             + ",\"tpu_active_slots\":" + std::to_string(sstats.active_slots)
+                             + ",\"tpu_queued_requests\":" + std::to_string(sstats.queued_requests)
+                             + ",\"tpu_avg_batch_size\":" + std::to_string(sstats.avg_batch_utilization)
+                             + ",\"tpu_total_tokens_generated\":" + std::to_string(sstats.total_tokens_generated)
                              + ",\"tpu_precision\":\"" + std::string(tpu_active ? (tpu_i8 ? "W8A16-INT8" : "BF16") : "none")
                              + "\",\"tpu_onchip_embeddings\":" + std::string(tpu_onchip_emb ? "true" : "false")
                              + ",\"tpu_hbm_weight_gb\":" + std::to_string(tpu_hbm_gb)
@@ -2241,8 +2482,13 @@ private:
             send_http_response(sock, "200 OK", "application/json; charset=utf-8", json_body, cors_hdr);
         }
         else if (path == "/health") {
-            std::string backend_name = tpu_onchip_active_ ? "tpu_onchip_42L" : (is_mlx_active_ ? "apple_mlx" : "cpu_avx2");
-            std::string resp_body = "{\"status\":\"sovereign_online\",\"engine\":\"haven-cpp-v2.0\",\"backend\":\"" + backend_name + "\",\"tpu_onchip\":" + std::string(tpu_onchip_active_ ? "true" : "false") + ",\"gateway\":true}";
+            std::string backend_name = tpu_onchip_active_
+                ? (tpu_scheduler_active_.load(std::memory_order_relaxed) ? "tpu_onchip_batched" : "tpu_onchip")
+                : (is_mlx_active_ ? "apple_mlx" : "cpu_avx2");
+            int tpu_slots = tpu_onchip_active_ ? tpu_gemma4_.get_config().batch_size : 1;
+            std::string resp_body = "{\"status\":\"sovereign_online\",\"engine\":\"haven-cpp-v2.0\",\"backend\":\"" + backend_name
+                                  + "\",\"tpu_onchip\":" + std::string(tpu_onchip_active_ ? "true" : "false")
+                                  + ",\"tpu_batch_capacity\":" + std::to_string(tpu_slots) + ",\"gateway\":true}";
             send_http_response(sock, "200 OK", "application/json; charset=utf-8", resp_body, cors_hdr);
         }
         else if (path == "/props" || path.starts_with("/props?")) {
@@ -2420,9 +2666,14 @@ private:
         }
         else if (path == "/api/reset") {
             std::lock_guard<std::mutex> lock(engine_mutex_);
+            const bool restart_sched = tpu_scheduler_active_.exchange(false, std::memory_order_acq_rel);
+            if (restart_sched) tpu_scheduler_.stop();
             haven_engine_.get_kv_cache().reset();
             if (tpu_onchip_active_) {
                 tpu_gemma4_.reset_kv_cache();
+                if (restart_sched && tpu_scheduler_.start(&tpu_gemma4_, &haven_engine_.get_tokenizer(), haven_engine_.get_sampler())) {
+                    tpu_scheduler_active_.store(true, std::memory_order_release);
+                }
             }
             cached_tokens_.clear();
             std::string json = "{\"ok\":true,\"message\":\"KV Cache and conversation context reset.\"}";
@@ -2726,6 +2977,10 @@ int main(int argc, char** argv) {
         uint32_t r = 0;
         if (parse_u32_range(env_rep, 1, 4, r)) tpu_opts.num_replicas = static_cast<int>(r);
     }
+    if (const char* env_batch = std::getenv("HAVEN_TPU_BATCH"); env_batch && *env_batch) {
+        uint32_t b = 1;
+        if (parse_u32_range(env_batch, 1, 128, b)) tpu_opts.batch_size = static_cast<int>(b);
+    }
     if (const char* env_lib = std::getenv("HAVEN_LIBTPU_PATH"); env_lib && *env_lib) {
         tpu_opts.libtpu_path = env_lib;
     }
@@ -2740,9 +2995,11 @@ int main(int argc, char** argv) {
                       << "  --port <port>             HTTP server port (default: 11436)\n"
                       << "  --api-key <key>           Require Authorization: Bearer <key> on API routes (or HAVEN_API_KEY)\n"
                       << "  --model <path>            GGUF or MLX model path to load\n"
-                      << "  --tpu, --tpu-onchip       Serve 42-layer Gemma 4 directly on Cloud TPU HBM3 via libtpu.so\n"
+                      << "  --tpu, --tpu-onchip       Serve dense transformers directly on Cloud TPU HBM3 via libtpu.so\n"
                       << "  --tpu-replicas <1|2|4>    Tensor-parallel TPU chips over Optical ICI (default: auto)\n"
+                      << "  --tpu-batch <1..128>      Multi-tenant HBM3 KV slots (1=interactive, 16/32/64=continuous batching)\n"
                       << "  --tpu-bf16 / --tpu-int8   HBM3 weight precision (default: --tpu-int8 W8A16)\n"
+                      << "  --tpu-argmax              Use on-chip TPU argmax (4B/slot D2H) for peak multi-tenant tok/s\n"
                       << "  --tpu-max-seq <N>         Static HBM3 KV cache length (default: 2048)\n"
                       << "  --tpu-host-emb            Use host-side embedding lookup instead of on-chip HBM3 gather\n"
                       << "  --libtpu <path>           Explicit path to libtpu.so (optional)\n"
@@ -2765,8 +3022,19 @@ int main(int argc, char** argv) {
         } else if (arg == "--tpu-int8") {
             tpu_opts.enable_onchip = true;
             tpu_opts.use_int8 = true;
+        } else if (arg == "--tpu-argmax") {
+            tpu_opts.enable_onchip = true;
+            tpu_opts.use_onchip_argmax = true;
         } else if (arg == "--tpu-host-emb") {
             tpu_opts.use_onchip_embeddings = false;
+        } else if (arg == "--tpu-batch" && i + 1 < argc) {
+            uint32_t b = 1;
+            if (!parse_u32_range(argv[++i], 1, 128, b)) {
+                std::cerr << "[HavenServer] Invalid --tpu-batch (must be 1..128).\n";
+                return 1;
+            }
+            tpu_opts.enable_onchip = true;
+            tpu_opts.batch_size = static_cast<int>(b);
         } else if (arg == "--tpu-replicas" && i + 1 < argc) {
             uint32_t r = 0;
             if (!parse_u32_range(argv[++i], 1, 4, r) || (r != 1 && r != 2 && r != 4)) {

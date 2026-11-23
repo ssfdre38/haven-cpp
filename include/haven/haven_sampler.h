@@ -44,6 +44,8 @@ public:
     void initialize_vocab_counterparts(const std::vector<std::string>& vocab);
 
     SamplerParams& get_params() { return params_; }
+    const SamplerParams& get_params() const { return params_; }
+    void seed(uint32_t s) { rng_.seed(s); }
 
 private:
     SamplerParams params_;
