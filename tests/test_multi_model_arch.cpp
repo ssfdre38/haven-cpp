@@ -31,8 +31,8 @@ void test_avx2_bias() {
     std::vector<float> out_f16(size, 5.0f);
     std::vector<uint16_t> bias_f16(size);
     for (int i = 0; i < size; ++i) {
-        // Approximate half-float representation for test
-        bias_f16[i] = _cvtss_sh((float)i * 0.25f, 0);
+        // Portable F16C single-to-half conversion (MSVC/GCC/Clang)
+        bias_f16[i] = static_cast<uint16_t>(_mm_extract_epi16(_mm_cvtps_ph(_mm_set_ss((float)i * 0.25f), 0), 0));
     }
 
     haven::TensorDesc desc_f16;
