@@ -45,10 +45,11 @@ namespace haven {
 struct TpuServerOptions {
     bool enable_onchip = false;
     bool use_int8 = true;
+    bool use_int8_kv = false;
     bool use_onchip_embeddings = true;
     bool use_onchip_argmax = false; // true = 4B/slot on-chip argmax for max multi-tenant throughput
-    int num_replicas = 0; // 0 = auto (max power-of-2 <= addressable TPU chips, capped at 4)
-    int batch_size = 1;   // 1 = interactive w/ prefix cache; 2..128 = multi-tenant continuous batching
+    int num_replicas = 0; // 0 = auto (max power-of-2 <= addressable TPU chips, capped at 8)
+    int batch_size = 1;   // 1 = interactive w/ prefix cache; 2..256 = multi-tenant continuous batching
     int max_seq_len = 2048;
     std::string libtpu_path = "";
 };
@@ -390,11 +391,12 @@ private:
                     }
 
                     TpuGemma4Config tcfg;
-                    tcfg.batch_size = std::clamp(tpu_opts_.batch_size, 1, 128);
+                    tcfg.batch_size = std::clamp(tpu_opts_.batch_size, 1, 256);
                     tcfg.max_seq_len = std::clamp(tpu_opts_.max_seq_len, 256, 8192);
-                    tcfg.prefill_chunk_size = 128; // Auto-compiles slot-targeted {128, 32, 16} (+ 1 when B>1)
+                    tcfg.prefill_chunk_size = 128; // Auto-compiles slot-targeted {128, 64, 32} (+ 1 when B>1)
                     tcfg.num_replicas = R;
                     tcfg.use_int8_weights = tpu_opts_.use_int8;
+                    tcfg.use_int8_kv = tpu_opts_.use_int8_kv;
                     tcfg.return_full_logits = !tpu_opts_.use_onchip_argmax;
                     tcfg.use_onchip_embeddings = tpu_opts_.use_onchip_embeddings;
                     tcfg.donate_kv_cache = true;
@@ -402,7 +404,8 @@ private:
                     std::cout << "[HavenServer] Initializing Model-General On-Chip TPU Engine (" << mc.architecture
                               << ", " << mc.num_layers << "L, R=" << R
                               << ", B=" << tcfg.batch_size
-                              << ", " << (tcfg.use_int8_weights ? "W8A16-INT8" : "BF16")
+                              << ", " << (tcfg.use_int8_weights ? "W8A16/W8A8-INT8" : "BF16")
+                              << ", KV=" << (tcfg.use_int8_kv ? "INT8" : "BF16")
                               << ", " << (tcfg.return_full_logits ? "FullSampler" : "OnChipArgmax")
                               << ", max_seq=" << tcfg.max_seq_len
                               << ", onchip_emb=" << (tcfg.use_onchip_embeddings ? "true" : "false") << ")...\n" << std::flush;
@@ -3023,6 +3026,9 @@ int main(int argc, char** argv) {
         } else if (arg == "--tpu-int8") {
             tpu_opts.enable_onchip = true;
             tpu_opts.use_int8 = true;
+        } else if (arg == "--tpu-kv-int8") {
+            tpu_opts.enable_onchip = true;
+            tpu_opts.use_int8_kv = true;
         } else if (arg == "--tpu-argmax") {
             tpu_opts.enable_onchip = true;
             tpu_opts.use_onchip_argmax = true;
@@ -3030,16 +3036,16 @@ int main(int argc, char** argv) {
             tpu_opts.use_onchip_embeddings = false;
         } else if (arg == "--tpu-batch" && i + 1 < argc) {
             uint32_t b = 1;
-            if (!parse_u32_range(argv[++i], 1, 128, b)) {
-                std::cerr << "[HavenServer] Invalid --tpu-batch (must be 1..128).\n";
+            if (!parse_u32_range(argv[++i], 1, 256, b)) {
+                std::cerr << "[HavenServer] Invalid --tpu-batch (must be 1..256).\n";
                 return 1;
             }
             tpu_opts.enable_onchip = true;
             tpu_opts.batch_size = static_cast<int>(b);
         } else if (arg == "--tpu-replicas" && i + 1 < argc) {
             uint32_t r = 0;
-            if (!parse_u32_range(argv[++i], 1, 4, r) || (r != 1 && r != 2 && r != 4)) {
-                std::cerr << "[HavenServer] Invalid --tpu-replicas (must be 1, 2, or 4).\n";
+            if (!parse_u32_range(argv[++i], 1, 8, r) || (r != 1 && r != 2 && r != 4 && r != 8)) {
+                std::cerr << "[HavenServer] Invalid --tpu-replicas (must be 1, 2, 4, or 8).\n";
                 return 1;
             }
             tpu_opts.enable_onchip = true;
