@@ -299,19 +299,6 @@ struct MlirEmitter {
         return out;
     }
 
-    // Half-bandwidth BF16 Optical ICI AllReduce wrapper for F32 residual/norm branches (-50% ICI traffic!)
-    std::string emit_all_reduce_sum_bf16_3d(const std::string& x_f32, int B, int S, int D, int R) {
-        if (R <= 1) return x_f32;
-        const std::string tf = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "x" + std::to_string(D) + "xf32>";
-        const std::string tb = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "x" + std::to_string(D) + "xbf16>";
-        std::string xb = tmp("arb");
-        ss << "    " << xb << " = stablehlo.convert " << x_f32 << " : (" << tf << ") -> " << tb << "\n";
-        std::string ar_b = emit_all_reduce_sum_3d(xb, B, S, D, R, "bf16");
-        std::string xf = tmp("arf");
-        ss << "    " << xf << " = stablehlo.convert " << ar_b << " : (" << tb << ") -> " << tf << "\n";
-        return xf;
-    }
-
     // Gather rows from a 2D [V_sh, K] table (bf16 or i8) using [B, S, 1] i32 indices -> [B, S, K] f32
     std::string emit_table_gather_2d(const std::string& table, const std::string& scale_1d,
                                      const std::string& idx_3d, int V_sh, int K, int B, int S, bool use_int8) {
@@ -1770,12 +1757,12 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const TpuModelSpec& spec,
               << "    " << ao_f32 << " = stablehlo.reshape " << ctxt << " : (" << t_ctx5t << ") -> " << t_q3 << "\n"
               << "    " << ao_bf  << " = stablehlo.convert " << ao_f32 << " : (" << t_q3 << ") -> " << t_ao_bf << "\n";
 
-        // 2f. Attention Output Projection + Half-BW BF16 Optical ICI AllReduce + Optional Post-Attn Norm + Residual 1
+        // 2f. Attention Output Projection + Full-F32 Optical ICI AllReduce + Optional Post-Attn Norm + Residual 1
         std::string attn_out_loc = em.emit_linear_3d(ao_bf,
             is_swa ? "%w_swa_o" : "%w_glob_o",
             is_swa ? "%s_swa_o" : "%s_glob_o",
             ti, N_type, B, S, D, Q_sh, i8);
-        std::string attn_out = em.emit_all_reduce_sum_bf16_3d(attn_out_loc, B, S, D, R);
+        std::string attn_out = em.emit_all_reduce_sum_3d(attn_out_loc, B, S, D, R);
         std::string attn_final = attn_out;
         if (spec.has_post_attn_norm) {
             std::string pa_nw = em.slice_1d_from_2d("%w_post_attn_norm", l, L, D);
@@ -1784,7 +1771,7 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const TpuModelSpec& spec,
         std::string x_res1 = em.tmp("res1");
         em.ss << "    " << x_res1 << " = stablehlo.add " << x_cur << ", " << attn_final << " : " << t_bsd_f32 << "\n";
 
-        // 2g-2i. Pre-FFN RMSNorm + Fused Sharded Gate+Up GeGLU/SwiGLU FFN + BF16 Optical ICI AllReduce + Residual 2
+        // 2g-2i. Pre-FFN RMSNorm + Fused Sharded Gate+Up GeGLU/SwiGLU FFN + Full-F32 Optical ICI AllReduce + Residual 2
         std::string fn_nw = em.slice_1d_from_2d("%w_ffn_norm", l, L, D);
         std::string x_fn_f32 = em.emit_rms_norm_3d(x_res1, fn_nw, B, S, D, spec.rms_norm_eps, c0_f32);
         std::string x_fn_bf = em.tmp("fnbf");
@@ -1806,7 +1793,7 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const TpuModelSpec& spec,
         std::string f_down_loc = em.emit_linear_3d(f_act_bf, "%w_ffn_down", "%s_ffn_down", l, L, B, S, D, F_sh, i8);
         std::string f_final;
         if (!is_moe) {
-            std::string f_down = em.emit_all_reduce_sum_bf16_3d(f_down_loc, B, S, D, R);
+            std::string f_down = em.emit_all_reduce_sum_3d(f_down_loc, B, S, D, R);
             f_final = f_down;
             if (spec.has_post_ffn_norm) {
                 std::string pf_nw = em.slice_1d_from_2d("%w_post_ffn_norm", l, L, D);
@@ -1925,13 +1912,14 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const TpuModelSpec& spec,
 
             std::string moe_2d;
             if (N_tok == 1) {
-                // Regime 1A (Interactive B=1 S=1): Vectorized bulk stablehlo.gather of ONLY K_exp=8 experts
-                // reshaped to 2D [K_exp*GU_exp_sh, D] & [K_exp*F_exp_sh, D] for fused 2D MXU INT8 dequant!
-                const std::string t_kg_idx = "tensor<" + std::to_string(K_exp) + "x1xi32>";
+                // Regime 1A (Interactive B=1 S=1): Direct HBM3 dynamic_slice of ONLY K_exp=8 experts
+                // (compiles to 8 direct contiguous VMEM DMA loads vs slow full-table gather!).
+                const std::string t_1gu    = "tensor<1x" + std::to_string(GU_exp_sh) + "x" + std::to_string(D) + "x" + wel + ">";
                 const std::string t_kgu    = "tensor<" + std::to_string(K_exp) + "x" + std::to_string(GU_exp_sh) + "x" + std::to_string(D) + "x" + wel + ">";
                 const std::string t_kgu2   = "tensor<" + std::to_string(K_exp * GU_exp_sh) + "x" + std::to_string(D) + "x" + wel + ">";
                 const std::string t_kgu2b  = "tensor<" + std::to_string(K_exp * GU_exp_sh) + "x" + std::to_string(D) + "xbf16>";
                 const std::string t_gu2_f  = "tensor<1x" + std::to_string(K_exp * GU_exp_sh) + "xf32>";
+                const std::string t_1dn    = "tensor<1x" + std::to_string(F_exp_sh) + "x" + std::to_string(D) + "x" + wel + ">";
                 const std::string t_kdn    = "tensor<" + std::to_string(K_exp) + "x" + std::to_string(F_exp_sh) + "x" + std::to_string(D) + "x" + wel + ">";
                 const std::string t_kdn2   = "tensor<" + std::to_string(K_exp * F_exp_sh) + "x" + std::to_string(D) + "x" + wel + ">";
                 const std::string t_kdn2b  = "tensor<" + std::to_string(K_exp * F_exp_sh) + "x" + std::to_string(D) + "xbf16>";
@@ -1940,29 +1928,43 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const TpuModelSpec& spec,
                 const std::string t_ef_bf  = "tensor<1x" + std::to_string(K_exp) + "x" + std::to_string(F_exp_sh) + "xbf16>";
                 const std::string t_ef2_bf = "tensor<1x" + std::to_string(K_exp * F_exp_sh) + "xbf16>";
 
-                std::string ti_g = em.tmp("tig"), kgu = em.tmp("kgu"), kdn = em.tmp("kdn");
-                em.ss << "    " << ti_g << " = stablehlo.reshape " << ti_v << " : (" << t_nk_i32 << ") -> " << t_kg_idx << "\n"
-                      << "    " << kgu << " = \"stablehlo.gather\"(" << wgu_l << ", " << ti_g << ") {\n"
-                      << "      dimension_numbers = #stablehlo.gather<\n"
-                      << "        offset_dims = [1, 2],\n"
-                      << "        collapsed_slice_dims = [0],\n"
-                      << "        start_index_map = [0],\n"
-                      << "        index_vector_dim = 1\n"
-                      << "      >,\n"
-                      << "      indices_are_sorted = false,\n"
-                      << "      slice_sizes = array<i64: 1, " << GU_exp_sh << ", " << D << ">\n"
-                      << "    } : (" << t_wgu3 << ", " << t_kg_idx << ") -> " << t_kgu << "\n"
-                      << "    " << kdn << " = \"stablehlo.gather\"(" << wdn_l << ", " << ti_g << ") {\n"
-                      << "      dimension_numbers = #stablehlo.gather<\n"
-                      << "        offset_dims = [1, 2],\n"
-                      << "        collapsed_slice_dims = [0],\n"
-                      << "        start_index_map = [0],\n"
-                      << "        index_vector_dim = 1\n"
-                      << "      >,\n"
-                      << "      indices_are_sorted = false,\n"
-                      << "      slice_sizes = array<i64: 1, " << F_exp_sh << ", " << D << ">\n"
-                      << "    } : (" << t_wdn3 << ", " << t_kg_idx << ") -> " << t_kdn << "\n";
+                std::vector<std::string> ek_vars, gu_parts, dn_parts, sgu_parts, sdn_parts;
+                for (int k = 0; k < K_exp; ++k) {
+                    std::string esl = em.tmp("eksl"), ek = em.tmp("ek");
+                    em.ss << "    " << esl << " = stablehlo.slice " << ti_v << " [0:1, " << k << ":" << (k + 1) << "] : (" << t_nk_i32 << ") -> tensor<1x1xi32>\n"
+                          << "    " << ek  << " = stablehlo.reshape " << esl << " : (tensor<1x1xi32>) -> tensor<i32>\n";
+                    ek_vars.push_back(ek);
 
+                    std::string guk = em.tmp("guk"), dnk = em.tmp("dnk");
+                    em.ss << "    " << guk << " = stablehlo.dynamic_slice " << wgu_l << ", " << ek << ", " << c0_i32 << ", " << c0_i32
+                          << ", sizes = [1, " << GU_exp_sh << ", " << D << "] : (" << t_wgu3 << ", tensor<i32>, tensor<i32>, tensor<i32>) -> " << t_1gu << "\n"
+                          << "    " << dnk << " = stablehlo.dynamic_slice " << wdn_l << ", " << ek << ", " << c0_i32 << ", " << c0_i32
+                          << ", sizes = [1, " << F_exp_sh << ", " << D << "] : (" << t_wdn3 << ", tensor<i32>, tensor<i32>, tensor<i32>) -> " << t_1dn << "\n";
+                    gu_parts.push_back(guk);
+                    dn_parts.push_back(dnk);
+
+                    if (i8) {
+                        std::string sguk = em.tmp("sguk"), sdnk = em.tmp("sdnk");
+                        em.ss << "    " << sguk << " = stablehlo.dynamic_slice " << sgu_l << ", " << ek << ", " << c0_i32
+                              << ", sizes = [1, " << GU_exp_sh << "] : (" << t_sgu2 << ", tensor<i32>, tensor<i32>) -> tensor<1x" << GU_exp_sh << "xf32>\n"
+                              << "    " << sdnk << " = stablehlo.dynamic_slice " << sdn_l << ", " << ek << ", " << c0_i32
+                              << ", sizes = [1, " << F_exp_sh << "] : (" << t_sdn2 << ", tensor<i32>, tensor<i32>) -> tensor<1x" << F_exp_sh << "xf32>\n";
+                        sgu_parts.push_back(sguk);
+                        sdn_parts.push_back(sdnk);
+                    }
+                }
+
+                auto emit_concat_k = [&](const std::vector<std::string>& parts, const std::string& elem_t, const std::string& out_t) -> std::string {
+                    std::string out = em.tmp("kcat");
+                    em.ss << "    " << out << " = stablehlo.concatenate ";
+                    for (size_t i = 0; i < parts.size(); ++i) em.ss << (i ? ", " : "") << parts[i];
+                    em.ss << ", dim = 0 : (";
+                    for (size_t i = 0; i < parts.size(); ++i) em.ss << (i ? ", " : "") << elem_t;
+                    em.ss << ") -> " << out_t << "\n";
+                    return out;
+                };
+
+                std::string kgu = emit_concat_k(gu_parts, t_1gu, t_kgu);
                 std::string kgu_2d = em.tmp("kgu2");
                 em.ss << "    " << kgu_2d << " = stablehlo.reshape " << kgu << " : (" << t_kgu << ") -> " << t_kgu2 << "\n";
                 std::string kgu_bf = kgu_2d;
@@ -1976,19 +1978,10 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const TpuModelSpec& spec,
                       << "    " << gu_dot  << " = stablehlo.reshape " << gu_dot2 << " : (" << t_gu2_f << ") -> " << t_gu_f32 << "\n";
                 std::string gu_cur = gu_dot;
                 if (i8) {
-                    const std::string t_ksgu = "tensor<" + std::to_string(K_exp) + "x" + std::to_string(GU_exp_sh) + "xf32>";
-                    std::string ksgu = em.tmp("ksgu"), ksgu3 = em.tmp("ksg3"), gu_sc = em.tmp("gusc");
-                    em.ss << "    " << ksgu << " = \"stablehlo.gather\"(" << sgu_l << ", " << ti_g << ") {\n"
-                          << "      dimension_numbers = #stablehlo.gather<\n"
-                          << "        offset_dims = [1],\n"
-                          << "        collapsed_slice_dims = [0],\n"
-                          << "        start_index_map = [0],\n"
-                          << "        index_vector_dim = 1\n"
-                          << "      >,\n"
-                          << "      indices_are_sorted = false,\n"
-                          << "      slice_sizes = array<i64: 1, " << GU_exp_sh << ">\n"
-                          << "    } : (" << t_sgu2 << ", " << t_kg_idx << ") -> " << t_ksgu << "\n"
-                          << "    " << ksgu3 << " = stablehlo.reshape " << ksgu << " : (" << t_ksgu << ") -> " << t_gu_f32 << "\n"
+                    std::string ksgu = emit_concat_k(sgu_parts, "tensor<1x" + std::to_string(GU_exp_sh) + "xf32>",
+                                                     "tensor<" + std::to_string(K_exp) + "x" + std::to_string(GU_exp_sh) + "xf32>");
+                    std::string ksgu3 = em.tmp("ksg3"), gu_sc = em.tmp("gusc");
+                    em.ss << "    " << ksgu3 << " = stablehlo.reshape " << ksgu << " : (tensor<" << K_exp << "x" << GU_exp_sh << "xf32>) -> " << t_gu_f32 << "\n"
                           << "    " << gu_sc << " = stablehlo.multiply " << gu_dot << ", " << ksgu3 << " : " << t_gu_f32 << "\n";
                     gu_cur = gu_sc;
                 }
@@ -2004,25 +1997,17 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const TpuModelSpec& spec,
                       << "    " << eact_w << " = stablehlo.multiply " << eact << ", " << twb << " : " << t_ef_f32 << "\n";
                 std::string eact_sc = eact_w;
                 if (i8) {
-                    const std::string t_ksdn = "tensor<" + std::to_string(K_exp) + "x" + std::to_string(F_exp_sh) + "xf32>";
-                    std::string ksdn = em.tmp("ksdn"), ksdn3 = em.tmp("ksd3"), eact_s = em.tmp("eas");
-                    em.ss << "    " << ksdn << " = \"stablehlo.gather\"(" << sdn_l << ", " << ti_g << ") {\n"
-                          << "      dimension_numbers = #stablehlo.gather<\n"
-                          << "        offset_dims = [1],\n"
-                          << "        collapsed_slice_dims = [0],\n"
-                          << "        start_index_map = [0],\n"
-                          << "        index_vector_dim = 1\n"
-                          << "      >,\n"
-                          << "      indices_are_sorted = false,\n"
-                          << "      slice_sizes = array<i64: 1, " << F_exp_sh << ">\n"
-                          << "    } : (" << t_sdn2 << ", " << t_kg_idx << ") -> " << t_ksdn << "\n"
-                          << "    " << ksdn3  << " = stablehlo.reshape " << ksdn << " : (" << t_ksdn << ") -> " << t_ef_f32 << "\n"
+                    std::string ksdn = emit_concat_k(sdn_parts, "tensor<1x" + std::to_string(F_exp_sh) + "xf32>",
+                                                     "tensor<" + std::to_string(K_exp) + "x" + std::to_string(F_exp_sh) + "xf32>");
+                    std::string ksdn3 = em.tmp("ksd3"), eact_s = em.tmp("eas");
+                    em.ss << "    " << ksdn3  << " = stablehlo.reshape " << ksdn << " : (tensor<" << K_exp << "x" << F_exp_sh << "xf32>) -> " << t_ef_f32 << "\n"
                           << "    " << eact_s << " = stablehlo.multiply " << eact_w << ", " << ksdn3 << " : " << t_ef_f32 << "\n";
                     eact_sc = eact_s;
                 }
                 std::string eact_bf = em.tmp("eab"), eact_2d = em.tmp("ea2");
                 em.ss << "    " << eact_bf << " = stablehlo.convert " << eact_sc << " : (" << t_ef_f32 << ") -> " << t_ef_bf << "\n"
                       << "    " << eact_2d << " = stablehlo.reshape " << eact_bf << " : (" << t_ef_bf << ") -> " << t_ef2_bf << "\n";
+                std::string kdn = emit_concat_k(dn_parts, t_1dn, t_kdn);
                 std::string kdn_2d = em.tmp("kdn2");
                 em.ss << "    " << kdn_2d << " = stablehlo.reshape " << kdn << " : (" << t_kdn << ") -> " << t_kdn2 << "\n";
                 std::string kdn_bf = kdn_2d;
@@ -2035,34 +2020,45 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const TpuModelSpec& spec,
                       << ", contracting_dims = [1] x [0] : (" << t_ef2_bf << ", " << t_kdn2b << ") -> " << t_nd_f32 << "\n";
             } else {
                 // Regime 2 (All Multi-Token Batches & Prefill N_tok >= 2):
-                // Hybrid Native Hadamard W8A8 (i8 x i8 -> i32) Gate+Up + Exact Sparse Top-K (K=8) GeGLU Extraction
-                // (16x less VPU tanh/scale/convert traffic — 100% bit-exact!) + Fused W8A16 Down!
+                // Zero-Gather Fused Block-256 Hadamard W8A8 (i8 x i8 -> i32) on Gate+Up + Fused W8A16 on Down!
+                // Keeps dot_general->convert->scale->GeGLU 100% fused in VMEM with zero i32 gather stalls!
                 const std::string t_nk1_i32 = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(K_exp) + "x1xi32>";
                 const std::string t_nk2_i32 = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(K_exp) + "x2xi32>";
                 const std::string t_nd_i8   = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(D) + "xi8>";
                 const std::string t_wgu2    = "tensor<" + std::to_string(E * GU_exp_sh) + "x" + std::to_string(D) + "x" + wel + ">";
                 const std::string t_gu2_f   = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(E * GU_exp_sh) + "xf32>";
                 const std::string t_gu2_i32 = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(E * GU_exp_sh) + "xi32>";
-                const std::string t_gu3_i32 = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(E) + "x" + std::to_string(GU_exp_sh) + "xi32>";
                 const std::string t_gu_f32  = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(E) + "x" + std::to_string(GU_exp_sh) + "xf32>";
-                const std::string t_guk_i32 = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(K_exp) + "x" + std::to_string(GU_exp_sh) + "xi32>";
-                const std::string t_guk_f32 = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(K_exp) + "x" + std::to_string(GU_exp_sh) + "xf32>";
-                const std::string t_efk_f32 = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(K_exp) + "x" + std::to_string(F_exp_sh) + "xf32>";
-                const std::string t_efk_bf  = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(K_exp) + "x" + std::to_string(F_exp_sh) + "xbf16>";
+                const std::string t_ef_f32  = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(E) + "x" + std::to_string(F_exp_sh) + "xf32>";
                 const std::string t_ef_bf   = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(E) + "x" + std::to_string(F_exp_sh) + "xbf16>";
                 const std::string t_ef2_bf  = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(E * F_exp_sh) + "xbf16>";
                 const std::string t_wdn2    = "tensor<" + std::to_string(E * F_exp_sh) + "x" + std::to_string(D) + "x" + wel + ">";
                 const std::string t_wdn2b   = "tensor<" + std::to_string(E * F_exp_sh) + "x" + std::to_string(D) + "xbf16>";
 
                 std::string n_io = em.tmp("nio"), n_io3 = em.tmp("nio3"), ti3 = em.tmp("ti3"), sc_idx = em.tmp("msc");
+                std::string z_ne = em.tmp("zne"), w_rt = em.tmp("wrt");
                 em.ss << "    " << n_io   << " = stablehlo.iota dim = 0 : " << t_nk_i32 << "\n"
                       << "    " << n_io3  << " = stablehlo.reshape " << n_io << " : (" << t_nk_i32 << ") -> " << t_nk1_i32 << "\n"
                       << "    " << ti3    << " = stablehlo.reshape " << ti_v << " : (" << t_nk_i32 << ") -> " << t_nk1_i32 << "\n"
-                      << "    " << sc_idx << " = stablehlo.concatenate " << n_io3 << ", " << ti3 << ", dim = 2 : (" << t_nk1_i32 << ", " << t_nk1_i32 << ") -> " << t_nk2_i32 << "\n";
+                      << "    " << sc_idx << " = stablehlo.concatenate " << n_io3 << ", " << ti3 << ", dim = 2 : (" << t_nk1_i32 << ", " << t_nk1_i32 << ") -> " << t_nk2_i32 << "\n"
+                      << "    " << z_ne   << " = stablehlo.constant dense<0.0000000e+00> : " << t_ne_f32 << "\n"
+                      << "    " << w_rt   << " = \"stablehlo.scatter\"(" << z_ne << ", " << sc_idx << ", " << tw << ") ({\n"
+                      << "    ^bb0(%old: tensor<f32>, %new: tensor<f32>):\n"
+                      << "      stablehlo.return %new : tensor<f32>\n"
+                      << "    }) {\n"
+                      << "      scatter_dimension_numbers = #stablehlo.scatter<\n"
+                      << "        update_window_dims = [],\n"
+                      << "        inserted_window_dims = [0, 1],\n"
+                      << "        scatter_dims_to_operand_dims = [0, 1],\n"
+                      << "        index_vector_dim = 2\n"
+                      << "      >,\n"
+                      << "      indices_are_sorted = false,\n"
+                      << "      unique_indices = true\n"
+                      << "    } : (" << t_ne_f32 << ", " << t_nk2_i32 << ", " << t_nk_f32 << ") -> " << t_ne_f32 << "\n";
 
                 std::string wgu_2d = em.tmp("wgu2");
                 em.ss << "    " << wgu_2d << " = stablehlo.reshape " << wgu_l << " : (" << t_wgu3 << ") -> " << t_wgu2 << "\n";
-                std::string guk_cur;
+                std::string gu_cur;
                 if (i8) {
                     std::string xm2_f2 = xm2_f2_src;
                     if (xm2_f2.empty()) {
@@ -2070,97 +2066,43 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const TpuModelSpec& spec,
                         em.ss << "    " << xm2_f2 << " = stablehlo.reshape " << x_m2 << " : (" << t_bsd_f32 << ") -> " << t_nd_f32 << "\n";
                     }
                     auto [xm2_i8, xm2_sc] = em.emit_quant_i8_per_row(xm2_f2, N_tok, D, c0_f32);
-                    std::string gu_i32 = em.tmp("gui32"), gu_3i = em.tmp("gu3i"), guk_i32 = em.tmp("guki32");
-                    std::string guk_f = em.tmp("gukf"), xscb = em.tmp("xscb"), sgu_k = em.tmp("sguk");
-                    std::string gu_s1 = em.tmp("gus1"), gu_sc = em.tmp("gusc");
+                    std::string gu_i32 = em.tmp("gui32"), gu_f2 = em.tmp("guf2"), gu_dot = em.tmp("gudot");
+                    std::string xscb = em.tmp("xscb"), sgub = em.tmp("sgub"), gu_s1 = em.tmp("gus1"), gu_sc = em.tmp("gusc");
                     em.ss << "    " << gu_i32 << " = stablehlo.dot_general " << xm2_i8 << ", " << wgu_2d
                           << ", contracting_dims = [1] x [1] : (" << t_nd_i8 << ", " << t_wgu2 << ") -> " << t_gu2_i32 << "\n"
-                          << "    " << gu_3i  << " = stablehlo.reshape " << gu_i32 << " : (" << t_gu2_i32 << ") -> " << t_gu3_i32 << "\n"
-                          << "    " << guk_i32 << " = \"stablehlo.gather\"(" << gu_3i << ", " << sc_idx << ") {\n"
-                          << "      dimension_numbers = #stablehlo.gather<\n"
-                          << "        offset_dims = [2],\n"
-                          << "        collapsed_slice_dims = [0, 1],\n"
-                          << "        start_index_map = [0, 1],\n"
-                          << "        index_vector_dim = 2\n"
-                          << "      >,\n"
-                          << "      indices_are_sorted = false,\n"
-                          << "      slice_sizes = array<i64: 1, 1, " << GU_exp_sh << ">\n"
-                          << "    } : (" << t_gu3_i32 << ", " << t_nk2_i32 << ") -> " << t_guk_i32 << "\n"
-                          << "    " << guk_f  << " = stablehlo.convert " << guk_i32 << " : (" << t_guk_i32 << ") -> " << t_guk_f32 << "\n"
-                          << "    " << xscb   << " = stablehlo.broadcast_in_dim " << xm2_sc << ", dims = [0] : (" << t_n1_f32 << ") -> " << t_guk_f32 << "\n"
-                          << "    " << gu_s1  << " = stablehlo.multiply " << guk_f << ", " << xscb << " : " << t_guk_f32 << "\n"
-                          << "    " << sgu_k  << " = \"stablehlo.gather\"(" << sgu_l << ", " << ti3 << ") {\n"
-                          << "      dimension_numbers = #stablehlo.gather<\n"
-                          << "        offset_dims = [2],\n"
-                          << "        collapsed_slice_dims = [0],\n"
-                          << "        start_index_map = [0],\n"
-                          << "        index_vector_dim = 2\n"
-                          << "      >,\n"
-                          << "      indices_are_sorted = false,\n"
-                          << "      slice_sizes = array<i64: 1, " << GU_exp_sh << ">\n"
-                          << "    } : (" << t_sgu2 << ", " << t_nk1_i32 << ") -> " << t_guk_f32 << "\n"
-                          << "    " << gu_sc  << " = stablehlo.multiply " << gu_s1 << ", " << sgu_k << " : " << t_guk_f32 << "\n";
-                    guk_cur = gu_sc;
+                          << "    " << gu_f2  << " = stablehlo.convert " << gu_i32 << " : (" << t_gu2_i32 << ") -> " << t_gu2_f << "\n"
+                          << "    " << gu_dot << " = stablehlo.reshape " << gu_f2 << " : (" << t_gu2_f << ") -> " << t_gu_f32 << "\n"
+                          << "    " << xscb   << " = stablehlo.broadcast_in_dim " << xm2_sc << ", dims = [0] : (" << t_n1_f32 << ") -> " << t_gu_f32 << "\n"
+                          << "    " << gu_s1  << " = stablehlo.multiply " << gu_dot << ", " << xscb << " : " << t_gu_f32 << "\n"
+                          << "    " << sgub   << " = stablehlo.broadcast_in_dim " << sgu_l << ", dims = [1, 2] : (" << t_sgu2 << ") -> " << t_gu_f32 << "\n"
+                          << "    " << gu_sc  << " = stablehlo.multiply " << gu_s1 << ", " << sgub << " : " << t_gu_f32 << "\n";
+                    gu_cur = gu_sc;
                 } else {
-                    std::string gu_dot2 = em.tmp("gud2"), gu_dot = em.tmp("gudot"), guk_f = em.tmp("gukf");
+                    std::string gu_dot2 = em.tmp("gud2"), gu_dot = em.tmp("gudot");
                     em.ss << "    " << gu_dot2 << " = stablehlo.dot_general " << xm2_bf << ", " << wgu_2d
                           << ", contracting_dims = [1] x [1] : (" << t_nd_bf << ", " << t_wgu2 << ") -> " << t_gu2_f << "\n"
-                          << "    " << gu_dot  << " = stablehlo.reshape " << gu_dot2 << " : (" << t_gu2_f << ") -> " << t_gu_f32 << "\n"
-                          << "    " << guk_f   << " = \"stablehlo.gather\"(" << gu_dot << ", " << sc_idx << ") {\n"
-                          << "      dimension_numbers = #stablehlo.gather<\n"
-                          << "        offset_dims = [2],\n"
-                          << "        collapsed_slice_dims = [0, 1],\n"
-                          << "        start_index_map = [0, 1],\n"
-                          << "        index_vector_dim = 2\n"
-                          << "      >,\n"
-                          << "      indices_are_sorted = false,\n"
-                          << "      slice_sizes = array<i64: 1, 1, " << GU_exp_sh << ">\n"
-                          << "    } : (" << t_gu_f32 << ", " << t_nk2_i32 << ") -> " << t_guk_f32 << "\n";
-                    guk_cur = guk_f;
+                          << "    " << gu_dot  << " = stablehlo.reshape " << gu_dot2 << " : (" << t_gu2_f << ") -> " << t_gu_f32 << "\n";
+                    gu_cur = gu_dot;
                 }
                 std::string eg = em.tmp("eg"), eu = em.tmp("eu");
-                em.ss << "    " << eg << " = stablehlo.slice " << guk_cur << " [0:" << N_tok << ", 0:" << K_exp << ", 0:" << F_exp_sh << "] : (" << t_guk_f32 << ") -> " << t_efk_f32 << "\n"
-                      << "    " << eu << " = stablehlo.slice " << guk_cur << " [0:" << N_tok << ", 0:" << K_exp << ", " << F_exp_sh << ":" << GU_exp_sh << "] : (" << t_guk_f32 << ") -> " << t_efk_f32 << "\n";
+                em.ss << "    " << eg << " = stablehlo.slice " << gu_cur << " [0:" << N_tok << ", 0:" << E << ", 0:" << F_exp_sh << "] : (" << t_gu_f32 << ") -> " << t_ef_f32 << "\n"
+                      << "    " << eu << " = stablehlo.slice " << gu_cur << " [0:" << N_tok << ", 0:" << E << ", " << F_exp_sh << ":" << GU_exp_sh << "] : (" << t_gu_f32 << ") -> " << t_ef_f32 << "\n";
                 std::string eg_act = (spec.ffn_activation == FfnActivation::GELU)
-                    ? em.emit_gelu_3d(eg, N_tok, K_exp, F_exp_sh)
-                    : em.emit_silu_3d(eg, N_tok, K_exp, F_exp_sh);
-                std::string eact = em.tmp("eact"), twb = em.tmp("twb"), eact_w = em.tmp("eactw");
-                em.ss << "    " << eact   << " = stablehlo.multiply " << eg_act << ", " << eu << " : " << t_efk_f32 << "\n"
-                      << "    " << twb    << " = stablehlo.broadcast_in_dim " << tw << ", dims = [0, 1] : (" << t_nk_f32 << ") -> " << t_efk_f32 << "\n"
-                      << "    " << eact_w << " = stablehlo.multiply " << eact << ", " << twb << " : " << t_efk_f32 << "\n";
+                    ? em.emit_gelu_3d(eg, N_tok, E, F_exp_sh)
+                    : em.emit_silu_3d(eg, N_tok, E, F_exp_sh);
+                std::string eact = em.tmp("eact"), wrtb = em.tmp("wrtb"), eact_w = em.tmp("eactw");
+                em.ss << "    " << eact   << " = stablehlo.multiply " << eg_act << ", " << eu << " : " << t_ef_f32 << "\n"
+                      << "    " << wrtb   << " = stablehlo.broadcast_in_dim " << w_rt << ", dims = [0, 1] : (" << t_ne_f32 << ") -> " << t_ef_f32 << "\n"
+                      << "    " << eact_w << " = stablehlo.multiply " << eact << ", " << wrtb << " : " << t_ef_f32 << "\n";
                 std::string eact_sc = eact_w;
                 if (i8) {
-                    std::string sdn_k = em.tmp("sdnk"), eact_s = em.tmp("eas");
-                    em.ss << "    " << sdn_k << " = \"stablehlo.gather\"(" << sdn_l << ", " << ti3 << ") {\n"
-                          << "      dimension_numbers = #stablehlo.gather<\n"
-                          << "        offset_dims = [2],\n"
-                          << "        collapsed_slice_dims = [0],\n"
-                          << "        start_index_map = [0],\n"
-                          << "        index_vector_dim = 2\n"
-                          << "      >,\n"
-                          << "      indices_are_sorted = false,\n"
-                          << "      slice_sizes = array<i64: 1, " << F_exp_sh << ">\n"
-                          << "    } : (" << t_sdn2 << ", " << t_nk1_i32 << ") -> " << t_efk_f32 << "\n"
-                          << "    " << eact_s << " = stablehlo.multiply " << eact_w << ", " << sdn_k << " : " << t_efk_f32 << "\n";
+                    std::string sdnb = em.tmp("sdnb"), eact_s = em.tmp("eas");
+                    em.ss << "    " << sdnb   << " = stablehlo.broadcast_in_dim " << sdn_l << ", dims = [1, 2] : (" << t_sdn2 << ") -> " << t_ef_f32 << "\n"
+                          << "    " << eact_s << " = stablehlo.multiply " << eact_w << ", " << sdnb << " : " << t_ef_f32 << "\n";
                     eact_sc = eact_s;
                 }
-                std::string eact_k_bf = em.tmp("eakb"), z_ef = em.tmp("zef"), eact_bf = em.tmp("eab");
-                std::string eact_2d = em.tmp("ea2"), wdn_2d = em.tmp("wdn2");
-                em.ss << "    " << eact_k_bf << " = stablehlo.convert " << eact_sc << " : (" << t_efk_f32 << ") -> " << t_efk_bf << "\n"
-                      << "    " << z_ef      << " = stablehlo.constant dense<0.0000000e+00> : " << t_ef_bf << "\n"
-                      << "    " << eact_bf   << " = \"stablehlo.scatter\"(" << z_ef << ", " << sc_idx << ", " << eact_k_bf << ") ({\n"
-                      << "    ^bb0(%old: tensor<bf16>, %new: tensor<bf16>):\n"
-                      << "      stablehlo.return %new : tensor<bf16>\n"
-                      << "    }) {\n"
-                      << "      scatter_dimension_numbers = #stablehlo.scatter<\n"
-                      << "        update_window_dims = [2],\n"
-                      << "        inserted_window_dims = [0, 1],\n"
-                      << "        scatter_dims_to_operand_dims = [0, 1],\n"
-                      << "        index_vector_dim = 2\n"
-                      << "      >,\n"
-                      << "      indices_are_sorted = false,\n"
-                      << "      unique_indices = true\n"
-                      << "    } : (" << t_ef_bf << ", " << t_nk2_i32 << ", " << t_efk_bf << ") -> " << t_ef_bf << "\n"
+                std::string eact_bf = em.tmp("eab"), eact_2d = em.tmp("ea2"), wdn_2d = em.tmp("wdn2");
+                em.ss << "    " << eact_bf << " = stablehlo.convert " << eact_sc << " : (" << t_ef_f32 << ") -> " << t_ef_bf << "\n"
                       << "    " << eact_2d << " = stablehlo.reshape " << eact_bf << " : (" << t_ef_bf << ") -> " << t_ef2_bf << "\n"
                       << "    " << wdn_2d  << " = stablehlo.reshape " << wdn_l   << " : (" << t_wdn3  << ") -> " << t_wdn2 << "\n";
                 std::string wdn_bf = wdn_2d;
@@ -2176,7 +2118,7 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const TpuModelSpec& spec,
             std::string moe_loc = em.tmp("moel");
             em.ss << "    " << moe_loc << " = stablehlo.reshape " << moe_2d << " : (" << t_nd_f32 << ") -> " << t_bsd_f32 << "\n";
 
-            // Fused Single BF16 Optical ICI AllReduce for BOTH Shared-MLP and Sparse-MoE branches (-50% ICI bytes!)
+            // Fused Single Full-F32 Optical ICI AllReduce for BOTH Shared-MLP and Sparse-MoE branches!
             std::string mlp_ar = f_down_loc;
             std::string moe_ar = moe_loc;
             if (R > 1) {
@@ -2184,7 +2126,7 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const TpuModelSpec& spec,
                 std::string both_loc = em.tmp("bothl");
                 em.ss << "    " << both_loc << " = stablehlo.concatenate " << f_down_loc << ", " << moe_loc << ", dim = 0 : ("
                       << t_bsd_f32 << ", " << t_bsd_f32 << ") -> " << t_2bsd << "\n";
-                std::string both_ar = em.emit_all_reduce_sum_bf16_3d(both_loc, 2 * B, S, D, R);
+                std::string both_ar = em.emit_all_reduce_sum_3d(both_loc, 2 * B, S, D, R);
                 mlp_ar = em.tmp("mlpar");
                 moe_ar = em.tmp("moear");
                 em.ss << "    " << mlp_ar << " = stablehlo.slice " << both_ar << " [0:" << B << ", 0:" << S << ", 0:" << D << "] : (" << t_2bsd << ") -> " << t_bsd_f32 << "\n"
