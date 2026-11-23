@@ -70,8 +70,8 @@ static bool validate_mlir_module(const std::string& ir, const std::string& label
         std::cerr << "  [FAIL] Expected %w_tok_emb for untied on-chip embeddings in " << label << "\n";
         return false;
     }
-    if (expect_moe_sort && (ir.find("\"stablehlo.sort\"") == std::string::npos || ir.find("%w_moe_gu") == std::string::npos)) {
-        std::cerr << "  [FAIL] Expected stablehlo.sort + %w_moe_gu for Sparse MoE in " << label << "\n";
+    if (expect_moe_sort && (ir.find("\"stablehlo.sort\"") == std::string::npos || ir.find("%w_moe_gu_0") == std::string::npos)) {
+        std::cerr << "  [FAIL] Expected stablehlo.sort + %w_moe_gu_0 for Sparse MoE in " << label << "\n";
         return false;
     }
     return true;
@@ -665,6 +665,7 @@ int main(int argc, char** argv) {
             run_config_bench("M4A. Ava 26B-A4B Parity Check (4-Chip v6e-4 BF16 FullLogits)",  4, 1,   false, true,  64,  128, true);
             run_config_bench("M4B. Ava 26B-A4B Interactive (4-Chip v6e-4 BF16 OnChipEmb)",    4, 1,   false, false, 128, 128, true);
             run_config_bench("M4C. Ava 26B-A4B Interactive (4-Chip v6e-4 W8A16 INT8)",        4, 1,   true,  false, 128, 128, true);
+            run_config_bench("M4C-P. Ava 26B-A4B INT8 Parity Check (4-Chip v6e-4 FullLogits)",4, 1,   true,  true,  32,  128, true);
             run_config_bench("M4D. Ava 26B-A4B Batch B=32 (4-Chip v6e-4 W8A16 INT8)",         4, 32,  true,  false, 64,  0,   true);
             run_config_bench("M4E. Ava 26B-A4B Batch B=64 (4-Chip v6e-4 W8A16 INT8)",         4, 64,  true,  false, 64,  0,   true);
             run_config_bench("M4F. Ava 26B-A4B Batch B=128 (4-Chip v6e-4 W8A16 INT8)",        4, 128, true,  false, 64,  0,   true);
