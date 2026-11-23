@@ -387,12 +387,13 @@ static std::vector<int> resolve_prefill_buckets(const TpuGemma4Config& cfg) {
         }
     } else if (cfg.prefill_chunk_size > 1) {
         if (cfg.prefill_chunk_size >= 128) {
-            for (int b : {cfg.prefill_chunk_size, 32, 16}) {
+            for (int b : {cfg.prefill_chunk_size, 32, 16, 8}) {
                 if (b <= cfg.max_seq_len) buckets.push_back(b);
             }
         } else {
             buckets.push_back(std::min(cfg.prefill_chunk_size, cfg.max_seq_len));
             if (cfg.prefill_chunk_size > 16) buckets.push_back(16);
+            if (cfg.prefill_chunk_size > 8) buckets.push_back(8);
         }
     }
     // For multi-tenant continuous batching (batch_size > 1), always include an isolated
@@ -765,14 +766,18 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const TpuModelSpec& spec,
     int alias_slot = 1;
     std::vector<std::string> kv_ret_types;
     if (has_swa_kv) {
-        em.ss << "    %kv_ks_in: " << kv_ks_t << donate_attr(alias_slot++) << ",\n"
-              << "    %kv_vs_in: " << kv_ks_t << donate_attr(alias_slot++) << (has_glob_kv ? ",\n" : "\n");
+        const int a_ks = alias_slot++;
+        const int a_vs = alias_slot++;
+        em.ss << "    %kv_ks_in: " << kv_ks_t << donate_attr(a_ks) << ",\n"
+              << "    %kv_vs_in: " << kv_ks_t << donate_attr(a_vs) << (has_glob_kv ? ",\n" : "\n");
         kv_ret_types.push_back(kv_ks_t);
         kv_ret_types.push_back(kv_ks_t);
     }
     if (has_glob_kv) {
-        em.ss << "    %kv_kg_in: " << kv_kg_t << donate_attr(alias_slot++) << ",\n"
-              << "    %kv_vg_in: " << kv_kg_t << donate_attr(alias_slot++) << "\n";
+        const int a_kg = alias_slot++;
+        const int a_vg = alias_slot++;
+        em.ss << "    %kv_kg_in: " << kv_kg_t << donate_attr(a_kg) << ",\n"
+              << "    %kv_vg_in: " << kv_kg_t << donate_attr(a_vg) << "\n";
         kv_ret_types.push_back(kv_kg_t);
         kv_ret_types.push_back(kv_kg_t);
     }

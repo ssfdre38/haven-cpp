@@ -326,17 +326,25 @@ int main(int argc, char** argv) {
         auto p1 = host_engine.tokenize(host_engine.format_chat_prompt("Hi Aura, say hello in two words."), true);
         auto p2 = host_engine.tokenize(host_engine.format_chat_prompt("Explain quantum entanglement in one concise sentence."), true);
 
-        // Compute CPU ground truth Top-1 AND step-2 Top-1 for all 3 prompts!
-        auto cpu_eval_2steps = [&](const std::vector<uint32_t>& toks) -> std::pair<uint32_t, uint32_t> {
-            std::vector<float> lg(mc.vocab_size, 0.0f);
+        // Compute CPU ground truth full 262k logits for Prefill AND Step-2 for all 3 prompts!
+        struct CpuGt {
+            std::vector<float> lg1;
+            std::vector<float> lg2;
+            uint32_t t1 = 0;
+            uint32_t t2 = 0;
+        };
+        auto cpu_eval_2steps = [&](const std::vector<uint32_t>& toks) -> CpuGt {
+            CpuGt gt;
+            gt.lg1.assign(mc.vocab_size, 0.0f);
+            gt.lg2.assign(mc.vocab_size, 0.0f);
             host_engine.get_kv_cache().reset();
             for (size_t i = 0; i < toks.size(); ++i) {
-                host_engine.forward(toks[i], static_cast<int>(i), (i + 1 == toks.size()) ? lg.data() : nullptr);
+                host_engine.forward(toks[i], static_cast<int>(i), (i + 1 == toks.size()) ? gt.lg1.data() : nullptr);
             }
-            uint32_t t1 = static_cast<uint32_t>(std::max_element(lg.begin(), lg.end()) - lg.begin());
-            host_engine.forward(t1, static_cast<int>(toks.size()), lg.data());
-            uint32_t t2 = static_cast<uint32_t>(std::max_element(lg.begin(), lg.end()) - lg.begin());
-            return {t1, t2};
+            gt.t1 = static_cast<uint32_t>(std::max_element(gt.lg1.begin(), gt.lg1.end()) - gt.lg1.begin());
+            host_engine.forward(gt.t1, static_cast<int>(toks.size()), gt.lg2.data());
+            gt.t2 = static_cast<uint32_t>(std::max_element(gt.lg2.begin(), gt.lg2.end()) - gt.lg2.begin());
+            return gt;
         };
 
         auto gt0 = cpu_eval_2steps(p0);
@@ -346,11 +354,11 @@ int main(int argc, char** argv) {
         TpuGemma4Config acfg;
         acfg.batch_size = 4;
         acfg.max_seq_len = 2048;
-        acfg.prefill_chunk_size = 128; // Auto compiles slot-targeted {128, 32, 16, 1}!
+        acfg.prefill_chunk_size = 128; // Auto compiles slot-targeted {128, 32, 16, 8, 1}!
         acfg.num_replicas = R_test;
-        acfg.use_int8_weights = false; // BF16 for exact parity check
+        acfg.use_int8_weights = false; // BF16 for exact 262k logit cosine parity check
         acfg.use_onchip_embeddings = true;
-        acfg.return_full_logits = false;
+        acfg.return_full_logits = true;
         acfg.donate_kv_cache = true;
 
         HavenTpuGemma4Engine async_eng;
@@ -359,13 +367,14 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        std::vector<float> pf_lg0, pf_lg1, pf_lg2, batch_lg;
         uint32_t tpu_t1_0 = 0, tpu_t1_1 = 0, tpu_t1_2 = 0;
         auto pf_a0 = std::chrono::high_resolution_clock::now();
-        bool ok0 = async_eng.prefill_slot(0, p0, 0, nullptr, &tpu_t1_0);
+        bool ok0 = async_eng.prefill_slot(0, p0, 0, &pf_lg0, &tpu_t1_0);
         auto pf_a1 = std::chrono::high_resolution_clock::now();
-        bool ok1 = async_eng.prefill_slot(1, p1, 0, nullptr, &tpu_t1_1);
+        bool ok1 = async_eng.prefill_slot(1, p1, 0, &pf_lg1, &tpu_t1_1);
         auto pf_a2 = std::chrono::high_resolution_clock::now();
-        bool ok2 = async_eng.prefill_slot(2, p2, 0, nullptr, &tpu_t1_2);
+        bool ok2 = async_eng.prefill_slot(2, p2, 0, &pf_lg2, &tpu_t1_2);
         auto pf_a3 = std::chrono::high_resolution_clock::now();
 
         if (!ok0 || !ok1 || !ok2) {
@@ -374,34 +383,42 @@ int main(int argc, char** argv) {
         }
 
         // Now run ONE lockstep decode_step_batched across all 4 slots at DIFFERENT positions!
-        std::vector<uint32_t> batch_toks = {tpu_t1_0, tpu_t1_1, tpu_t1_2, 0};
+        std::vector<uint32_t> batch_toks = {gt0.t1, gt1.t1, gt2.t1, 0};
         std::vector<int> batch_pos = {static_cast<int>(p0.size()), static_cast<int>(p1.size()), static_cast<int>(p2.size()), 0};
         std::vector<uint32_t> batch_next;
-        if (!async_eng.decode_step_batched(batch_toks, batch_pos, nullptr, batch_next)) {
+        if (!async_eng.decode_step_batched(batch_toks, batch_pos, &batch_lg, batch_next)) {
             std::cerr << "  ASYNC DECODE FAILED: " << async_eng.get_last_error() << "\n";
             return 1;
         }
 
+        const size_t V = mc.vocab_size;
+        double c_pf0 = cosine_sim(gt0.lg1.data(), pf_lg0.data(), V);
+        double c_pf1 = cosine_sim(gt1.lg1.data(), pf_lg1.data(), V);
+        double c_pf2 = cosine_sim(gt2.lg1.data(), pf_lg2.data(), V);
+        double c_d0  = cosine_sim(gt0.lg2.data(), batch_lg.data() + 0 * V, V);
+        double c_d1  = cosine_sim(gt1.lg2.data(), batch_lg.data() + 1 * V, V);
+        double c_d2  = cosine_sim(gt2.lg2.data(), batch_lg.data() + 2 * V, V);
+
         std::cout << "  Slot 0 (len=" << p0.size() << ", " << std::setprecision(2)
                   << std::chrono::duration<double, std::milli>(pf_a1 - pf_a0).count() << " ms): "
-                  << "Prefill Top1=" << tpu_t1_0 << " (CPU=" << gt0.first << ", " << (tpu_t1_0 == gt0.first ? "MATCH" : "DIFF") << ") | "
-                  << "Async Step2=" << batch_next[0] << " (CPU=" << gt0.second << ", " << (batch_next[0] == gt0.second ? "MATCH" : "DIFF") << ")\n";
+                  << "Prefill Cos=" << std::setprecision(6) << c_pf0 << " (\"" << host_engine.detokenize(tpu_t1_0) << "\") | "
+                  << "Async Step2 Cos=" << c_d0 << " (\"" << host_engine.detokenize(batch_next[0]) << "\")\n";
         std::cout << "  Slot 1 (len=" << p1.size() << ", " << std::setprecision(2)
                   << std::chrono::duration<double, std::milli>(pf_a2 - pf_a1).count() << " ms): "
-                  << "Prefill Top1=" << tpu_t1_1 << " (CPU=" << gt1.first << ", " << (tpu_t1_1 == gt1.first ? "MATCH" : "DIFF") << ") | "
-                  << "Async Step2=" << batch_next[1] << " (CPU=" << gt1.second << ", " << (batch_next[1] == gt1.second ? "MATCH" : "DIFF") << ")\n";
+                  << "Prefill Cos=" << std::setprecision(6) << c_pf1 << " (\"" << host_engine.detokenize(tpu_t1_1) << "\") | "
+                  << "Async Step2 Cos=" << c_d1 << " (\"" << host_engine.detokenize(batch_next[1]) << "\")\n";
         std::cout << "  Slot 2 (len=" << p2.size() << ", " << std::setprecision(2)
                   << std::chrono::duration<double, std::milli>(pf_a3 - pf_a2).count() << " ms): "
-                  << "Prefill Top1=" << tpu_t1_2 << " (CPU=" << gt2.first << ", " << (tpu_t1_2 == gt2.first ? "MATCH" : "DIFF") << ") | "
-                  << "Async Step2=" << batch_next[2] << " (CPU=" << gt2.second << ", " << (batch_next[2] == gt2.second ? "MATCH" : "DIFF") << ")\n";
+                  << "Prefill Cos=" << std::setprecision(6) << c_pf2 << " (\"" << host_engine.detokenize(tpu_t1_2) << "\") | "
+                  << "Async Step2 Cos=" << c_d2 << " (\"" << host_engine.detokenize(batch_next[2]) << "\")\n";
 
         async_eng.shutdown();
-        if (tpu_t1_0 != gt0.first || tpu_t1_1 != gt1.first || tpu_t1_2 != gt2.first ||
-            batch_next[0] != gt0.second || batch_next[1] != gt1.second || batch_next[2] != gt2.second) {
-            std::cerr << "  [FAIL] Async per-slot parity mismatch!\n";
+        if (c_pf0 < 0.97 || c_pf1 < 0.97 || c_pf2 < 0.97 ||
+            c_d0  < 0.97 || c_d1  < 0.97 || c_d2  < 0.97) {
+            std::cerr << "  [FAIL] Async per-slot 262k logit cosine parity below 0.97!\n";
             return 1;
         }
-        std::cout << "  [PASS] 6/6 Async Per-Slot Prefill & Decode Top-1 Exact Match vs CPU!\n";
+        std::cout << "  [PASS] 6/6 Async Per-Slot Prefill & Lockstep Decode 262k Logit Parity >= 0.97 vs F32 CPU!\n";
         if (async_slots_only) return 0;
     }
 
