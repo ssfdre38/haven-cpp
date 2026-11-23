@@ -6,10 +6,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Enable AVX2, FMA, F16C, OpenMP and Aggressive Optimization
 if (MSVC)
-    add_compile_options(/O2 /arch:AVX2 /W4 /openmp)
+    add_compile_options(/O2 /arch:AVX2 /W4 /openmp /utf-8)
+    add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS)
 else()
     add_compile_options(-O3 -march=native -mavx2 -mfma -mf16c -fopenmp -Wall -Wextra)
     add_link_options(-fopenmp)
+    if (WIN32)
+        add_compile_definitions(NOMINMAX)
+    endif()
 endif()
 
 if (WIN32)

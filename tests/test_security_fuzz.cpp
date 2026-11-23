@@ -495,9 +495,14 @@ static void test_hmb_binary_fuzzer() {
 // 6. Live Hardened Plugin Security Tests (Job Object, Workspace, Vault, SSRF)
 // -----------------------------------------------------------------------------
 static void test_hardened_plugins() {
+#ifndef _WIN32
+    std::cout << "[6/6] Skipping Win32 Job Object / WinHTTP plugin suite on non-Windows host.\n";
+    return;
+#else
     std::cout << "[6/6] Verifying Hardened Plugins (Win32 Job Object, Workspace, Vault, DNS-SSRF)...\n";
     PluginManager pm;
-    size_t count = pm.discover_plugins("plugins", true);
+    size_t count = pm.discover_plugins("build/plugins", true);
+    if (count == 0) count = pm.discover_plugins("plugins", true);
     if (count == 0) count = pm.discover_plugins("C:\\Users\\admin\\source\\haven-cpp\\plugins", true);
     assert(count > 0 && "Plugins must be discoverable");
 
@@ -544,6 +549,7 @@ static void test_hardened_plugins() {
     }
 
     std::cout << "   ✓ All hardened plugin security defenses verified live.\n";
+#endif
 }
 
 int main() {

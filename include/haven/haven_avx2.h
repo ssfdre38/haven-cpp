@@ -10,9 +10,9 @@ namespace haven {
 
 class Avx2Math {
 public:
-    // Convert FP16 uint16_t to float using hardware native F16C SIMD instruction
+    // Convert FP16 uint16_t to float using hardware native F16C SIMD instruction (MSVC/GCC/Clang portable)
     static inline float fp16_to_fp32(uint16_t h) {
-        return _cvtsh_ss(h);
+        return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(h))));
     }
 
     // Convert BF16 uint16_t to float

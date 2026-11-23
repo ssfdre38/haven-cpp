@@ -62,7 +62,11 @@ jobs:
             test-secure-cluster `
             test-multi-model-arch `
             test-tpu-scheduler `
-            test-tpu-gemma4-onchip
+            test-tpu-gemma4-onchip `
+            plugin_terminal `
+            plugin_workspace_coder `
+            plugin_vault_sync `
+            plugin_browser
 
       - name: Run zero-GGUF security, architecture, scheduler & TPU StableHLO tests
         run: |
