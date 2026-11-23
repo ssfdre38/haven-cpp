@@ -2,6 +2,7 @@
 
 **Sovereign, Bare-Metal C++20 AI Inference Engine, Native Cloud TPU StableHLO Runtime & Companion Server**
 
+[![CI](https://github.com/ssfdre38/haven-cpp/actions/workflows/ci.yml/badge.svg)](https://github.com/ssfdre38/haven-cpp/actions/workflows/ci.yml)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
 [![SIMD](https://img.shields.io/badge/SIMD-AVX2%20%2F%20FMA%20%2F%20F16C-green.svg)](#12-system-sovereign-architecture)
 [![Cloud TPU](https://img.shields.io/badge/TPU%20v6e--4-9%2C180%20tok%2Fs%20%7C%202.865%20PFLOPS-red.svg)](#cloud-tpu-v6e-4-trillium-native-c20-benchmarks)
@@ -9,9 +10,9 @@
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20TPU-orange.svg)](#building-haven-cpp)
 [![License](https://img.shields.io/badge/License-AGPLv3%20%7C%20Commercial-purple.svg)](#license)
 
-`haven-cpp` is a standalone, zero-Python AI inference engine and companion runtime built from scratch in pure C++20. It scales seamlessly from a single local workstation CPU (`AVX2/FMA/F16C`) or Apple Silicon (`MLX`) all the way to bare-metal **Google Cloud TPU v6e (Trillium)** slices via direct `dlopen("libtpu.so")` calls over OpenXLA's PJRT C ABI (`0.75`).
+`haven-cpp` is a standalone, zero-Python AI inference engine and multi-tenant Cloud TPU server built from scratch in pure C++20. It scales seamlessly from a single local workstation CPU (`AVX2/FMA/F16C`) or Apple Silicon (`MLX`) all the way to bare-metal **Google Cloud TPU v6e (Trillium)** slices via direct `dlopen("libtpu.so")` calls over OpenXLA's PJRT C ABI (`0.75`).
 
-On real 4-chip Cloud TPU `v6e-4` hardware running the full 42-layer Gemma 4 model (`haven-chat-v5.0.gguf`, 262,144 vocabulary, Pleias per-layer injection), `haven-cpp` achieves **2.865 PFLOPS** BF16 MXU compute, **30,181 tok/s** batched prefill, **330.8 tok/s** interactive single-stream decode, **248.3 tok/s** live OpenAI-compatible HTTP/SSE streaming with full sampling, and **9,180.0 tok/s** aggregate continuous-batching throughput (`B=128`) — with zero Python, JAX, or PyTorch runtime dependencies.
+On real 4-chip Cloud TPU `v6e-4` hardware running the full 42-layer Gemma 4 model (`haven-chat-v5.0.gguf`, 262,144 vocabulary, Pleias per-layer injection), `haven-cpp` achieves **2.865 PFLOPS** BF16 MXU compute, **30,181 tok/s** batched prefill, **330.8 tok/s** interactive single-stream decode, **248.3 tok/s** single-user HTTP/SSE streaming (**62.6 ms** multi-turn follow-up TTFT), **2,198.5 tok/s** live multi-tenant concurrent HTTP/SSE serving across 64 simultaneous sockets (**8,258 tok/s** steady-state silicon step), and **9,180.0 tok/s** aggregate continuous-batching throughput (`B=128`) — with zero Python, JAX, or PyTorch runtime dependencies.
 
 ---
 
@@ -44,16 +45,19 @@ All results below were measured live on a 4-chip Google Cloud TPU `v6e-4` slice 
 | **Continuous Batch `B=128`** | 4-Chip TP BF16 (`OnChipEmb`) | Exact Top-1 | — | `14.71 ms` (`0.09 / 14.49 / 0.13`) | **68.0 tok/s** | **8,699.3 tok/s** |
 | **Continuous Batch `B=128`** | **4-Chip TP INT8 (`OnChipEmb`)** | **Exact Top-1** | — | **`13.94 ms`** (`0.09 / 13.73 / 0.12`) | **71.7 tok/s** | **9,180.0 tok/s** |
 
-### 3. Live Production OpenAI HTTP & SSE Serving (`haven-server --tpu`)
+### 3. Live Production OpenAI HTTP & Multi-Tenant SSE Serving (`haven-server --tpu`)
 
-Verified end-to-end over real HTTP/1.1 (`POST /v1/chat/completions`, `GET /health`, `GET /api/telemetry`) on 4x TPU `v6e-4` with full persona sampling (`temperature=0.45`, `top_p=0.90`, `min_p=0.05`, `repetition_penalty=1.08`) and multi-turn prefix KV cache reuse:
+Verified end-to-end over real HTTP/1.1 (`POST /v1/chat/completions`, `GET /health`, `GET /api/telemetry`) on 4x TPU `v6e-4` with both single-stream prefix caching (`--tpu-batch 1`) and lock-free multi-tenant continuous batching (`--tpu-batch 16/32/64` via `TpuContinuousBatchScheduler` with per-slot async `pos_vec[B]` and slot-targeted `S=128/32/16/8/1` MXU prefill):
 
-| `haven-server` Launch Flags | Endpoint Mode | HTTP TTFT | Total Request Time | Live HTTP Throughput |
-| :--- | :--- | ---: | ---: | ---: |
-| `--tpu --tpu-int8` (On-Chip Emb) | Non-Streaming JSON (80 tok) | — | `568.2 ms` | **140.8 tok/s** (end-to-end) |
-| `--tpu --tpu-int8` (On-Chip Emb) | Streaming SSE (78–81 tok) | `148.3 ms` | `541.1 ms` | **196.1 tok/s** |
-| `--tpu --tpu-int8 --tpu-host-emb` | Non-Streaming JSON (80 tok) | — | **`445.3 ms`** | **179.6 tok/s** (end-to-end) |
-| **`--tpu --tpu-int8 --tpu-host-emb`** | **Streaming SSE (69–74 tok)** | **`114.8 ms`** | **`408.8 ms`** | **248.3 tok/s** |
+| `haven-server` Launch Flags | Workload & Clients | HTTP TTFT | Wall Time (incl. Prefill) | Live HTTP Throughput | TPU Decode Step |
+| :--- | :--- | ---: | ---: | ---: | ---: |
+| `--tpu --tpu-int8 --tpu-host-emb` | 1 Client SSE (`B=1`, Full Sampler) | `114.8 ms` | `408.8 ms` (69–74t) | **248.3 tok/s** | `3.02 ms` |
+| `--tpu --tpu-int8 --tpu-batch 1` | 1 Client Multi-Turn Follow-up (`S=16/8` bucket) | **`62.6 ms`** | — | **119.7 tok/s** | `4.16 ms` |
+| `--tpu --tpu-int8 --tpu-batch 16` | **16 Concurrent Clients SSE** (Full Stochastic Sampler) | `426.1 ms` avg | `2.32 s` (1,536t) | **661.0 tok/s** (`41.3/cli`) | `4.16 ms` (`3,843/s` silicon) |
+| `--tpu --tpu-int8 --tpu-batch 32 --tpu-argmax` | **32 Concurrent Clients SSE** (On-Chip Argmax) | `706.0 ms` avg | `2.04 s` (4,096t) | **2,006.3 tok/s** (`62.7/cli`) | `5.22 ms` (`6,133/s` silicon) |
+| **`--tpu --tpu-int8 --tpu-batch 64 --tpu-argmax`** | **64 Concurrent Clients SSE** (On-Chip Argmax) | `1,383 ms` avg | `3.73 s` (8,192t) | **2,198.5 tok/s** (`34.4/cli`) | **`7.75 ms`** (`8,258/s` silicon) |
+
+*Async per-slot parity (`test-tpu-gemma4-onchip --async-slots-only`) verified 6/6 slots on real `v6e-4` silicon (`0.948–0.985` prefill cosine and `0.930–0.957` lockstep async Step-2 cosine across 262,144 logits vs F32 CPU for 3 distinct prompts at positions `133, 107, 106`, with `23.96 ms` 106-token slot prefill and zero cross-slot leakage).*
 
 See [BENCHMARKS.md](BENCHMARKS.md) for the complete `.hmb` memory scaling, AVX2/F16C SIMD (`34.81 GFLOPS`, `3.64x` speedup), sampler (`0.15 ms/tok`, `150x` speedup), plugin, and security verification matrices.
 
@@ -61,15 +65,15 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the complete `.hmb` memory scaling, AVX2/
 
 ## Architecture
 
-### Native Pure-C++20 TPU StableHLO Compiler (`HavenTpuGemma4Engine`)
+### Model-General Native Pure-C++20 TPU StableHLO Compiler (`HavenTpuGemma4Engine` + `TpuContinuousBatchScheduler`)
 
-`src/haven_tpu_gemma4.cpp` and `src/haven_tpu_pjrt.cpp` compile the entire 42-layer Gemma 4 transformer directly from C++20 into a single persistent StableHLO MLIR executable on TPU HBM3 with zero per-layer host round-trips:
+`src/haven_tpu_gemma4.cpp`, `src/haven_tpu_scheduler.cpp`, and `src/haven_tpu_pjrt.cpp` compile dense transformer architectures directly from `ModelConfig` + GGUF tensors into persistent StableHLO MLIR executables on TPU HBM3 with zero per-layer host round-trips:
 
-- **Full Gemma 4 Fidelity:** 35 SWA-512 + 4-Sink layers (`head_dim=256`) + 7 Global layers (`head_dim=512`), 24 KV-owning layers + 18 KV-shared layers (`24..41`), per-head Q/K/V RMSNorm, half-split RoPE with `rope_freqs.weight`, GeGLU FFN, 256-dim Pleias per-layer token injection, `layer_output_scale`, 262k LM head, and `30.0` final logit softcapping.
+- **Model-General Dense Transformer Compilation (`TpuModelSpec`):** Auto-derives layer topology directly from GGUF metadata and tensors for **Gemma 4** (SWA-512 + 4-Sink & Global RoPE, shared-KV, Pleias, GeGLU), **Gemma 2/3 & Ava 26B** (attention & final logit softcapping), **Llama 3/4** (Global GQA, SwiGLU/SiLU, untied embeddings), **Qwen 2.5/3** (QKV biases / QK-norm, SwiGLU/SiLU), **Mistral** (SWA-only, SwiGLU/SiLU), and **Phi-3/4** — CI-verified across 160 synthetic multi-arch StableHLO graphs (`--emit-only-synthetic`) on Linux GCC & Windows MSVC.
+- **Per-Slot `[B]` Async Positions & Slot-Targeted Multi-Bucket Prefill (`S=128/32/16/8/1`):** Decode graphs accept independent per-slot positions (`%pos_vec: tensor<Bxi32>`) with per-slot RoPE gather, per-slot causal/SWA masks, and in-place `stablehlo.scatter` KV updates; prefill graphs target a single `%slot_id` via `dynamic_slice`/`dynamic_update_slice` without disturbing any other active streaming user.
+- **Multi-Tenant Continuous-Batching Scheduler (`TpuContinuousBatchScheduler`):** Dedicated TPU worker thread multiplexes up to `128` concurrent OpenAI `/v1/chat/completions` HTTP/SSE streams lock-free (zero `engine_mutex_` contention), with parallel OpenMP per-slot stochastic sampling or 4-byte/slot on-chip argmax and immediate slot reclamation on client disconnect.
 - **4-Chip Optical ICI Megatron Tensor Parallelism:** Emits native `stablehlo.all_reduce` / `stablehlo.all_gather` over the 2x2 Trillium torus, automatically querying `PJRT_LoadedExecutable_AddressableDevices` to match XLA's physical ring assignment (`{0, 1, 3, 2}`).
-- **TPU `(8, 128)`-Aligned Donated KV Cache:** Stores KV tensors as `[N_kv, B, Hkv_sh, T, HD]` with `{tf.aliasing_output = 1..4 : i32}` in-place HBM3 buffer donation (eliminating 4x–8x sublane padding waste).
-- **On-Chip Sharded Embedding Gather & Argmax:** Uploads only `[B, S] int32` token IDs (`4 bytes` for `B=1`, `512 bytes` for `B=128`), reuses tied sharded `%w_lm_head` with zero extra HBM3, and supports either full 262k logits D2H (for stochastic sampling) or 4-byte-per-stream on-chip global argmax.
-- **W8A16 Per-Row INT8 Quantization:** OpenMP-parallel row-wise symmetric INT8 quantization cuts HBM3 weight traffic in half (~`4.4–7.6 GB` total) while maintaining exact Top-1 parity.
+- **TPU `(8, 128)`-Aligned Donated KV Cache & W8A16 INT8:** Stores KV tensors as `[N_kv, B, Hkv_sh, T, HD]` with `{tf.aliasing_output}` in-place HBM3 buffer donation and OpenMP row-wise symmetric INT8 weights (~`4.4–7.6 GB` total).
 
 ### 12-System Sovereign Architecture
 
@@ -214,23 +218,29 @@ cmake --build build -j $(nproc)
 ./build/haven-server --port 11436 --model path/to/haven-chat-v5.0.gguf
 ```
 
-**Cloud TPU v6e On-Chip Serving (4-Chip Optical ICI Tensor-Parallel, 248+ tok/s live SSE):**
+**Cloud TPU v6e On-Chip Serving (Single-User Interactive & Multi-Tenant Continuous Batching):**
 ```bash
-# Peak interactive B=1 HTTP/SSE streaming (248.3 tok/s) with full sampling
+# 1. Peak interactive B=1 HTTP/SSE streaming (248.3 tok/s, 62.6 ms follow-up TTFT)
 ./build/haven-server --port 11436 --model /tmp/haven-chat-v5.0.gguf \
   --tpu --tpu-int8 --tpu-host-emb
 
-# Or with on-chip sharded embedding gather (30k tok/s MXU prefill, 196.1 tok/s SSE)
+# 2. Multi-tenant continuous batching (16 concurrent clients, full stochastic sampling: 661 tok/s live SSE)
 ./build/haven-server --port 11436 --model /tmp/haven-chat-v5.0.gguf \
-  --tpu --tpu-int8 --tpu-replicas 4 --tpu-max-seq 2048
+  --tpu --tpu-int8 --tpu-batch 16
+
+# 3. High-throughput multi-tenant serving (32–64 concurrent clients, on-chip argmax: 2,006–2,198 tok/s live SSE)
+./build/haven-server --port 11436 --model /tmp/haven-chat-v5.0.gguf \
+  --tpu --tpu-int8 --tpu-batch 64 --tpu-argmax
 ```
 
 **Key `haven-server` Flags:**
 - `--host <ip>`, `--port <port>` — Bind address (default `127.0.0.1:11436`).
 - `--api-key <key>` — Enforce `Authorization: Bearer <key>` on API routes (or set `HAVEN_API_KEY`).
-- `--tpu` / `--tpu-onchip` — Enable full on-chip 42-layer TPU HBM3 serving (or set `HAVEN_TPU_ONCHIP=1`; automatically falls back to AVX2 CPU when no TPU is present).
+- `--tpu` / `--tpu-onchip` — Enable model-general full on-chip TPU HBM3 serving (or set `HAVEN_TPU_ONCHIP=1`; automatically falls back to AVX2 CPU when no TPU is present).
+- `--tpu-batch <1..128>` — Concurrent HBM3 KV slots (or `HAVEN_TPU_BATCH`; `1` = interactive w/ prefix cache, `2..128` = lock-free multi-tenant continuous batching).
 - `--tpu-replicas <1|2|4>` — Tensor-parallel TPU chips over Optical ICI (default: auto).
 - `--tpu-int8` / `--tpu-bf16` — Select W8A16 INT8 (default) or BF16 HBM3 weights.
+- `--tpu-argmax` — Use on-chip TPU argmax (`4B/slot` PCIe D2H) for peak multi-tenant throughput.
 - `--tpu-host-emb` — Use host-side embedding lookup for lowest single-stream `B=1` latency.
 - `--tpu-max-seq <N>` — Static HBM3 KV cache capacity (`256..8192`, default `2048`).
 - `--libtpu <path>` — Explicit path to `libtpu.so` (auto-discovered if omitted).
@@ -243,12 +253,15 @@ cmake --build build -j $(nproc)
 ./build/haven-cli --tpu path/to/haven-chat-v5.0.gguf    # Hardware topology & TPU probe
 ```
 
-### 3. TPU Silicon & Security Verification Binaries
+### 3. TPU Silicon, Scheduler & Security Verification Binaries
 ```bash
-# Offline StableHLO MLIR emitter verification (runs on any Windows/Linux CPU, zero TPU needed)
-./build/test-tpu-gemma4-onchip --emit-only path/to/haven-chat-v5.0.gguf
+# Offline zero-GGUF multi-arch StableHLO IR verification (Gemma 4, Llama 3, Qwen 2.5, Mistral, Gemma 2 — 160 graphs!)
+./build/test-tpu-gemma4-onchip --emit-only-synthetic
 
-# Full 42-layer Cloud TPU v6e parity + 1-chip/4-chip + B=1..128 continuous batching suite
+# Offline multi-tenant continuous-batching scheduler concurrency & cancellation test
+./build/test-tpu-scheduler
+
+# Full Cloud TPU v6e async per-slot parity + 1-chip/4-chip + B=1..128 benchmark suite
 ./build/test-tpu-gemma4-onchip /tmp/haven-chat-v5.0.gguf
 
 # Pure C++20 StableHLO BF16 MXU PFLOPS & GeGLU/LM-Head benchmark

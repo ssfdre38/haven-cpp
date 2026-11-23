@@ -21,7 +21,8 @@ Tests span both **worst-case local host hardware** (6-core Xeon CPU + mechanical
 | • TPU Continuous Batching:  9,180.0 tok/s end-to-end (B=128, INT8, OnChipEmb)     |
 | • TPU Batched MXU Prefill:  30,181 tok/s (4.24 ms for 128 tokens, 4-chip INT8)    |
 | • TPU Interactive Decode:   330.8 tok/s (3.02 ms/step, 24.81 ms 133-tok TTFT)     |
-| • Live TPU HTTP/SSE Server: 248.3 tok/s live streaming (full persona sampling)    |
+| • Live Single HTTP/SSE:     248.3 tok/s streaming (62.6 ms multi-turn TTFT)       |
+| • Live Multi-Tenant SSE:    2,198.5 tok/s over 64 concurrent HTTP/SSE sockets     |
 | • 262k Top-Tail Sampler:    0.15 ms/tok (150x speedup vs 22.6 ms full-vocab sort) |
 | • AVX2/F16C SIMD Kernel:    34.81 GFLOPS (3.64x speedup over 9.57 GFLOPS)         |
 | • 64-Bit Memory Scaling:    100,000 memories scanned in 9.86 ms on CPU (71.3 MB)  |
@@ -166,14 +167,20 @@ CPU Ground Truth (`180-vCPU EPYC 9B14`, `OMP=48`): 133-token prompt prefill in `
 | `3E` | 4-Chip TP `B=128` BF16 | OnChipEmb | Exact Top-1 | — | `14.71 ms` (`0.09 / 14.49 / 0.13`) | **68.0 tok/s** | **8,699.3 tok/s** |
 | **`3D`** | **4-Chip TP `B=128` INT8** | **OnChipEmb** | **Exact Top-1** | — | **`13.94 ms`** (`0.09 / 13.73 / 0.12`) | **71.7 tok/s** | **9,180.0 tok/s** |
 
-### 6C. Live OpenAI HTTP/SSE Server (`haven-server --tpu`, Full Persona Sampling)
+### 6C. Live OpenAI HTTP/SSE Server (`haven-server --tpu`, Single-User & Multi-Tenant Continuous Batching)
 
-| Server Configuration | Endpoint Mode (`temp=0.45, top_p=0.90, min_p=0.05`) | HTTP TTFT | Total HTTP Time | Live Throughput |
-| :--- | :--- | ---: | ---: | ---: |
-| `--tpu --tpu-int8` (OnChipEmb) | Non-Streaming JSON (80 tokens) | — | `568.2 ms` | **140.8 tok/s** |
-| `--tpu --tpu-int8` (OnChipEmb) | Streaming SSE (78–81 tokens, T1 & Prefix T2) | `148.3 ms` | `541.1 ms` | **196.1 tok/s** |
-| `--tpu --tpu-int8 --tpu-host-emb` | Non-Streaming JSON (80 tokens) | — | **`445.3 ms`** | **179.6 tok/s** |
-| **`--tpu --tpu-int8 --tpu-host-emb`** | **Streaming SSE (69–74 tokens, T1 & Prefix T2)** | **`114.8 ms`** | **`408.8 ms`** | **248.3 tok/s** |
+| Server Configuration | Workload & Clients | HTTP TTFT | Total Wall Time | Live HTTP Throughput | TPU Decode Step |
+| :--- | :--- | ---: | ---: | ---: | ---: |
+| `--tpu --tpu-int8` (OnChipEmb) | 1 Client JSON (80 tokens, Full Sampler) | — | `568.2 ms` | **140.8 tok/s** | `4.16 ms` |
+| `--tpu --tpu-int8` (OnChipEmb) | 1 Client SSE (78–81 tokens, Full Sampler) | `148.3 ms` | `541.1 ms` | **196.1 tok/s** | `4.16 ms` |
+| `--tpu --tpu-int8 --tpu-host-emb` | 1 Client JSON (80 tokens, Full Sampler) | — | **`445.3 ms`** | **179.6 tok/s** | `3.02 ms` |
+| **`--tpu --tpu-int8 --tpu-host-emb`** | **1 Client SSE (69–74 tokens, Full Sampler)** | **`114.8 ms`** | **`408.8 ms`** | **248.3 tok/s** | **`3.02 ms`** |
+| `--tpu --tpu-int8 --tpu-batch 1` | 1 Client Turn 2 Follow-up (`S=128/32/16/8` buckets) | **`62.63 ms`** | — | **119.7 tok/s** | `4.16 ms` |
+| `--tpu --tpu-int8 --tpu-batch 16` | **16 Concurrent SSE Clients** (Full Stochastic Sampler, avg batch `14.68`) | `426.1 ms` avg | `2.32 s` (1,536t) | **661.0 tok/s** (`41.3/cli`) | `4.16 ms` (`3,843/s` silicon) |
+| `--tpu --tpu-int8 --tpu-batch 32 --tpu-argmax` | **32 Concurrent SSE Clients** (On-Chip Argmax, avg batch `29.72`) | `706.0 ms` avg | `2.04 s` (4,096t) | **2,006.3 tok/s** (`62.7/cli`) | `5.22 ms` (`6,133/s` silicon) |
+| **`--tpu --tpu-int8 --tpu-batch 64 --tpu-argmax`** | **64 Concurrent SSE Clients** (On-Chip Argmax, avg batch `58.95`) | `1,383.2 ms` avg | `3.73 s` (8,192t) | **2,198.5 tok/s** (`34.4/cli`) | **`7.75 ms`** (`8,258/s` silicon) |
+
+*Async Per-Slot Parity (`test-tpu-gemma4-onchip --async-slots-only` on 4x `v6e-4`, BF16, `pos_vec = {133, 107, 106, 0}`): 6/6 slots PASS against F32 CPU ground truth (`0.984932 / 0.981128 / 0.947977` prefill 262k-logit cosine; `0.956526 / 0.949569 / 0.930302` lockstep async Step-2 cosine; `23.96 ms` 106-token slot prefill; zero cross-slot leakage). GitHub Actions CI (`linux-gcc` + `windows-msvc`) also verifies 160 synthetic multi-architecture StableHLO graphs (`Gemma 4`, `Llama 3`, `Qwen 2.5`, `Mistral`, `Gemma 2`) and `test-tpu-scheduler` on every push.*
 
 ### 6D. Adversarial Security, Cryptography & Fuzz Verification (`test-security-fuzz`)
 
