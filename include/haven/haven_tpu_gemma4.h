@@ -209,7 +209,8 @@ private:
                        const std::vector<uint32_t>& flat_tokens,
                        const std::vector<int>& pos_per_slot,
                        std::vector<float>* out_logits,
-                       std::vector<uint32_t>& out_next_tokens);
+                       std::vector<uint32_t>& out_next_tokens,
+                       int valid_last = -1);
 };
 
 } // namespace haven
