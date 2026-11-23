@@ -674,15 +674,14 @@ int main(int argc, char** argv) {
             run_config_bench("M7. Ava 26B-A4B Batch B=128 (8-Chip v6e-8 BF16)",               8, 128, false, false, 64,  0,   true);
             run_config_bench("M2. Ava 26B-A4B Interactive (8-Chip v6e-8 BF16 OnChipEmb)",     8, 1,   false, false, 128, 128, true);
         } else if (n_devs >= 4) {
-            run_config_bench("M4C. Ava 26B-A4B Interactive (4-Chip Hadamard INT8 + FP8-KV)",     4, 1,   true,  false, 128, 128, true,  true);
-            run_config_bench("M4C-P. Ava 26B-A4B Hadamard INT8 + FP8-KV Parity (FullLogits)", 4, 1,   true,  true,  32,  128, true,  true);
-            run_config_bench("M4C-H. Ava 26B-A4B Hadamard INT8 + BF16-KV Parity (FullLogits)",4, 1,   true,  true,  32,  128, true,  false);
-            run_config_bench("M4D. Ava 26B-A4B Batch B=32 (4-Chip Hadamard INT8 + FP8-KV)",   4, 32,  true,  false, 64,  0,   true,  true);
-            run_config_bench("M4E. Ava 26B-A4B Batch B=64 (4-Chip Hadamard INT8 + FP8-KV)",   4, 64,  true,  false, 64,  0,   true,  true);
-            run_config_bench("M4F. Ava 26B-A4B Batch B=128 (4-Chip Hadamard INT8 + FP8-KV)",  4, 128, true,  false, 64,  0,   true,  true);
-            run_config_bench("M4H. Ava 26B-A4B Batch B=256 (4-Chip Hadamard INT8 + FP8-KV)",  4, 256, true,  false, 64,  0,   true,  true);
-            run_config_bench("M4G. Ava 26B-A4B Batch B=128 (4-Chip Pure BF16)",               4, 128, false, false, 64,  0,   true,  false);
-            run_config_bench("M4B. Ava 26B-A4B Interactive (4-Chip Pure BF16 OnChipEmb)",     4, 1,   false, false, 128, 128, true,  false);
+            run_config_bench("M4C. Ava 26B-A4B Interactive (4-Chip Hadamard INT8 + Sparse-Top8)",    4, 1,   true,  false, 128, 128, true,  false);
+            run_config_bench("M4C-P. Ava 26B-A4B Hadamard INT8 + BF16-KV Parity (FullLogits)",      4, 1,   true,  true,  32,  128, true,  false);
+            run_config_bench("M4D. Ava 26B-A4B Batch B=32 (4-Chip Hadamard INT8 + Sparse-Top8)",    4, 32,  true,  false, 64,  0,   true,  false);
+            run_config_bench("M4E. Ava 26B-A4B Batch B=64 (4-Chip Hadamard INT8 + Sparse-Top8)",    4, 64,  true,  false, 64,  0,   true,  false);
+            run_config_bench("M4F. Ava 26B-A4B Batch B=128 (4-Chip Hadamard INT8 + Sparse-Top8)",   4, 128, true,  false, 64,  0,   true,  false);
+            run_config_bench("M4H. Ava 26B-A4B Batch B=256 (4-Chip Hadamard INT8 + BF16-KV!!)",     4, 256, true,  false, 64,  0,   true,  false);
+            run_config_bench("M4G. Ava 26B-A4B Batch B=128 (4-Chip Pure BF16)",                     4, 128, false, false, 64,  0,   true,  false);
+            run_config_bench("M4B. Ava 26B-A4B Interactive (4-Chip Pure BF16 OnChipEmb)",           4, 1,   false, false, 128, 128, true,  false);
         } else {
             run_config_bench("M1A. Ava 26B-A4B Single-Chip (1-Chip W8A16 INT8)",              1, 1,   true,  false, 64,  128, true);
         }
