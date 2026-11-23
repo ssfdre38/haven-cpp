@@ -12,7 +12,7 @@
 
 `haven-cpp` is a standalone, zero-Python AI inference engine and multi-tenant Cloud TPU server built from scratch in pure C++20. It scales seamlessly from a single local workstation CPU (`AVX2/FMA/F16C`) or Apple Silicon (`MLX`) all the way to bare-metal **Google Cloud TPU v6e (Trillium)** slices via direct `dlopen("libtpu.so")` calls over OpenXLA's PJRT C ABI (`0.75`).
 
-On real 4-chip Cloud TPU `v6e-4` hardware running the full 42-layer Gemma 4 model (`haven-chat-v5.0.gguf`, 262,144 vocabulary, Pleias per-layer injection), `haven-cpp` achieves **2.865 PFLOPS** BF16 MXU compute, **30,181 tok/s** batched prefill, **330.8 tok/s** interactive single-stream decode, **248.3 tok/s** single-user HTTP/SSE streaming (**62.6 ms** multi-turn follow-up TTFT), **2,198.5 tok/s** live multi-tenant concurrent HTTP/SSE serving across 64 simultaneous sockets (**8,258 tok/s** steady-state silicon step), and **9,180.0 tok/s** aggregate continuous-batching throughput (`B=128`) — with zero Python, JAX, or PyTorch runtime dependencies.
+On real 4-chip Cloud TPU `v6e-4` hardware, `haven-cpp` achieves **2.865 PFLOPS** BF16 MXU compute with zero Python, JAX, or PyTorch runtime dependencies — delivering **9,180.0 tok/s** continuous batching (`B=128`), **30,181 tok/s** batched prefill, **330.8 tok/s** interactive decode, and **2,198.5 tok/s** live 64-client HTTP/SSE on 42-layer Gemma 4 E4B (`haven-chat-v5.0.gguf`), **and** natively compiling **26.3B Mixture-of-Experts** (`ava-26b-turbo-iq4xs-v2.gguf`, 128 experts / Top-8, `IQ4_XS` / `IQ4_NL` / `Q5_1`) directly into StableHLO for **223.0 tok/s** interactive decode (**0.9972** 262k-logit cosine parity), **9,014 tok/s** MXU prefill (`14.2 ms`), **180.4 tok/s** live HTTP/SSE, and **905.3 tok/s** batched decode (**1.81x–2.37x faster than Ava's prior 8-chip JAX run on half the chips**).
 
 ---
 
@@ -59,6 +59,22 @@ Verified end-to-end over real HTTP/1.1 (`POST /v1/chat/completions`, `GET /healt
 
 *Async per-slot parity (`test-tpu-gemma4-onchip --async-slots-only`) verified 6/6 slots on real `v6e-4` silicon (`0.948–0.985` prefill cosine and `0.930–0.957` lockstep async Step-2 cosine across 262,144 logits vs F32 CPU for 3 distinct prompts at positions `133, 107, 106`, with `23.96 ms` 106-token slot prefill and zero cross-slot leakage).*
 
+### 4. Native 26.3B Mixture-of-Experts on Cloud TPU `v6e-4` (`ava-26b-turbo-iq4xs-v2.gguf`, 128 Experts / Top-8)
+
+Measured live on 4-chip Cloud TPU `v6e-4` (`us-east1-d`, 128 GB HBM3, zero Python) running real **Ava 26B-A4B MoE** weights (30 Gemma 4 MoE layers, 128 routed experts / Top-8 active + parallel shared dense MLP, `Hkv=8` SWA-256 / `Hkv=2` Global-512 `k_eq_v`, `IQ4_XS` / `IQ4_NL` / `Q5_1` GGUF). Per-layer XLA-native MXU layouts + direct `B=1` `dynamic_slice` Top-8 HBM3 routing + fused W8A16 down-GEMM verified **6/6 async per-slot parity (`0.990–0.999` 262k-logit cosine vs F32 CPU, exact Top-1 `100 == 100`)**:
+
+| Workload (Ava 26B-A4B MoE, 4x `v6e-4`) | Precision & Mode | Parity vs CPU | `S=128` MXU Prefill | Step Latency (H2D / TPU / D2H) | Throughput |
+| :--- | :--- | :---: | ---: | :--- | ---: |
+| Prior 8-Chip JAX Baseline (`v6e-8`) | 8x TPU v6e BF16 (Python/JAX) | — | — | `~8.1–10.6 ms` | `94.2–123.2 tok/s` |
+| **On-Chip `B=1` BF16 (FullLogits)** | 4-Chip TP BF16 (`47.12 GB`) | **`0.998697`** / Exact | `14.86 ms` (`8,616 tok/s`) | `5.36 ms` (`0.08 / 4.82 / 0.45`) | **186.6 tok/s** (`99.2 ms` TTFT) |
+| **On-Chip `B=1` BF16 (Argmax)** | 4-Chip TP BF16 (`47.12 GB`) | Exact Top-1 | **`14.20 ms` (`9,014 tok/s`)** | `4.99 ms` (`0.09 / 4.79 / 0.11`) | **200.2 tok/s** (`208.8` silicon) |
+| **On-Chip `B=1` W8A16 INT8 (FullLogits)** | 4-Chip TP INT8 (`23.65 GB`) | **`0.997189`** / Exact | `20.92 ms` (`6,120 tok/s`) | `4.87 ms` (`0.09 / 4.32 / 0.46`) | **205.2 tok/s** |
+| **On-Chip `B=1` W8A16 INT8 (Argmax)** | **4-Chip TP INT8 (`5.91 GB/chip`)** | **Exact Top-1** | `20.44 ms` (`6,263 tok/s`) | **`4.49 ms`** (`0.09 / 4.28 / 0.11`) | **223.0 tok/s** (`233.6` silicon) |
+| **Continuous Batch `B=32`** | 4-Chip TP W8A16 INT8 | Exact Top-1 | — | `35.35 ms` (`0.11 / 35.09 / 0.15`) | **905.3 tok/s** (`28.3/user`) |
+| **Live `haven-server` HTTP/SSE (`B=1`)** | 1 Client SSE (Full Sampler) | Coherent Ava | — | `110.5 ms` HTTP TTFT | **180.4 tok/s** |
+| **Live `haven-server` HTTP/SSE (`B=16`)** | 16 Concurrent Clients (Full Sampler) | Coherent Ava | — | `703.3 ms` avg TTFT | **344.5 tok/s** (`21.5/cli`) |
+| **Live `haven-server` HTTP/SSE (`B=64`)** | 64 Concurrent Clients (Argmax) | Coherent Ava | — | `2,660 ms` avg TTFT | **496.6 tok/s** (`7.8/cli`) |
+
 See [BENCHMARKS.md](BENCHMARKS.md) for the complete `.hmb` memory scaling, AVX2/F16C SIMD (`34.81 GFLOPS`, `3.64x` speedup), sampler (`0.15 ms/tok`, `150x` speedup), plugin, and security verification matrices.
 
 ---
@@ -69,10 +85,10 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the complete `.hmb` memory scaling, AVX2/
 
 `src/haven_tpu_gemma4.cpp`, `src/haven_tpu_scheduler.cpp`, and `src/haven_tpu_pjrt.cpp` compile dense transformer architectures directly from `ModelConfig` + GGUF tensors into persistent StableHLO MLIR executables on TPU HBM3 with zero per-layer host round-trips:
 
-- **Model-General Dense Transformer Compilation (`TpuModelSpec`):** Auto-derives layer topology directly from GGUF metadata and tensors for **Gemma 4** (SWA-512 + 4-Sink & Global RoPE, shared-KV, Pleias, GeGLU), **Gemma 2/3 & Ava 26B** (attention & final logit softcapping), **Llama 3/4** (Global GQA, SwiGLU/SiLU, untied embeddings), **Qwen 2.5/3** (QKV biases / QK-norm, SwiGLU/SiLU), **Mistral** (SWA-only, SwiGLU/SiLU), and **Phi-3/4** — CI-verified across 160 synthetic multi-arch StableHLO graphs (`--emit-only-synthetic`) on Linux GCC & Windows MSVC.
+- **Model-General Dense + Sparse MoE Compilation (`TpuModelSpec`):** Auto-derives layer topology directly from GGUF metadata and tensors for **Gemma 4 E4B** (SWA-512 + 4-Sink & Global RoPE, shared-KV, Pleias, GeGLU), **Gemma 4 26B-A4B MoE / Ava 26B** (128 experts / Top-8 via `stablehlo.sort`, direct `B=1` `dynamic_slice` HBM3 routing, fused MXU-native per-layer expert GEMMs, per-layer GQA & `k_eq_v`), **Gemma 2/3**, **Llama 3/4**, **Qwen 2.5/3**, **Mistral**, and **Phi-3/4** — CI-verified across **260** synthetic multi-arch StableHLO graphs (`--emit-only-synthetic`) on Linux GCC & Windows MSVC.
 - **Per-Slot `[B]` Async Positions & Slot-Targeted Multi-Bucket Prefill (`S=128/32/16/8/1`):** Decode graphs accept independent per-slot positions (`%pos_vec: tensor<Bxi32>`) with per-slot RoPE gather, per-slot causal/SWA masks, and in-place `stablehlo.scatter` KV updates; prefill graphs target a single `%slot_id` via `dynamic_slice`/`dynamic_update_slice` without disturbing any other active streaming user.
 - **Multi-Tenant Continuous-Batching Scheduler (`TpuContinuousBatchScheduler`):** Dedicated TPU worker thread multiplexes up to `128` concurrent OpenAI `/v1/chat/completions` HTTP/SSE streams lock-free (zero `engine_mutex_` contention), with parallel OpenMP per-slot stochastic sampling or 4-byte/slot on-chip argmax and immediate slot reclamation on client disconnect.
-- **4-Chip Optical ICI Megatron Tensor Parallelism:** Emits native `stablehlo.all_reduce` / `stablehlo.all_gather` over the 2x2 Trillium torus, automatically querying `PJRT_LoadedExecutable_AddressableDevices` to match XLA's physical ring assignment (`{0, 1, 3, 2}`).
+- **1/2/4/8-Chip Optical ICI Megatron Tensor Parallelism:** Emits native `stablehlo.all_reduce` / `stablehlo.all_gather` over Trillium optical torus topologies (including fused single-sync Shared-MLP + Sparse-MoE AllReduce), automatically querying `PJRT_LoadedExecutable_AddressableDevices` to match XLA's physical ring assignment.
 - **TPU `(8, 128)`-Aligned Donated KV Cache & W8A16 INT8:** Stores KV tensors as `[N_kv, B, Hkv_sh, T, HD]` with `{tf.aliasing_output}` in-place HBM3 buffer donation and OpenMP row-wise symmetric INT8 weights (~`4.4–7.6 GB` total).
 
 ### 12-System Sovereign Architecture
