@@ -69,7 +69,7 @@ struct TpuModelSpec {
     std::vector<int>  layer_kv_idx;
 
     int num_kv_buffers() const {
-        return (num_swa_kv_layers > 0 ? 2 : 0) + (num_glob_kv_layers > 0 ? 2 : 0);
+        return 2 * num_swa_kv_layers + 2 * num_glob_kv_layers;
     }
 
     // Derive exact TPU execution graph specification from a loaded HavenEngine
@@ -189,7 +189,8 @@ private:
     // Per-replica persistent HBM3 weight buffers (constant across all steps)
     std::vector<std::vector<PJRT_Buffer*>> replica_weight_bufs_;
 
-    // Per-replica mutable HBM3 KV cache buffers: [k_swa, v_swa] and/or [k_glob, v_glob]
+    // Per-replica mutable donated 4D HBM3 KV cache buffers:
+    // [ks_0, vs_0, ..., ks_{N_swa_kv-1}, vs_{N_swa_kv-1}, kg_0, vg_0, ..., kg_{N_glob_kv-1}, vg_{N_glob_kv-1}]
     std::vector<std::vector<PJRT_Buffer*>> replica_kv_bufs_;
 
     // Pre-allocated host scratch buffers for zero-malloc per-step embedding lookup

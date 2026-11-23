@@ -74,6 +74,10 @@ static bool validate_mlir_module(const std::string& ir, const std::string& label
         std::cerr << "  [FAIL] Expected stablehlo.sort + %w_moe_gu_0 for Sparse MoE in " << label << "\n";
         return false;
     }
+    if (ir.find("%kv_ks_0") == std::string::npos && ir.find("%kv_kg_0") == std::string::npos) {
+        std::cerr << "  [FAIL] Expected per-layer 4D KV buffer (%kv_ks_0 / %kv_kg_0) in " << label << "\n";
+        return false;
+    }
     return true;
 }
 
@@ -210,7 +214,7 @@ static int run_synthetic_multi_arch_ir_suite() {
         const bool is_moe = (ac.mc.expert_count > 0);
         std::vector<int> replicas = is_moe ? std::vector<int>{1, 4, 8} : std::vector<int>{1, 4};
         for (int R : replicas) {
-            for (int B : {1, 16}) {
+            for (int B : {1, 16, 128}) {
                 for (bool i8 : {false, true}) {
                     TpuGemma4Config cfg;
                     cfg.batch_size = B;
@@ -240,7 +244,7 @@ static int run_synthetic_multi_arch_ir_suite() {
                 }
             }
         }
-        std::cout << "  [PASS] " << ac.name << " (R=" << (is_moe ? "1,4,8" : "1,4") << " | B=1,16 | BF16,INT8 | Decode + Slot-Prefill S=8,16,32,128)\n";
+        std::cout << "  [PASS] " << ac.name << " (R=" << (is_moe ? "1,4,8" : "1,4") << " | B=1,16,128 | BF16,INT8 | Decode + Slot-Prefill S=8,16,32,128)\n";
     }
 
     std::cout << "ALL " << total_checks << " SYNTHETIC MULTI-ARCH STABLEHLO GRAPHS VERIFIED!\n";
@@ -656,12 +660,12 @@ int main(int argc, char** argv) {
             run_config_bench("M1. Ava 26B-A4B Parity Check (8-Chip v6e-8 BF16 FullLogits)",    8, 1,   false, true,  64,  128, true);
             run_config_bench("M2. Ava 26B-A4B Interactive (8-Chip v6e-8 BF16 OnChipEmb)",     8, 1,   false, false, 128, 128, true);
             run_config_bench("M3. Ava 26B-A4B Interactive (8-Chip v6e-8 W8A16 INT8)",         8, 1,   true,  false, 128, 128, true);
+            run_config_bench("M3-P. Ava 26B-A4B INT8 Parity Check (8-Chip v6e-8 FullLogits)", 8, 1,   true,  true,  32,  128, true);
             run_config_bench("M4. Ava 26B-A4B Batch B=32 (8-Chip v6e-8 W8A16 INT8)",          8, 32,  true,  false, 64,  0,   true);
             run_config_bench("M5. Ava 26B-A4B Batch B=64 (8-Chip v6e-8 W8A16 INT8)",          8, 64,  true,  false, 64,  0,   true);
             run_config_bench("M6. Ava 26B-A4B Batch B=128 (8-Chip v6e-8 W8A16 INT8)",         8, 128, true,  false, 64,  0,   true);
             run_config_bench("M7. Ava 26B-A4B Batch B=128 (8-Chip v6e-8 BF16)",               8, 128, false, false, 64,  0,   true);
-        }
-        if (n_devs >= 4) {
+        } else if (n_devs >= 4) {
             run_config_bench("M4A. Ava 26B-A4B Parity Check (4-Chip v6e-4 BF16 FullLogits)",  4, 1,   false, true,  64,  128, true);
             run_config_bench("M4B. Ava 26B-A4B Interactive (4-Chip v6e-4 BF16 OnChipEmb)",    4, 1,   false, false, 128, 128, true);
             run_config_bench("M4C. Ava 26B-A4B Interactive (4-Chip v6e-4 W8A16 INT8)",        4, 1,   true,  false, 128, 128, true);
