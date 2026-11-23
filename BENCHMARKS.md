@@ -22,8 +22,8 @@ Tests span both **worst-case local host hardware** (6-core Xeon CPU + mechanical
 | • TPU Batched MXU Prefill:  30,181 tok/s (4.24 ms for 128 tokens, 4-chip INT8)    |
 | • TPU Interactive Decode:   330.8 tok/s (3.02 ms/step, 24.81 ms 133-tok TTFT)     |
 | • Live Single HTTP/SSE:     248.3 tok/s streaming (62.6 ms multi-turn TTFT)       |
-| • Live Multi-Tenant SSE:    2,198.5 tok/s over 64 concurrent HTTP/SSE sockets     |
-| • Ava 26B-A4B MoE (v6e-4):  223.0 tok/s B=1 INT8 (0.9972 cos) | 9,014 tok/s PF   |
+| • Live Multi-Tenant SSE:    2,872.9 tok/s (Ava 26B) / 2,198.5 tok/s (Gemma 4 E4B)   |
+| • Ava 26B-A4B MoE (v6e-4):  7,805.8 tok/s B=128 | 232.6 B=1 (0.9978 cos) | 8.8ms TTFT|
 | • 262k Top-Tail Sampler:    0.15 ms/tok (150x speedup vs 22.6 ms full-vocab sort) |
 | • AVX2/F16C SIMD Kernel:    34.81 GFLOPS (3.64x speedup over 9.57 GFLOPS)         |
 | • 64-Bit Memory Scaling:    100,000 memories scanned in 9.86 ms on CPU (71.3 MB)  |
@@ -181,25 +181,27 @@ CPU Ground Truth (`180-vCPU EPYC 9B14`, `OMP=48`): 133-token prompt prefill in `
 | `--tpu --tpu-int8 --tpu-batch 32 --tpu-argmax` | **32 Concurrent SSE Clients** (On-Chip Argmax, avg batch `29.72`) | `706.0 ms` avg | `2.04 s` (4,096t) | **2,006.3 tok/s** (`62.7/cli`) | `5.22 ms` (`6,133/s` silicon) |
 | **`--tpu --tpu-int8 --tpu-batch 64 --tpu-argmax`** | **64 Concurrent SSE Clients** (On-Chip Argmax, avg batch `58.95`) | `1,383.2 ms` avg | `3.73 s` (8,192t) | **2,198.5 tok/s** (`34.4/cli`) | **`7.75 ms`** (`8,258/s` silicon) |
 
-*Async Per-Slot Parity (`test-tpu-gemma4-onchip --async-slots-only` on 4x `v6e-4`, BF16, `pos_vec = {133, 107, 106, 0}`): 6/6 slots PASS against F32 CPU ground truth (`0.984932 / 0.981128 / 0.947977` prefill 262k-logit cosine; `0.956526 / 0.949569 / 0.930302` lockstep async Step-2 cosine; `23.96 ms` 106-token slot prefill; zero cross-slot leakage). GitHub Actions CI (`linux-gcc` + `windows-msvc`) also verifies 260 synthetic multi-architecture StableHLO graphs (`Gemma 4 E4B`, `Ava 26B-A4B MoE`, `Llama 3`, `Qwen 2.5`, `Mistral`, `Gemma 2`) and `test-tpu-scheduler` on every push.*
+*Async Per-Slot Parity (`test-tpu-gemma4-onchip --async-slots-only` on 4x `v6e-4`, BF16, `pos_vec = {133, 107, 106, 0}`): 6/6 slots PASS against F32 CPU ground truth (`0.984932 / 0.981128 / 0.947977` prefill 262k-logit cosine; `0.956526 / 0.949569 / 0.930302` lockstep async Step-2 cosine; `23.96 ms` 106-token slot prefill; zero cross-slot leakage). GitHub Actions CI (`linux-gcc` + `windows-msvc`) also verifies 390 synthetic multi-architecture StableHLO graphs (`Gemma 4 E4B`, `Ava 26B-A4B MoE`, `Llama 3`, `Qwen 2.5`, `Mistral`, `Gemma 2`) and `test-tpu-scheduler` on every push.*
 
 ### 6D. Native 26.3B Mixture-of-Experts on Cloud TPU `v6e-4` (`ava-26b-turbo-iq4xs-v2.gguf`, 128 Experts / Top-8)
 
-Measured live on 4-chip Cloud TPU `v6e-4` (`us-east1-d`, 128 GB HBM3, 180-vCPU EPYC 9B14 host, commit `ce456ea`) using real `ava-26b-turbo-iq4xs-v2.gguf` (30 Gemma 4 26B-A4B MoE layers, 128 experts / Top-8 + shared dense FFN, `Hkv=8` SWA-256 / `Hkv=2` Global-512 `k_eq_v`, `IQ4_XS` / `IQ4_NL` / `Q5_1`):
+Measured live on 4-chip Cloud TPU `v6e-4` (`europe-west4-a`, 128 GB HBM3, 180-vCPU EPYC 9B14 host, commit `a441e3d`) using real `ava-26b-turbo-iq4xs-v2.gguf` (30 Gemma 4 26B-A4B MoE layers, 128 experts / Top-8 + shared dense FFN, `Hkv=8` SWA-256 / `Hkv=2` Global-512 `k_eq_v`, `IQ4_XS` / `IQ4_NL` / `Q5_1`). Powered by per-layer coalesced 3D `[B, T_kv, KV_sh]` donated KV caches, 4-sink-preserving SWA ring buffers, hybrid hardware `W8A8` (`i8×i8→i32`) Gate+Up + fused `W8A16` Down MoE GEMMs, zero-copy 1-slot KV isolation, and single-shot padded prefill (`%valid_last`):
 
-- **6/6 Async Per-Slot Parity vs F32 CPU (`pos_vec = {107, 57, 56, 0}`):** Slot 0 `0.998697 / 0.997405`, Slot 1 `0.997442 / 0.990249`, Slot 2 `0.994877 / 0.995879` across all 262,144 vocab logits; exact Top-1 `100 == 100` (`"<|channel>"` -> `"thought"`)!
-- **Per-Chip Speedup vs Prior 8-Chip `v6e-8` JAX Baseline (`94.2–123.21 tok/s`):** `223.0 tok/s` on 4 chips = **1.81x–2.37x faster wall-clock on half the chips (`3.62x–4.73x` per-chip speedup)**.
+- **6/6 Async Per-Slot Parity vs F32 CPU (`pos_vec = {107, 57, 56, 0}`):** Slot 0 `0.995809 / 0.995644`, Slot 1 `0.998252 / 0.994509` (`20.1 ms`), Slot 2 `0.996748 / 0.995127` (`15.6 ms`) across all 262,144 vocab logits; exact Top-1 `100 == 100` (`"<|channel>"` -> `"thought"`).
+- **Per-Chip Speedup vs Prior 8-Chip `v6e-8` JAX Baseline (`94.2–123.21 tok/s`):** `232.6 tok/s` on 4 chips = **1.89x–2.47x faster wall-clock on half the chips (`3.78x–4.94x` per-chip speedup)**, while `B=128` reaches **7,805.8 tok/s** (**85% of 42L Gemma 4 E4B**) and 64-client live HTTP/SSE reaches **2,872.9 tok/s** (**1.31x faster than Gemma 4 E4B's 2,198.5 tok/s!**).
 
 | Config | Silicon & Precision | Parity vs CPU | `S=128` MXU Prefill | Step Latency (H2D / TPU / D2H) | Throughput |
 | :--- | :--- | :---: | ---: | :--- | ---: |
-| `M4A` | 4-Chip BF16 (`47.12 GB`, FullLogits) | **`0.998697`** / Exact | `14.86 ms` (`8,616 tok/s`) | `5.36 ms` (`0.08 / 4.82 / 0.45`) | **186.6 tok/s** (`99.2 ms` TTFT) |
-| `M4B` | 4-Chip BF16 (`47.12 GB`, Argmax) | Exact Top-1 | **`14.20 ms` (`9,014 tok/s`)** | `4.99 ms` (`0.09 / 4.79 / 0.11`) | **200.2 tok/s** (`208.8` silicon) |
-| `M4C-P` | 4-Chip W8A16 INT8 (`23.65 GB`, FullLogits) | **`0.997189`** / Exact | `20.92 ms` (`6,120 tok/s`) | `4.87 ms` (`0.09 / 4.32 / 0.46`) | **205.2 tok/s** |
-| **`M4C`** | **4-Chip W8A16 INT8 (`5.91 GB/chip`, Argmax)** | **Exact Top-1** | `20.44 ms` (`6,263 tok/s`) | **`4.49 ms`** (`0.09 / 4.28 / 0.11`) | **223.0 tok/s** (`233.6` silicon) |
-| `M4D` | 4-Chip Continuous Batch `B=32` INT8 | Exact Top-1 | — | `35.35 ms` (`0.11 / 35.09 / 0.15`) | **905.3 tok/s** (`28.3/user`) |
-| `HTTP-1` | Live `haven-server` `B=1` INT8 Full Sampler | Coherent Ava | — | `110.49 ms` HTTP TTFT | **180.4 tok/s** |
-| `HTTP-16` | Live `haven-server` `B=16` INT8 Full Sampler | Coherent Ava | — | `703.3 ms` avg TTFT | **344.5 tok/s** (`21.5/cli`) |
-| `HTTP-64` | Live `haven-server` `B=64` INT8 Argmax | Coherent Ava | — | `2,660.1 ms` avg TTFT | **496.6 tok/s** (`7.8/cli`) |
+| `M4B` | 4-Chip BF16 (`47.12 GB`, Argmax) | **`0.9983`** / Exact | `14.38 ms` (`8,903 tok/s`) | `5.43 ms` (`14.30 ms` 107t TTFT) | **184.3 tok/s** (`193.4` silicon) |
+| `M4C-P` | 4-Chip INT8 (`23.65 GB`, FullLogits) | **`0.997842`** / Exact | `9.67 ms` (`13,234 tok/s`) | `4.64 ms` (`9.61 ms` 107t TTFT) | **215.3 tok/s** |
+| **`M4C`** | **4-Chip INT8 (`5.91 GB/chip`, Argmax)** | **Exact Top-1** | **`8.86 ms` (`14,442 tok/s`)** | **`4.30 ms`** (**`8.80 ms`** 107t TTFT) | **232.6 tok/s** (`248.1` silicon) |
+| `M4D` | 4-Chip Continuous Batch `B=32` Hybrid INT8 | Exact Top-1 | — | `9.99 ms` (`0.10 / 9.69 / 0.20`) | **3,203.1 tok/s** (`100.1/user`) |
+| `M4E` | 4-Chip Continuous Batch `B=64` Hybrid INT8 | Exact Top-1 | — | `12.49 ms` (`0.10 / 12.19 / 0.20`) | **5,123.5 tok/s** (`80.1/user`) |
+| `M4G` | 4-Chip Continuous Batch `B=128` Pure BF16 | Exact Top-1 | — | `21.83 ms` (`0.10 / 21.52 / 0.21`) | **5,863.2 tok/s** (`45.8/user`) |
+| **`M4F`** | **4-Chip Continuous Batch `B=128` Hybrid INT8** | **Exact Top-1** | — | **`16.40 ms`** (`0.10 / 16.09 / 0.20`) | **7,805.8 tok/s** (`61.0/user`) |
+| `HTTP-1` | Live `haven-server` `B=1` INT8 Full Sampler | Coherent Ava | — | **`12.66 ms`** HTTP TTFT | **192.4 tok/s** (`186.7` e2e) |
+| `HTTP-16` | Live `haven-server` `B=16` INT8 Full Sampler | Coherent Ava | — | **`196.6 ms`** avg TTFT (`316 ms` max) | **676.6 tok/s** (`42.3/cli`) |
+| **`HTTP-64`** | **Live `haven-server` `B=64` INT8 Argmax** | **Coherent Ava** | — | **`473.2 ms`** avg TTFT (`863 ms` max) | **2,872.9 tok/s** (`44.9/cli`) |
 
 ### 6E. Adversarial Security, Cryptography & Fuzz Verification (`test-security-fuzz`)
 
