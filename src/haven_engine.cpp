@@ -495,12 +495,13 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         const float* layer_k = kv_lay.keys.data();
         const float* layer_v = kv_lay.values.data();
 
+        const int num_heads_i = static_cast<int>(cfg.num_heads);
         #pragma omp parallel for schedule(static)
-        for (uint32_t h = 0; h < cfg.num_heads; ++h) {
-            const float* q_h = q_scratch_.data() + h * actual_head_dim;
-            const uint32_t kv_head_idx = std::min(h / gqa_ratio, cfg.num_kv_heads - 1);
+        for (int h = 0; h < num_heads_i; ++h) {
+            const float* q_h = q_scratch_.data() + static_cast<size_t>(h) * static_cast<size_t>(actual_head_dim);
+            const uint32_t kv_head_idx = std::min(static_cast<uint32_t>(h / gqa_ratio), cfg.num_kv_heads - 1);
             const uint32_t kv_head_offset = kv_head_idx * actual_head_dim;
-            float* out_h = attn_heads_out_scratch_.data() + h * actual_head_dim;
+            float* out_h = attn_heads_out_scratch_.data() + static_cast<size_t>(h) * static_cast<size_t>(actual_head_dim);
 
             if (active_attn_len > 0 && kv_head_offset + static_cast<uint32_t>(actual_head_dim) <= static_cast<uint32_t>(kv_dim)) {
                 FlashAttentionCpu::compute_tiled_attention(
