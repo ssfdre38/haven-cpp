@@ -9,9 +9,9 @@
 
 namespace haven {
 
-// Architecture-agnostic dense transformer specification compiled directly into
-// a single persistent StableHLO HBM3 graph (supports Gemma 4, Gemma 2/3,
-// Llama 3/4, Qwen 2.5/3, Mistral, Phi-3/4, and Ava 26B).
+// Architecture-agnostic dense + sparse MoE transformer specification compiled directly
+// into a single persistent StableHLO HBM3 graph (supports Gemma 4 E4B & 26B-A4B MoE / Ava,
+// Gemma 2/3, Llama 3/4, Qwen 2.5/3, Mistral, Phi-3/4).
 struct TpuModelSpec {
     std::string architecture;
     int num_layers = 0;
@@ -20,6 +20,8 @@ struct TpuModelSpec {
     int vocab_size = 0;
     int num_heads = 0;
     int num_kv_heads = 0;
+    int num_kv_heads_swa = 0;
+    int num_kv_heads_glob = 0;
     int head_dim_swa = 0;
     int head_dim_glob = 0;
     int pleias_dim = 256;
@@ -35,12 +37,24 @@ struct TpuModelSpec {
     bool has_q_norm = false;
     bool has_k_norm = false;
     bool has_v_norm = false;
+    bool has_swa_v = true;
+    bool has_glob_v = true;
     bool has_post_attn_norm = false;
     bool has_post_ffn_norm = false;
     bool has_post_norm = false;
     bool has_layer_scale = false;
     bool has_qkv_bias = false;
     bool has_tied_embeddings = true;
+
+    // Sparse Mixture-of-Experts (Gemma 4 26B-A4B / Ava 26B Turbo MoE)
+    bool is_moe = false;
+    int num_experts = 0;
+    int num_experts_used = 0;
+    int expert_ffn_dim = 0;
+    bool has_moe_router_scale = false;
+    bool has_post_ffn_norm_1 = false;
+    bool has_pre_ffn_norm_2 = false;
+    bool has_post_ffn_norm_2 = false;
 
     int num_swa_layers = 0;
     int num_glob_layers = 0;
@@ -68,7 +82,7 @@ struct TpuGemma4Config {
     int max_seq_len = 2048;        // Static on-chip HBM3 KV cache capacity per sequence slot
     int prefill_chunk_size = 128;  // Max batched prefill bucket (0 = skip prefill graph compilation)
     std::vector<int> prefill_buckets; // Explicit bucket list (empty = auto {128, 32, 16} when prefill_chunk_size >= 128)
-    int num_replicas = 1;          // 1 = single Trillium chip, 2 or 4 = Megatron Tensor-Parallel over Optical ICI
+    int num_replicas = 1;          // 1 = single Trillium chip, 2/4/8 = Megatron Tensor-Parallel over Optical ICI
     bool use_int8_weights = false; // false = BF16, true = W8A16 INT8 (~2x HBM3 BW)
     bool return_full_logits = false; // true = return [B, vocab] F32 logits, false = on-chip argmax [B] i32 (4B/slot PCIe)
     bool use_onchip_embeddings = false; // true = upload only [B, S] i32 token IDs & gather embeddings on-chip in HBM3

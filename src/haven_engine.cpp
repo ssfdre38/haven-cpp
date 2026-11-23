@@ -1,4 +1,5 @@
 #include "haven/haven_engine.h"
+#include <algorithm>
 #include <iostream>
 #include <cstring>
 #include <cmath>
@@ -133,6 +134,14 @@ bool HavenEngine::load_model(const std::string& gguf_filepath) {
     ffn_gate_scratch_.resize(cfg.hidden_dim, 0.0f);
     ffn_up_scratch_.resize(cfg.hidden_dim, 0.0f);
     ffn_down_scratch_.resize(cfg.embedding_dim, 0.0f);
+    if (cfg.expert_count > 0) {
+        const uint32_t exp_ff = (cfg.expert_ffn_dim > 0) ? cfg.expert_ffn_dim : cfg.hidden_dim;
+        moe_router_scratch_.resize(cfg.expert_count, 0.0f);
+        moe_norm_scratch_.resize(cfg.embedding_dim, 0.0f);
+        moe_gate_up_scratch_.resize(static_cast<size_t>(exp_ff) * 2ULL, 0.0f);
+        moe_exp_down_scratch_.resize(cfg.embedding_dim, 0.0f);
+        moe_accum_scratch_.resize(cfg.embedding_dim, 0.0f);
+    }
     logits_scratch_.resize(cfg.vocab_size, 0.0f);
     default_norm_weights_.assign(std::max({cfg.embedding_dim, cfg.hidden_dim, cfg.head_dim, 256u}), 1.0f);
     attn_scores_scratch_.resize(std::max(1024u, cfg.max_context_length), 0.0f);
@@ -172,6 +181,16 @@ bool HavenEngine::load_model(const std::string& gguf_filepath) {
         layers_[l].ffn_up               = loader_.get_tensor(prefix + "ffn_up.weight");
         layers_[l].ffn_down             = loader_.get_tensor(prefix + "ffn_down.weight");
         layers_[l].post_ffw_norm        = loader_.get_tensor(prefix + "post_ffw_norm.weight");
+        layers_[l].post_ffw_norm_1      = loader_.get_tensor(prefix + "post_ffw_norm_1.weight");
+        layers_[l].pre_ffw_norm_2       = loader_.get_tensor(prefix + "pre_ffw_norm_2.weight");
+        layers_[l].post_ffw_norm_2      = loader_.get_tensor(prefix + "post_ffw_norm_2.weight");
+        layers_[l].ffn_gate_inp         = loader_.get_tensor(prefix + "ffn_gate_inp.weight");
+        layers_[l].ffn_gate_inp_scale   = loader_.get_tensor(prefix + "ffn_gate_inp.scale");
+        layers_[l].ffn_gate_up_exps     = loader_.get_tensor(prefix + "ffn_gate_up_exps.weight");
+        layers_[l].ffn_gate_exps        = loader_.get_tensor(prefix + "ffn_gate_exps.weight");
+        layers_[l].ffn_up_exps          = loader_.get_tensor(prefix + "ffn_up_exps.weight");
+        layers_[l].ffn_down_exps        = loader_.get_tensor(prefix + "ffn_down_exps.weight");
+        layers_[l].ffn_down_exps_scale  = loader_.get_tensor(prefix + "ffn_down_exps.scale");
         layers_[l].inp_gate             = loader_.get_tensor(prefix + "inp_gate.weight");
         layers_[l].proj                 = loader_.get_tensor(prefix + "proj.weight");
         layers_[l].post_norm            = loader_.get_tensor(prefix + "post_norm.weight");
@@ -206,6 +225,14 @@ bool HavenEngine::load_model(const std::string& gguf_filepath) {
     ffn_gate_scratch_.resize(cfg.hidden_dim, 0.0f);
     ffn_up_scratch_.resize(cfg.hidden_dim, 0.0f);
     ffn_down_scratch_.resize(cfg.embedding_dim, 0.0f);
+    if (cfg.expert_count > 0) {
+        const uint32_t exp_ff = (cfg.expert_ffn_dim > 0) ? cfg.expert_ffn_dim : cfg.hidden_dim;
+        moe_router_scratch_.resize(cfg.expert_count, 0.0f);
+        moe_norm_scratch_.resize(cfg.embedding_dim, 0.0f);
+        moe_gate_up_scratch_.resize(static_cast<size_t>(exp_ff) * 2ULL, 0.0f);
+        moe_exp_down_scratch_.resize(cfg.embedding_dim, 0.0f);
+        moe_accum_scratch_.resize(cfg.embedding_dim, 0.0f);
+    }
     layer_gate_scratch_.resize(cfg.hidden_dim, 0.0f);
     per_layer_emb_scratch_.resize(pleias_dim, 0.0f);
     per_layer_proj_scratch_.resize(pleias_dim, 0.0f);
@@ -392,18 +419,23 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         const int q_dim = std::max(1, std::min<int>(
             static_cast<int>(q_scratch_.size()),
             (lt.attn_q && lt.attn_q->shape.size() > 1) ? (int)lt.attn_q->shape[1] : (int)(cfg.num_heads * cfg.head_dim)));
+        const int actual_head_dim = std::max(1, (cfg.num_heads > 0) ? (q_dim / (int)cfg.num_heads) : (int)cfg.head_dim);
+        const uint32_t layer_n_kv_heads = (l < cfg.head_count_kv_per_layer.size() && cfg.head_count_kv_per_layer[l] > 0)
+            ? cfg.head_count_kv_per_layer[l]
+            : ((lt.attn_k && lt.attn_k->shape.size() > 1 && actual_head_dim > 0)
+                ? std::max(1u, static_cast<uint32_t>(lt.attn_k->shape[1]) / static_cast<uint32_t>(actual_head_dim))
+                : cfg.num_kv_heads);
         const int kv_dim = std::max(1, std::min<int>(
             static_cast<int>(k_scratch_.size()),
-            (lt.attn_k && lt.attn_k->shape.size() > 1) ? (int)lt.attn_k->shape[1] : (int)(cfg.num_kv_heads * cfg.head_dim)));
-        const int actual_head_dim = std::max(1, (cfg.num_heads > 0) ? (q_dim / (int)cfg.num_heads) : (int)cfg.head_dim);
+            (lt.attn_k && lt.attn_k->shape.size() > 1) ? (int)lt.attn_k->shape[1] : (int)(layer_n_kv_heads * static_cast<uint32_t>(actual_head_dim))));
         const float attn_scale = cfg.is_gemma ? 1.0f : (1.0f / std::sqrt((float)actual_head_dim));
-        const int gqa_ratio = std::max(1u, cfg.num_heads / cfg.num_kv_heads);
+        const int gqa_ratio = std::max(1u, cfg.num_heads / std::max(1u, layer_n_kv_heads));
 
         // 2a. Pre-Attention RMSNorm
         const float* attn_norm_w = safe_f32_weights(lt.attn_norm, cfg.embedding_dim);
         Avx2Math::rms_norm(norm_scratch_.data(), embedding_scratch_.data(), attn_norm_w, cfg.embedding_dim, cfg.rms_norm_eps);
 
-        // 2b. Q, K, V Projections
+        // 2b. Q, K, V Projections (with Gemma 4 k_eq_v fallback when attn_v is omitted on global layers)
         if (lt.attn_q) {
             Avx2Math::gemv(q_scratch_.data(), *lt.attn_q, norm_scratch_.data(), q_dim, cfg.embedding_dim);
             if (lt.attn_q_bias) Avx2Math::add_bias(q_scratch_.data(), *lt.attn_q_bias, q_dim);
@@ -421,6 +453,9 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         if (lt.attn_v) {
             Avx2Math::gemv(v_scratch_.data(), *lt.attn_v, norm_scratch_.data(), kv_dim, cfg.embedding_dim);
             if (lt.attn_v_bias) Avx2Math::add_bias(v_scratch_.data(), *lt.attn_v_bias, kv_dim);
+        } else if (lt.attn_k) {
+            // Gemma 4 k_eq_v: V shares raw K projection prior to K-norm and RoPE
+            std::memcpy(v_scratch_.data(), k_scratch_.data(), static_cast<size_t>(kv_dim) * sizeof(float));
         } else {
             for (int i = 0; i < kv_dim; ++i) v_scratch_[i] = norm_scratch_[i % cfg.embedding_dim];
         }
@@ -435,13 +470,13 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         }
         if (lt.attn_k_norm) {
             const float* k_norm_w = safe_f32_weights(lt.attn_k_norm, static_cast<size_t>(actual_head_dim));
-            for (uint32_t h = 0; h < cfg.num_kv_heads; ++h) {
+            for (uint32_t h = 0; h < layer_n_kv_heads; ++h) {
                 float* k_h = k_scratch_.data() + h * actual_head_dim;
                 Avx2Math::rms_norm(k_h, k_h, k_norm_w, actual_head_dim, cfg.rms_norm_eps);
             }
         }
         if (cfg.is_gemma && lt.attn_q_norm && lt.attn_k_norm) {
-            for (uint32_t h = 0; h < cfg.num_kv_heads; ++h) {
+            for (uint32_t h = 0; h < layer_n_kv_heads; ++h) {
                 float* v_h = v_scratch_.data() + h * actual_head_dim;
                 Avx2Math::rms_norm(v_h, v_h, default_norm_weights_.data(), actual_head_dim, cfg.rms_norm_eps);
             }
@@ -449,7 +484,9 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
 
         // 2c. RoPE Rotary Embeddings
         bool has_swa = (cfg.sliding_window > 0) && (cfg.is_gemma || cfg.architecture == "mistral");
-        bool is_swa = has_swa && (cfg.architecture == "mistral" || (l % 6 != 5));
+        bool is_swa = (l < cfg.sliding_window_pattern.size())
+            ? cfg.sliding_window_pattern[l]
+            : (has_swa && (cfg.architecture == "mistral" || (l % 6 != 5)));
         float layer_freq_base = is_swa ? cfg.rope_freq_base_swa : cfg.rope_freq_base;
         int rope_dim = actual_head_dim;
         const float* freq_factors_w = (!is_swa && rope_freqs_tensor_ && rope_freqs_tensor_->type == QuantType::F32 &&
@@ -459,8 +496,8 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         uint32_t kv_source_layer = l;
         bool has_kv = (lt.attn_k != nullptr);
         if (!has_kv) {
-            if (cfg.num_layers > 20) {
-                uint32_t n_kv_start = cfg.num_layers - 18;
+            if (cfg.num_layers > 20 && cfg.shared_kv_layers > 0 && cfg.shared_kv_layers < cfg.num_layers) {
+                uint32_t n_kv_start = cfg.num_layers - cfg.shared_kv_layers;
                 kv_source_layer = n_kv_start - (is_swa ? 2 : 1);
             } else {
                 kv_source_layer = (l > 0) ? (l - 1) : 0;
@@ -471,7 +508,7 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         }
 
         if (has_kv) {
-            Avx2Math::apply_rope(q_scratch_.data(), k_scratch_.data(), actual_head_dim, cfg.num_heads, cfg.num_kv_heads, pos, layer_freq_base, cfg.rope_freq_scale, freq_factors_w, rope_dim);
+            Avx2Math::apply_rope(q_scratch_.data(), k_scratch_.data(), actual_head_dim, cfg.num_heads, layer_n_kv_heads, pos, layer_freq_base, cfg.rope_freq_scale, freq_factors_w, rope_dim);
             kv_cache_.write(l, pos, k_scratch_.data(), v_scratch_.data(), kv_dim);
         } else {
             Avx2Math::apply_rope(q_scratch_.data(), nullptr, actual_head_dim, cfg.num_heads, 0, pos, layer_freq_base, cfg.rope_freq_scale, freq_factors_w, rope_dim);
@@ -481,7 +518,8 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         const auto& kv_lay = kv_cache_.get_layer(kv_source_layer);
         const size_t max_safe_positions = (kv_dim > 0) ? (kv_lay.keys.size() / static_cast<size_t>(kv_dim)) : 0;
         const int seq_len = std::min({pos + 1, (int)cfg.max_context_length, (int)max_safe_positions});
-        const int s_start = is_swa ? std::max(0, seq_len - 512) : 0;
+        const int swa_win = (cfg.sliding_window > 0) ? static_cast<int>(cfg.sliding_window) : 512;
+        const int s_start = is_swa ? std::max(0, seq_len - swa_win) : 0;
 
         int active_attn_len = 0;
         const int max_indices = static_cast<int>(attn_indices_scratch_.size());
@@ -499,7 +537,7 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         #pragma omp parallel for schedule(static)
         for (int h = 0; h < num_heads_i; ++h) {
             const float* q_h = q_scratch_.data() + static_cast<size_t>(h) * static_cast<size_t>(actual_head_dim);
-            const uint32_t kv_head_idx = std::min(static_cast<uint32_t>(h / gqa_ratio), cfg.num_kv_heads - 1);
+            const uint32_t kv_head_idx = std::min(static_cast<uint32_t>(h / gqa_ratio), std::max(1u, layer_n_kv_heads) - 1);
             const uint32_t kv_head_offset = kv_head_idx * actual_head_dim;
             float* out_h = attn_heads_out_scratch_.data() + static_cast<size_t>(h) * static_cast<size_t>(actual_head_dim);
 
@@ -571,6 +609,88 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
                 Avx2Math::gemv(ffn_down_scratch_.data(), *lt.ffn_down, ffn_gate_scratch_.data(), cfg.embedding_dim, cfg.hidden_dim);
             } else {
                 for (size_t i = 0; i < cfg.embedding_dim; ++i) ffn_down_scratch_[i] = ffn_gate_scratch_[i % cfg.hidden_dim] * 0.05f;
+            }
+        }
+
+        // 2i-1b. Parallel Sparse Mixture-of-Experts Branch (Gemma 4 26B-A4B MoE)
+        if (lt.ffn_gate_inp && lt.ffn_down_exps && (lt.ffn_gate_up_exps || (lt.ffn_gate_exps && lt.ffn_up_exps)) && cfg.expert_count > 0) {
+            // Post-norm 1 on shared dense MLP branch before combining with MoE branch
+            if (lt.post_ffw_norm_1) {
+                const float* p1_w = safe_f32_weights(lt.post_ffw_norm_1, cfg.embedding_dim);
+                Avx2Math::rms_norm(ffn_down_scratch_.data(), ffn_down_scratch_.data(), p1_w, cfg.embedding_dim, cfg.rms_norm_eps);
+            }
+
+            const int E = static_cast<int>(cfg.expert_count);
+            const int K_used = std::clamp(static_cast<int>(cfg.expert_used_count > 0 ? cfg.expert_used_count : 8u), 1, E);
+            const int F_exp = static_cast<int>(cfg.expert_ffn_dim > 0 ? cfg.expert_ffn_dim : cfg.hidden_dim);
+
+            // Router input: parameter-free RMSNorm(attn_out) * (1 / sqrt(D)) * ffn_gate_inp.scale
+            Avx2Math::rms_norm(moe_norm_scratch_.data(), embedding_scratch_.data(), default_norm_weights_.data(), cfg.embedding_dim, cfg.rms_norm_eps);
+            const float inv_sqrt_d = 1.0f / std::sqrt(static_cast<float>(cfg.embedding_dim));
+            const float* rscale = lt.ffn_gate_inp_scale ? safe_f32_weights(lt.ffn_gate_inp_scale, cfg.embedding_dim) : nullptr;
+            for (size_t i = 0; i < cfg.embedding_dim; ++i) {
+                moe_norm_scratch_[i] *= inv_sqrt_d * (rscale ? rscale[i] : 1.0f);
+            }
+            Avx2Math::gemv(moe_router_scratch_.data(), *lt.ffn_gate_inp, moe_norm_scratch_.data(), E, cfg.embedding_dim);
+            Avx2Math::softmax(moe_router_scratch_.data(), E);
+
+            // Top-K expert selection & renormalization
+            std::vector<int> exp_idx(static_cast<size_t>(E));
+            for (int e = 0; e < E; ++e) exp_idx[static_cast<size_t>(e)] = e;
+            std::partial_sort(exp_idx.begin(), exp_idx.begin() + K_used, exp_idx.end(),
+                [&](int a, int b) { return moe_router_scratch_[static_cast<size_t>(a)] > moe_router_scratch_[static_cast<size_t>(b)]; });
+
+            float w_sum = 0.0f;
+            for (int k = 0; k < K_used; ++k) w_sum += moe_router_scratch_[static_cast<size_t>(exp_idx[static_cast<size_t>(k)])];
+            if (w_sum < 6.103515625e-5f) w_sum = 6.103515625e-5f;
+
+            // Pre-FFN norm 2 on attn_out for sparse experts
+            const float* pre2_w = safe_f32_weights(lt.pre_ffw_norm_2, cfg.embedding_dim);
+            Avx2Math::rms_norm(moe_norm_scratch_.data(), embedding_scratch_.data(), pre2_w, cfg.embedding_dim, cfg.rms_norm_eps);
+
+            const float* down_s = lt.ffn_down_exps_scale ? safe_f32_weights(lt.ffn_down_exps_scale, static_cast<size_t>(E)) : nullptr;
+            std::fill(moe_accum_scratch_.begin(), moe_accum_scratch_.end(), 0.0f);
+
+            for (int k = 0; k < K_used; ++k) {
+                const int e = exp_idx[static_cast<size_t>(k)];
+                const float w_k = (moe_router_scratch_[static_cast<size_t>(e)] / w_sum) * (down_s ? down_s[e] : 1.0f);
+
+                if (lt.ffn_gate_up_exps) {
+                    Avx2Math::gemv_slice(moe_gate_up_scratch_.data(), *lt.ffn_gate_up_exps,
+                        static_cast<size_t>(e) * static_cast<size_t>(2 * F_exp),
+                        moe_norm_scratch_.data(), 2 * F_exp, cfg.embedding_dim);
+                } else {
+                    Avx2Math::gemv_slice(moe_gate_up_scratch_.data(), *lt.ffn_gate_exps,
+                        static_cast<size_t>(e) * static_cast<size_t>(F_exp),
+                        moe_norm_scratch_.data(), F_exp, cfg.embedding_dim);
+                    Avx2Math::gemv_slice(moe_gate_up_scratch_.data() + F_exp, *lt.ffn_up_exps,
+                        static_cast<size_t>(e) * static_cast<size_t>(F_exp),
+                        moe_norm_scratch_.data(), F_exp, cfg.embedding_dim);
+                }
+
+                if (cfg.ffn_activation == FfnActivation::GELU) {
+                    Avx2Math::gelu(moe_gate_up_scratch_.data(), F_exp);
+                } else {
+                    Avx2Math::silu(moe_gate_up_scratch_.data(), F_exp);
+                }
+                for (int j = 0; j < F_exp; ++j) {
+                    moe_gate_up_scratch_[static_cast<size_t>(j)] *= moe_gate_up_scratch_[static_cast<size_t>(F_exp + j)];
+                }
+
+                Avx2Math::gemv_slice(moe_exp_down_scratch_.data(), *lt.ffn_down_exps,
+                    static_cast<size_t>(e) * static_cast<size_t>(cfg.embedding_dim),
+                    moe_gate_up_scratch_.data(), cfg.embedding_dim, F_exp);
+                for (size_t i = 0; i < cfg.embedding_dim; ++i) {
+                    moe_accum_scratch_[i] += w_k * moe_exp_down_scratch_[i];
+                }
+            }
+
+            if (lt.post_ffw_norm_2) {
+                const float* p2_w = safe_f32_weights(lt.post_ffw_norm_2, cfg.embedding_dim);
+                Avx2Math::rms_norm(moe_accum_scratch_.data(), moe_accum_scratch_.data(), p2_w, cfg.embedding_dim, cfg.rms_norm_eps);
+            }
+            for (size_t i = 0; i < cfg.embedding_dim; ++i) {
+                ffn_down_scratch_[i] += moe_accum_scratch_[i];
             }
         }
 

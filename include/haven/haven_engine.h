@@ -47,6 +47,16 @@ public:
         const TensorDesc* ffn_up = nullptr;
         const TensorDesc* ffn_down = nullptr;
         const TensorDesc* post_ffw_norm = nullptr;
+        const TensorDesc* post_ffw_norm_1 = nullptr;      // Gemma 4 26B-A4B shared MLP post-norm
+        const TensorDesc* pre_ffw_norm_2 = nullptr;       // Gemma 4 26B-A4B MoE branch pre-norm
+        const TensorDesc* post_ffw_norm_2 = nullptr;      // Gemma 4 26B-A4B MoE branch post-norm
+        const TensorDesc* ffn_gate_inp = nullptr;         // MoE router projection [D, E]
+        const TensorDesc* ffn_gate_inp_scale = nullptr;   // Gemma 4 MoE router input scale [D]
+        const TensorDesc* ffn_gate_up_exps = nullptr;     // Fused MoE gate+up experts [D, 2*F_exp, E]
+        const TensorDesc* ffn_gate_exps = nullptr;        // Separate MoE gate experts [D, F_exp, E]
+        const TensorDesc* ffn_up_exps = nullptr;          // Separate MoE up experts [D, F_exp, E]
+        const TensorDesc* ffn_down_exps = nullptr;        // MoE down experts [F_exp, D, E]
+        const TensorDesc* ffn_down_exps_scale = nullptr;  // Per-expert down output scale [E]
         const TensorDesc* inp_gate = nullptr;
         const TensorDesc* proj = nullptr;
         const TensorDesc* post_norm = nullptr;
@@ -228,6 +238,11 @@ private:
     std::vector<float> ffn_gate_scratch_;
     std::vector<float> ffn_up_scratch_;
     std::vector<float> ffn_down_scratch_;
+    std::vector<float> moe_router_scratch_;
+    std::vector<float> moe_norm_scratch_;
+    std::vector<float> moe_gate_up_scratch_;
+    std::vector<float> moe_exp_down_scratch_;
+    std::vector<float> moe_accum_scratch_;
     std::vector<float> logits_scratch_;
     std::vector<float> inv_freqs_;
     std::vector<float> attn_scores_scratch_;

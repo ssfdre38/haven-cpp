@@ -561,6 +561,81 @@ float Avx2Math::vec_dot_q3_K(int n, const block_q3_K* vx, const float* vy) {
     return sumf;
 }
 
+static constexpr int8_t kvalues_iq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+};
+
+// Dot product of quantized Q5_1 weights with FP32 vector (32 values per block)
+float Avx2Math::vec_dot_q5_1(int n, const block_q5_1* vx, const float* vy) {
+    const int nb = n / 32;
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32(vx[i].d);
+        const float m = fp16_to_fp32(vx[i].m);
+        uint32_t qh = 0;
+        std::memcpy(&qh, vx[i].qh, sizeof(qh));
+        const uint8_t* qs = vx[i].qs;
+        const float* y = vy + i * 32;
+        float sum_q = 0.0f;
+        float sum_y = 0.0f;
+        for (int j = 0; j < 16; ++j) {
+            const uint8_t xh_0 = static_cast<uint8_t>(((qh >> (j + 0)) << 4) & 0x10);
+            const uint8_t xh_1 = static_cast<uint8_t>((qh >> (j + 12)) & 0x10);
+            const int x0 = (qs[j] & 0x0F) | xh_0;
+            const int x1 = (qs[j] >> 4) | xh_1;
+            sum_q += static_cast<float>(x0) * y[j] + static_cast<float>(x1) * y[j + 16];
+            sum_y += y[j] + y[j + 16];
+        }
+        sumf += d * sum_q + m * sum_y;
+    }
+    return sumf;
+}
+
+// Dot product of quantized IQ4_NL weights with FP32 vector (32 values per block)
+float Avx2Math::vec_dot_iq4_nl(int n, const block_iq4_nl* vx, const float* vy) {
+    const int nb = n / 32;
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32(vx[i].d);
+        const uint8_t* qs = vx[i].qs;
+        const float* y = vy + i * 32;
+        float acc = 0.0f;
+        for (int j = 0; j < 16; ++j) {
+            acc += static_cast<float>(kvalues_iq4nl[qs[j] & 0x0F]) * y[j]
+                 + static_cast<float>(kvalues_iq4nl[qs[j] >> 4])   * y[j + 16];
+        }
+        sumf += d * acc;
+    }
+    return sumf;
+}
+
+// Dot product of quantized IQ4_XS weights with FP32 vector (256 values per super-block)
+float Avx2Math::vec_dot_iq4_xs(int n, const block_iq4_xs* vx, const float* vy) {
+    const int nb = n / 256;
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32(vx[i].d);
+        const uint16_t scales_h = vx[i].scales_h;
+        const uint8_t* scales_l = vx[i].scales_l;
+        const uint8_t* qs = vx[i].qs;
+        const float* y = vy + i * 256;
+        for (int ib = 0; ib < 8; ++ib) {
+            const int ls = ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0F)
+                         | (((scales_h >> (2 * ib)) & 3) << 4);
+            const float dl = d * static_cast<float>(ls - 32);
+            float acc = 0.0f;
+            for (int j = 0; j < 16; ++j) {
+                acc += static_cast<float>(kvalues_iq4nl[qs[j] & 0x0F]) * y[j]
+                     + static_cast<float>(kvalues_iq4nl[qs[j] >> 4])   * y[j + 16];
+            }
+            sumf += dl * acc;
+            y += 32;
+            qs += 16;
+        }
+    }
+    return sumf;
+}
+
 // Dot product of FP16 weights with FP32 vector (F16C SIMD)
 float Avx2Math::vec_dot_f16(int n, const uint16_t* vx, const float* vy) {
     __m256 acc = _mm256_setzero_ps();
@@ -638,16 +713,19 @@ static size_t haven_row_bytes(QuantType type, int cols) {
     if (cols <= 0) return 0;
     const size_t c = static_cast<size_t>(cols);
     switch (type) {
-        case QuantType::Q8_0: return (c / 32) * sizeof(block_q8_0);
-        case QuantType::Q4_0: return (c / 32) * sizeof(block_q4_0);
-        case QuantType::Q5_0: return (c / 32) * sizeof(block_q5_0);
-        case QuantType::Q4_K: return (c / 256) * sizeof(block_q4_K);
-        case QuantType::Q5_K: return (c / 256) * sizeof(block_q5_K);
-        case QuantType::Q6_K: return (c / 256) * sizeof(block_q6_K);
-        case QuantType::Q3_K: return (c / 256) * sizeof(block_q3_K);
+        case QuantType::Q8_0:   return (c / 32) * sizeof(block_q8_0);
+        case QuantType::Q4_0:   return (c / 32) * sizeof(block_q4_0);
+        case QuantType::Q5_0:   return (c / 32) * sizeof(block_q5_0);
+        case QuantType::Q5_1:   return (c / 32) * sizeof(block_q5_1);
+        case QuantType::Q4_K:   return (c / 256) * sizeof(block_q4_K);
+        case QuantType::Q5_K:   return (c / 256) * sizeof(block_q5_K);
+        case QuantType::Q6_K:   return (c / 256) * sizeof(block_q6_K);
+        case QuantType::Q3_K:   return (c / 256) * sizeof(block_q3_K);
+        case QuantType::IQ4_NL: return (c / 32) * sizeof(block_iq4_nl);
+        case QuantType::IQ4_XS: return (c / 256) * sizeof(block_iq4_xs);
         case QuantType::BF16:
-        case QuantType::F16:  return c * sizeof(uint16_t);
-        case QuantType::F32:  return c * sizeof(float);
+        case QuantType::F16:    return c * sizeof(uint16_t);
+        case QuantType::F32:    return c * sizeof(float);
         default: return 0;
     }
 }
@@ -837,6 +915,62 @@ void Avx2Math::dequantize_row(float* out, const TensorDesc& weight, int row, int
             }
         }
     }
+    else if (weight.type == QuantType::Q5_1) {
+        const auto* blocks = reinterpret_cast<const block_q5_1*>(weight.data);
+        const int blocks_per_row = cols / 32;
+        const block_q5_1* row_blocks = blocks + static_cast<size_t>(row) * static_cast<size_t>(blocks_per_row);
+        for (int b = 0; b < blocks_per_row; ++b) {
+            const float d = fp16_to_fp32(row_blocks[b].d);
+            const float m = fp16_to_fp32(row_blocks[b].m);
+            uint32_t qh = 0;
+            std::memcpy(&qh, row_blocks[b].qh, sizeof(qh));
+            for (int j = 0; j < 16; ++j) {
+                const uint8_t xh_0 = static_cast<uint8_t>(((qh >> (j + 0)) << 4) & 0x10);
+                const uint8_t xh_1 = static_cast<uint8_t>((qh >> (j + 12)) & 0x10);
+                const int x0 = (row_blocks[b].qs[j] & 0x0F) | xh_0;
+                const int x1 = (row_blocks[b].qs[j] >> 4) | xh_1;
+                out[b * 32 + j + 0]  = static_cast<float>(x0) * d + m;
+                out[b * 32 + j + 16] = static_cast<float>(x1) * d + m;
+            }
+        }
+    }
+    else if (weight.type == QuantType::IQ4_NL) {
+        const auto* blocks = reinterpret_cast<const block_iq4_nl*>(weight.data);
+        const int blocks_per_row = cols / 32;
+        const block_iq4_nl* row_blocks = blocks + static_cast<size_t>(row) * static_cast<size_t>(blocks_per_row);
+        for (int b = 0; b < blocks_per_row; ++b) {
+            const float d = fp16_to_fp32(row_blocks[b].d);
+            const uint8_t* qs = row_blocks[b].qs;
+            float* out_b = out + b * 32;
+            for (int j = 0; j < 16; ++j) {
+                out_b[j + 0]  = d * static_cast<float>(kvalues_iq4nl[qs[j] & 0x0F]);
+                out_b[j + 16] = d * static_cast<float>(kvalues_iq4nl[qs[j] >> 4]);
+            }
+        }
+    }
+    else if (weight.type == QuantType::IQ4_XS) {
+        const auto* blocks = reinterpret_cast<const block_iq4_xs*>(weight.data);
+        const int blocks_per_row = cols / 256;
+        const block_iq4_xs* row_blocks = blocks + static_cast<size_t>(row) * static_cast<size_t>(blocks_per_row);
+        for (int b = 0; b < blocks_per_row; ++b) {
+            const float d = fp16_to_fp32(row_blocks[b].d);
+            const uint16_t scales_h = row_blocks[b].scales_h;
+            const uint8_t* scales_l = row_blocks[b].scales_l;
+            const uint8_t* qs = row_blocks[b].qs;
+            float* out_b = out + b * 256;
+            for (int ib = 0; ib < 8; ++ib) {
+                const int ls = ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0F)
+                             | (((scales_h >> (2 * ib)) & 3) << 4);
+                const float dl = d * static_cast<float>(ls - 32);
+                for (int j = 0; j < 16; ++j) {
+                    out_b[j + 0]  = dl * static_cast<float>(kvalues_iq4nl[qs[j] & 0x0F]);
+                    out_b[j + 16] = dl * static_cast<float>(kvalues_iq4nl[qs[j] >> 4]);
+                }
+                out_b += 32;
+                qs += 16;
+            }
+        }
+    }
     else if (weight.type == QuantType::BF16) {
         const auto* w = reinterpret_cast<const uint16_t*>(weight.data) + static_cast<size_t>(row) * static_cast<size_t>(cols);
         for (int c = 0; c < cols; ++c) {
@@ -865,10 +999,15 @@ void Avx2Math::silu(float* x, int size) {
 
 // Matrix-Vector Multiplication: y = W * x
 void Avx2Math::gemv(float* y, const TensorDesc& weight, const float* x, int rows, int cols) {
+    gemv_slice(y, weight, 0, x, rows, cols);
+}
+
+// Matrix-Vector Multiplication on a contiguous row slice (e.g. expert e inside 3D [cols, rows, E] tensor)
+void Avx2Math::gemv_slice(float* y, const TensorDesc& weight, size_t row_offset, const float* x, int rows, int cols) {
     if (!y || !weight.data || !x || rows <= 0 || cols <= 0) return;
     if (weight.size_bytes > 0) {
         const size_t rb = haven_row_bytes(weight.type, cols);
-        if (rb == 0 || static_cast<size_t>(rows) > weight.size_bytes / rb) {
+        if (rb == 0 || row_offset + static_cast<size_t>(rows) > weight.size_bytes / rb) {
             std::memset(y, 0, static_cast<size_t>(rows) * sizeof(float));
             return;
         }
@@ -876,70 +1015,91 @@ void Avx2Math::gemv(float* y, const TensorDesc& weight, const float* x, int rows
 
     if (weight.type == QuantType::Q8_0) {
         const auto* blocks = reinterpret_cast<const block_q8_0*>(weight.data);
-        const int blocks_per_row = cols / 32;
+        const size_t blocks_per_row = static_cast<size_t>(cols / 32);
         #pragma omp parallel for schedule(static)
         for (int r = 0; r < rows; ++r) {
-            y[r] = vec_dot_q8_0(cols, blocks + (size_t)r * blocks_per_row, x);
+            y[r] = vec_dot_q8_0(cols, blocks + (row_offset + static_cast<size_t>(r)) * blocks_per_row, x);
         }
     } else if (weight.type == QuantType::Q4_0) {
         const auto* blocks = reinterpret_cast<const block_q4_0*>(weight.data);
-        const int blocks_per_row = cols / 32;
+        const size_t blocks_per_row = static_cast<size_t>(cols / 32);
         #pragma omp parallel for schedule(static)
         for (int r = 0; r < rows; ++r) {
-            y[r] = vec_dot_q4_0(cols, blocks + (size_t)r * blocks_per_row, x);
+            y[r] = vec_dot_q4_0(cols, blocks + (row_offset + static_cast<size_t>(r)) * blocks_per_row, x);
         }
     } else if (weight.type == QuantType::Q4_K) {
         const auto* blocks = reinterpret_cast<const block_q4_K*>(weight.data);
-        const int blocks_per_row = cols / 256;
+        const size_t blocks_per_row = static_cast<size_t>(cols / 256);
         #pragma omp parallel for schedule(static)
         for (int r = 0; r < rows; ++r) {
-            y[r] = vec_dot_q4_K(cols, blocks + (size_t)r * blocks_per_row, x);
+            y[r] = vec_dot_q4_K(cols, blocks + (row_offset + static_cast<size_t>(r)) * blocks_per_row, x);
         }
     } else if (weight.type == QuantType::Q6_K) {
         const auto* blocks = reinterpret_cast<const block_q6_K*>(weight.data);
-        const int blocks_per_row = cols / 256;
+        const size_t blocks_per_row = static_cast<size_t>(cols / 256);
         #pragma omp parallel for schedule(static)
         for (int r = 0; r < rows; ++r) {
-            y[r] = vec_dot_q6_K(cols, blocks + (size_t)r * blocks_per_row, x);
+            y[r] = vec_dot_q6_K(cols, blocks + (row_offset + static_cast<size_t>(r)) * blocks_per_row, x);
         }
     } else if (weight.type == QuantType::Q5_0) {
         const auto* blocks = reinterpret_cast<const block_q5_0*>(weight.data);
-        const int blocks_per_row = cols / 32;
+        const size_t blocks_per_row = static_cast<size_t>(cols / 32);
         #pragma omp parallel for schedule(static)
         for (int r = 0; r < rows; ++r) {
-            y[r] = vec_dot_q5_0(cols, blocks + (size_t)r * blocks_per_row, x);
+            y[r] = vec_dot_q5_0(cols, blocks + (row_offset + static_cast<size_t>(r)) * blocks_per_row, x);
+        }
+    } else if (weight.type == QuantType::Q5_1) {
+        const auto* blocks = reinterpret_cast<const block_q5_1*>(weight.data);
+        const size_t blocks_per_row = static_cast<size_t>(cols / 32);
+        #pragma omp parallel for schedule(static)
+        for (int r = 0; r < rows; ++r) {
+            y[r] = vec_dot_q5_1(cols, blocks + (row_offset + static_cast<size_t>(r)) * blocks_per_row, x);
         }
     } else if (weight.type == QuantType::Q5_K) {
         const auto* blocks = reinterpret_cast<const block_q5_K*>(weight.data);
-        const int blocks_per_row = cols / 256;
+        const size_t blocks_per_row = static_cast<size_t>(cols / 256);
         #pragma omp parallel for schedule(static)
         for (int r = 0; r < rows; ++r) {
-            y[r] = vec_dot_q5_K(cols, blocks + (size_t)r * blocks_per_row, x);
+            y[r] = vec_dot_q5_K(cols, blocks + (row_offset + static_cast<size_t>(r)) * blocks_per_row, x);
         }
     } else if (weight.type == QuantType::Q3_K) {
         const auto* blocks = reinterpret_cast<const block_q3_K*>(weight.data);
-        const int blocks_per_row = cols / 256;
+        const size_t blocks_per_row = static_cast<size_t>(cols / 256);
         #pragma omp parallel for schedule(static)
         for (int r = 0; r < rows; ++r) {
-            y[r] = vec_dot_q3_K(cols, blocks + (size_t)r * blocks_per_row, x);
+            y[r] = vec_dot_q3_K(cols, blocks + (row_offset + static_cast<size_t>(r)) * blocks_per_row, x);
+        }
+    } else if (weight.type == QuantType::IQ4_NL) {
+        const auto* blocks = reinterpret_cast<const block_iq4_nl*>(weight.data);
+        const size_t blocks_per_row = static_cast<size_t>(cols / 32);
+        #pragma omp parallel for schedule(static)
+        for (int r = 0; r < rows; ++r) {
+            y[r] = vec_dot_iq4_nl(cols, blocks + (row_offset + static_cast<size_t>(r)) * blocks_per_row, x);
+        }
+    } else if (weight.type == QuantType::IQ4_XS) {
+        const auto* blocks = reinterpret_cast<const block_iq4_xs*>(weight.data);
+        const size_t blocks_per_row = static_cast<size_t>(cols / 256);
+        #pragma omp parallel for schedule(static)
+        for (int r = 0; r < rows; ++r) {
+            y[r] = vec_dot_iq4_xs(cols, blocks + (row_offset + static_cast<size_t>(r)) * blocks_per_row, x);
         }
     } else if (weight.type == QuantType::BF16) {
         const auto* w = reinterpret_cast<const uint16_t*>(weight.data);
         #pragma omp parallel for schedule(static)
         for (int r = 0; r < rows; ++r) {
-            y[r] = vec_dot_bf16(cols, w + (size_t)r * cols, x);
+            y[r] = vec_dot_bf16(cols, w + (row_offset + static_cast<size_t>(r)) * static_cast<size_t>(cols), x);
         }
     } else if (weight.type == QuantType::F16) {
         const auto* w = reinterpret_cast<const uint16_t*>(weight.data);
         #pragma omp parallel for schedule(static)
         for (int r = 0; r < rows; ++r) {
-            y[r] = vec_dot_f16(cols, w + (size_t)r * cols, x);
+            y[r] = vec_dot_f16(cols, w + (row_offset + static_cast<size_t>(r)) * static_cast<size_t>(cols), x);
         }
     } else if (weight.type == QuantType::F32) {
         const auto* w = reinterpret_cast<const float*>(weight.data);
         #pragma omp parallel for schedule(static)
         for (int r = 0; r < rows; ++r) {
-            y[r] = vec_dot_f32(cols, w + (size_t)r * cols, x);
+            y[r] = vec_dot_f32(cols, w + (row_offset + static_cast<size_t>(r)) * static_cast<size_t>(cols), x);
         }
     }
 }

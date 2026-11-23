@@ -233,14 +233,14 @@ bool GgufLoader::parse_header() {
     };
 
     auto read_uint_val = [&](uint32_t val_type, uint32_t& out) -> bool {
-        if (val_type == 4 && has_bytes(ptr, end, 4)) {
+        if ((val_type == 4 || val_type == 5) && has_bytes(ptr, end, 4)) {
             uint32_t v = 0;
             std::memcpy(&v, ptr, sizeof(v));
             ptr += 4;
             out = v;
             return true;
         }
-        if (val_type == 10 && has_bytes(ptr, end, 8)) {
+        if ((val_type == 10 || val_type == 11) && has_bytes(ptr, end, 8)) {
             uint64_t v = 0;
             std::memcpy(&v, ptr, sizeof(v));
             ptr += 8;
@@ -312,11 +312,60 @@ bool GgufLoader::parse_header() {
         else if (ends_with(key, ".attention.head_count_kv") && (val_type == 4 || val_type == 10)) {
             if (!read_uint_val(val_type, config_.num_kv_heads)) return false;
         }
+        else if (ends_with(key, ".attention.head_count_kv") && val_type == 9) {
+            if (!has_bytes(ptr, end, 12)) return false;
+            uint32_t arr_type = 0;
+            uint64_t arr_len = 0;
+            std::memcpy(&arr_type, ptr, sizeof(arr_type));
+            std::memcpy(&arr_len, ptr + 4, sizeof(arr_len));
+            ptr += 12;
+            if ((arr_type != 4 && arr_type != 5 && arr_type != 10 && arr_type != 11) || arr_len > 4096) return false;
+            config_.head_count_kv_per_layer.clear();
+            config_.head_count_kv_per_layer.reserve(static_cast<size_t>(arr_len));
+            uint32_t max_kv_h = 0;
+            for (uint64_t j = 0; j < arr_len; ++j) {
+                uint32_t v = 0;
+                if (!read_uint_val(arr_type, v)) return false;
+                config_.head_count_kv_per_layer.push_back(v);
+                if (v > max_kv_h) max_kv_h = v;
+            }
+            if (max_kv_h > 0) config_.num_kv_heads = max_kv_h;
+        }
+        else if (ends_with(key, ".attention.sliding_window_pattern") && val_type == 9) {
+            if (!has_bytes(ptr, end, 12)) return false;
+            uint32_t arr_type = 0;
+            uint64_t arr_len = 0;
+            std::memcpy(&arr_type, ptr, sizeof(arr_type));
+            std::memcpy(&arr_len, ptr + 4, sizeof(arr_len));
+            ptr += 12;
+            if (arr_type != 7 || arr_len > 4096 || !has_bytes(ptr, end, arr_len)) return false;
+            config_.sliding_window_pattern.resize(static_cast<size_t>(arr_len));
+            for (uint64_t j = 0; j < arr_len; ++j) {
+                config_.sliding_window_pattern[static_cast<size_t>(j)] = (ptr[j] != 0);
+            }
+            ptr += arr_len;
+        }
+        else if (ends_with(key, ".attention.key_length_swa") && (val_type == 4 || val_type == 10)) {
+            if (!read_uint_val(val_type, config_.head_dim_swa)) return false;
+        }
         else if (ends_with(key, ".attention.key_length") && (val_type == 4 || val_type == 10)) {
             if (!read_uint_val(val_type, config_.head_dim)) return false;
         }
         else if (ends_with(key, ".attention.sliding_window") && (val_type == 4 || val_type == 10)) {
             if (!read_uint_val(val_type, config_.sliding_window)) return false;
+        }
+        else if (ends_with(key, ".attention.shared_kv_layers") && (val_type == 4 || val_type == 10)) {
+            if (!read_uint_val(val_type, config_.shared_kv_layers)) return false;
+            config_.has_shared_kv_layers_kv = true;
+        }
+        else if (ends_with(key, ".expert_count") && (val_type == 4 || val_type == 10)) {
+            if (!read_uint_val(val_type, config_.expert_count)) return false;
+        }
+        else if (ends_with(key, ".expert_used_count") && (val_type == 4 || val_type == 10)) {
+            if (!read_uint_val(val_type, config_.expert_used_count)) return false;
+        }
+        else if (ends_with(key, ".expert_feed_forward_length") && (val_type == 4 || val_type == 10)) {
+            if (!read_uint_val(val_type, config_.expert_ffn_dim)) return false;
         }
         else if (ends_with(key, ".attention.layer_norm_rms_epsilon")) {
             if (!read_float_val(val_type, config_.rms_norm_eps)) return false;
@@ -370,7 +419,12 @@ bool GgufLoader::parse_header() {
     if (config_.is_gemma) {
         config_.ffn_activation = FfnActivation::GELU;
         if (config_.final_logit_softcapping == 0.0f) config_.final_logit_softcapping = 30.0f;
-        if (config_.attn_logit_softcapping == 0.0f) config_.attn_logit_softcapping = 50.0f;
+        if (config_.attn_logit_softcapping == 0.0f && config_.architecture == "gemma2") {
+            config_.attn_logit_softcapping = 50.0f;
+        }
+        if (!config_.has_shared_kv_layers_kv && config_.num_layers == 42) {
+            config_.shared_kv_layers = 18; // Gemma 4 E4B default when key omitted
+        }
     } else {
         config_.ffn_activation = FfnActivation::SILU;
         config_.final_logit_softcapping = 0.0f;
@@ -467,7 +521,7 @@ bool GgufLoader::parse_header() {
             case QuantType::Q4_0: return safe_block_bytes(n_elems, 32, sizeof(block_q4_0));
             case QuantType::Q4_1: return safe_block_bytes(n_elems, 32, 20);
             case QuantType::Q5_0: return safe_block_bytes(n_elems, 32, sizeof(block_q5_0));
-            case QuantType::Q5_1: return safe_block_bytes(n_elems, 32, 24);
+            case QuantType::Q5_1: return safe_block_bytes(n_elems, 32, sizeof(block_q5_1));
             case QuantType::Q8_0: return safe_block_bytes(n_elems, 32, sizeof(block_q8_0));
             case QuantType::Q8_1: return safe_block_bytes(n_elems, 32, 36);
             case QuantType::Q2_K: return safe_block_bytes(n_elems, 256, 84);
@@ -476,6 +530,8 @@ bool GgufLoader::parse_header() {
             case QuantType::Q5_K: return safe_block_bytes(n_elems, 256, sizeof(block_q5_K));
             case QuantType::Q6_K: return safe_block_bytes(n_elems, 256, sizeof(block_q6_K));
             case QuantType::Q8_K: return safe_block_bytes(n_elems, 256, 292);
+            case QuantType::IQ4_NL: return safe_block_bytes(n_elems, 32, sizeof(block_iq4_nl));
+            case QuantType::IQ4_XS: return safe_block_bytes(n_elems, 256, sizeof(block_iq4_xs));
             case QuantType::I8:   return safe_block_bytes(n_elems, 1, 1);
             case QuantType::I16:  return safe_block_bytes(n_elems, 1, 2);
             case QuantType::I32:  return safe_block_bytes(n_elems, 1, 4);

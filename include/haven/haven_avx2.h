@@ -38,11 +38,20 @@ public:
     // Dot product of quantized Q5_0 weights with FP32 vector using AVX2 and FMA
     static float vec_dot_q5_0(int n, const block_q5_0* vx, const float* vy);
 
+    // Dot product of quantized Q5_1 weights with FP32 vector
+    static float vec_dot_q5_1(int n, const block_q5_1* vx, const float* vy);
+
     // Dot product of quantized Q5_K weights with FP32 vector using AVX2 and FMA
     static float vec_dot_q5_K(int n, const block_q5_K* vx, const float* vy);
 
     // Dot product of quantized Q3_K weights with FP32 vector using AVX2 and FMA
     static float vec_dot_q3_K(int n, const block_q3_K* vx, const float* vy);
+
+    // Dot product of quantized IQ4_NL weights with FP32 vector
+    static float vec_dot_iq4_nl(int n, const block_iq4_nl* vx, const float* vy);
+
+    // Dot product of quantized IQ4_XS weights with FP32 vector
+    static float vec_dot_iq4_xs(int n, const block_iq4_xs* vx, const float* vy);
 
     // Dot product of FP16 weights with FP32 vector
     static float vec_dot_f16(int n, const uint16_t* vx, const float* vy);
@@ -85,6 +94,9 @@ public:
 
     // Matrix-Vector Multiplication: y = W * x
     static void gemv(float* y, const TensorDesc& weight, const float* x, int rows, int cols);
+
+    // Matrix-Vector Multiplication on a contiguous row slice (e.g. expert e inside 3D [cols, rows, E] tensor)
+    static void gemv_slice(float* y, const TensorDesc& weight, size_t row_offset, const float* x, int rows, int cols);
 
     // Bare-metal AVX2 Vector Norm: sqrt(sum(x^2))
     static float vector_norm(const float* x, int size);

@@ -433,8 +433,12 @@ TpuModelSpec TpuModelSpec::from_model_config(const ModelConfig& mc, const HavenE
 
     const int default_hd = (mc.head_dim > 0) ? static_cast<int>(mc.head_dim)
                          : ((s.num_heads > 0) ? (s.embedding_dim / s.num_heads) : 128);
-    s.head_dim_swa = default_hd;
+    s.head_dim_swa = (mc.head_dim_swa > 0) ? static_cast<int>(mc.head_dim_swa) : default_hd;
     s.head_dim_glob = default_hd;
+    s.num_kv_heads_swa = s.num_kv_heads;
+    s.num_kv_heads_glob = s.num_kv_heads;
+    s.has_swa_v = true;
+    s.has_glob_v = true;
 
     if (host_engine != nullptr && s.num_layers > 0) {
         const auto& lt0 = host_engine->get_layer_tensors(0);
@@ -453,47 +457,105 @@ TpuModelSpec TpuModelSpec::from_model_config(const ModelConfig& mc, const HavenE
             s.pleias_dim = static_cast<int>(lt0.inp_gate->shape[1]);
         }
 
+        // Detect Sparse Mixture-of-Experts (Gemma 4 26B-A4B / Ava 26B Turbo MoE)
+        if (lt0.ffn_gate_inp != nullptr && lt0.ffn_down_exps != nullptr &&
+            (lt0.ffn_gate_up_exps != nullptr || (lt0.ffn_gate_exps != nullptr && lt0.ffn_up_exps != nullptr))) {
+            s.is_moe = true;
+            s.num_experts = (mc.expert_count > 0)
+                ? static_cast<int>(mc.expert_count)
+                : ((lt0.ffn_gate_inp->shape.size() > 1) ? static_cast<int>(lt0.ffn_gate_inp->shape[1]) : 128);
+            s.num_experts_used = (mc.expert_used_count > 0) ? static_cast<int>(mc.expert_used_count) : 8;
+            s.expert_ffn_dim = (mc.expert_ffn_dim > 0)
+                ? static_cast<int>(mc.expert_ffn_dim)
+                : ((lt0.ffn_down_exps->shape.size() > 0) ? static_cast<int>(lt0.ffn_down_exps->shape[0]) : s.hidden_dim);
+            s.has_moe_router_scale = (lt0.ffn_gate_inp_scale != nullptr);
+            s.has_post_ffn_norm_1  = (lt0.post_ffw_norm_1 != nullptr);
+            s.has_pre_ffn_norm_2   = (lt0.pre_ffw_norm_2 != nullptr);
+            s.has_post_ffn_norm_2  = (lt0.post_ffw_norm_2 != nullptr);
+        }
+
         bool found_swa_hd = false, found_glob_hd = false;
+        bool found_swa_kv = false, found_glob_kv = false;
         for (int l = 0; l < s.num_layers; ++l) {
             const auto& lt = host_engine->get_layer_tensors(static_cast<uint32_t>(l));
-            bool is_swa = has_swa_arch && (mc.architecture == "mistral" || (l % 6 != 5));
+            bool is_swa = (static_cast<size_t>(l) < mc.sliding_window_pattern.size())
+                ? mc.sliding_window_pattern[static_cast<size_t>(l)]
+                : (has_swa_arch && (mc.architecture == "mistral" || (l % 6 != 5)));
             bool has_kv = (lt.attn_k != nullptr);
             s.layer_is_swa[static_cast<size_t>(l)] = is_swa;
             s.layer_has_kv[static_cast<size_t>(l)] = has_kv;
 
+            int layer_hd = default_hd;
             if (lt.attn_q && lt.attn_q->shape.size() > 1 && s.num_heads > 0) {
                 int hd = static_cast<int>(lt.attn_q->shape[1]) / s.num_heads;
                 if (hd > 0) {
+                    layer_hd = hd;
                     if (is_swa && !found_swa_hd) { s.head_dim_swa = hd; found_swa_hd = true; }
                     if (!is_swa && !found_glob_hd) { s.head_dim_glob = hd; found_glob_hd = true; }
+                }
+            }
+            if (has_kv) {
+                int layer_hkv = (static_cast<size_t>(l) < mc.head_count_kv_per_layer.size() && mc.head_count_kv_per_layer[static_cast<size_t>(l)] > 0)
+                    ? static_cast<int>(mc.head_count_kv_per_layer[static_cast<size_t>(l)])
+                    : ((lt.attn_k && lt.attn_k->shape.size() > 1 && layer_hd > 0)
+                        ? std::max(1, static_cast<int>(lt.attn_k->shape[1]) / layer_hd)
+                        : s.num_kv_heads);
+                if (is_swa && !found_swa_kv) {
+                    s.num_kv_heads_swa = layer_hkv;
+                    s.has_swa_v = (lt.attn_v != nullptr);
+                    found_swa_kv = true;
+                }
+                if (!is_swa && !found_glob_kv) {
+                    s.num_kv_heads_glob = layer_hkv;
+                    s.has_glob_v = (lt.attn_v != nullptr);
+                    found_glob_kv = true;
                 }
             }
         }
     } else {
         // Synthetic specification from ModelConfig (for offline CI & IR inspection)
-        const bool is_gemma4_42 = (mc.is_gemma && s.num_layers == 42);
+        const bool is_gemma4_moe = (mc.is_gemma && mc.expert_count > 0);
+        const bool is_gemma4_42 = (mc.is_gemma && s.num_layers == 42 && !is_gemma4_moe);
         const bool is_gemma3_or_4 = (mc.is_gemma && (mc.architecture.find("gemma3") != std::string::npos ||
                                                      mc.architecture.find("gemma4") != std::string::npos ||
-                                                     is_gemma4_42));
+                                                     is_gemma4_42 || is_gemma4_moe));
         s.has_pleias = is_gemma4_42;
         s.has_q_norm = is_gemma3_or_4 || (mc.architecture == "qwen3");
         s.has_k_norm = is_gemma3_or_4 || (mc.architecture == "qwen3");
-        s.has_v_norm = is_gemma4_42;
+        s.has_v_norm = is_gemma4_42 || is_gemma4_moe;
         s.has_post_attn_norm = mc.is_gemma;
         s.has_post_ffn_norm = mc.is_gemma;
         s.has_post_norm = is_gemma4_42;
-        s.has_layer_scale = is_gemma4_42;
+        s.has_layer_scale = is_gemma4_42 || is_gemma4_moe;
         s.has_qkv_bias = (mc.architecture == "qwen2");
         s.has_tied_embeddings = mc.is_gemma;
         if (is_gemma4_42) {
             s.head_dim_swa = 256;
             s.head_dim_glob = 512;
         }
+        if (is_gemma4_moe) {
+            s.is_moe = true;
+            s.num_experts = static_cast<int>(mc.expert_count);
+            s.num_experts_used = (mc.expert_used_count > 0) ? static_cast<int>(mc.expert_used_count) : 8;
+            s.expert_ffn_dim = (mc.expert_ffn_dim > 0) ? static_cast<int>(mc.expert_ffn_dim) : 704;
+            s.has_moe_router_scale = true;
+            s.has_post_ffn_norm_1 = true;
+            s.has_pre_ffn_norm_2 = true;
+            s.has_post_ffn_norm_2 = true;
+            s.head_dim_swa = (mc.head_dim_swa > 0) ? static_cast<int>(mc.head_dim_swa) : 256;
+            s.head_dim_glob = (mc.head_dim > 0) ? static_cast<int>(mc.head_dim) : 512;
+            s.num_kv_heads_swa = s.num_kv_heads;
+            s.num_kv_heads_glob = 2;
+            s.has_swa_v = true;
+            s.has_glob_v = false;
+        }
         const int kv_owner_limit = (is_gemma4_42 && s.num_layers > 20)
             ? (s.num_layers - static_cast<int>(mc.shared_kv_layers > 0 ? mc.shared_kv_layers : 18))
             : s.num_layers;
         for (int l = 0; l < s.num_layers; ++l) {
-            bool is_swa = has_swa_arch && (mc.architecture == "mistral" || (l % 6 != 5));
+            bool is_swa = (static_cast<size_t>(l) < mc.sliding_window_pattern.size())
+                ? mc.sliding_window_pattern[static_cast<size_t>(l)]
+                : (has_swa_arch && (mc.architecture == "mistral" || (l % 6 != 5)));
             bool has_kv = (l < kv_owner_limit);
             s.layer_is_swa[static_cast<size_t>(l)] = is_swa;
             s.layer_has_kv[static_cast<size_t>(l)] = has_kv;
@@ -539,9 +601,9 @@ bool HavenTpuGemma4Engine::is_model_supported(const HavenEngine& host_engine, st
         return false;
     }
     const auto& lt0 = host_engine.get_layer_tensors(0);
-    if (!lt0.attn_q || !lt0.attn_k || !lt0.attn_v || !lt0.attn_output ||
+    if (!lt0.attn_q || !lt0.attn_k || !lt0.attn_output ||
         !lt0.ffn_gate || !lt0.ffn_up || !lt0.ffn_down) {
-        reason_out = "Layer 0 is missing required dense attention/FFN tensors (MoE/SSM models not yet supported).";
+        reason_out = "Layer 0 is missing required attention/FFN tensors.";
         return false;
     }
     TpuModelSpec spec = TpuModelSpec::from_model_config(mc, &host_engine);
@@ -549,9 +611,13 @@ bool HavenTpuGemma4Engine::is_model_supported(const HavenEngine& host_engine, st
         reason_out = "Model has no KV-owning layers.";
         return false;
     }
-    if ((spec.num_swa_layers > 0 && (spec.head_dim_swa <= 0 || (spec.head_dim_swa % 2) != 0)) ||
-        (spec.num_glob_layers > 0 && (spec.head_dim_glob <= 0 || (spec.head_dim_glob % 2) != 0))) {
-        reason_out = "Head dimension must be positive and even for RoPE.";
+    if ((spec.num_swa_layers > 0 && (spec.head_dim_swa <= 0 || (spec.head_dim_swa % 2) != 0 || (spec.num_heads % std::max(1, spec.num_kv_heads_swa)) != 0)) ||
+        (spec.num_glob_layers > 0 && (spec.head_dim_glob <= 0 || (spec.head_dim_glob % 2) != 0 || (spec.num_heads % std::max(1, spec.num_kv_heads_glob)) != 0))) {
+        reason_out = "Head dimension must be positive/even and num_heads divisible by per-type num_kv_heads.";
+        return false;
+    }
+    if (spec.is_moe && (spec.num_experts <= 0 || spec.num_experts_used <= 0 || spec.num_experts_used > spec.num_experts || spec.expert_ffn_dim <= 0)) {
+        reason_out = "Invalid MoE configuration (experts/top-k/expert_ffn_dim).";
         return false;
     }
     reason_out.clear();
@@ -589,16 +655,26 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const TpuModelSpec& spec,
     const int F_sh = F / R;
     const int V_sh = V / R;
     const int H_sh = H / R;
-    const int Hkv_sh = compute_hkv_shard(Hkv, R);
-    const int G_sh = std::max(1, H_sh / Hkv_sh);
+    const int Hkv_swa = (spec.num_kv_heads_swa > 0) ? spec.num_kv_heads_swa : Hkv;
+    const int Hkv_glob = (spec.num_kv_heads_glob > 0) ? spec.num_kv_heads_glob : Hkv;
+    const int Hkv_swa_sh = compute_hkv_shard(Hkv_swa, R);
+    const int Hkv_glob_sh = compute_hkv_shard(Hkv_glob, R);
+    const int G_swa_sh = std::max(1, H_sh / Hkv_swa_sh);
+    const int G_glob_sh = std::max(1, H_sh / Hkv_glob_sh);
 
     const int HD_swa = spec.head_dim_swa;
     const int HD_glob = spec.head_dim_glob;
     const int Q_swa_sh = H_sh * HD_swa;
-    const int KV_swa_sh = Hkv_sh * HD_swa;
+    const int KV_swa_sh = Hkv_swa_sh * HD_swa;
     const int Q_glob_sh = H_sh * HD_glob;
-    const int KV_glob_sh = Hkv_sh * HD_glob;
+    const int KV_glob_sh = Hkv_glob_sh * HD_glob;
     const int P_dim = spec.pleias_dim;
+
+    const bool is_moe = spec.is_moe;
+    const int E = is_moe ? spec.num_experts : 0;
+    const int K_exp = is_moe ? spec.num_experts_used : 0;
+    const int F_exp_sh = is_moe ? (spec.expert_ffn_dim / R) : 0;
+    const int GU_exp_sh = 2 * F_exp_sh;
 
     const int N_swa = spec.num_swa_layers;
     const int N_glob = spec.num_glob_layers;
@@ -611,8 +687,8 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const TpuModelSpec& spec,
 
     MlirEmitter em;
     // Zero-padding TPU (8,128)-aligned KV Cache layout: [N_kv, B_cap, Hkv_sh, T, HD]
-    const std::string kv_ks_t = "tensor<" + std::to_string(N_swa_kv)  + "x" + std::to_string(B_cap) + "x" + std::to_string(Hkv_sh) + "x" + std::to_string(T) + "x" + std::to_string(HD_swa)  + "xbf16>";
-    const std::string kv_kg_t = "tensor<" + std::to_string(N_glob_kv) + "x" + std::to_string(B_cap) + "x" + std::to_string(Hkv_sh) + "x" + std::to_string(T) + "x" + std::to_string(HD_glob) + "xbf16>";
+    const std::string kv_ks_t = "tensor<" + std::to_string(N_swa_kv)  + "x" + std::to_string(B_cap) + "x" + std::to_string(Hkv_swa_sh)  + "x" + std::to_string(T) + "x" + std::to_string(HD_swa)  + "xbf16>";
+    const std::string kv_kg_t = "tensor<" + std::to_string(N_glob_kv) + "x" + std::to_string(B_cap) + "x" + std::to_string(Hkv_glob_sh) + "x" + std::to_string(T) + "x" + std::to_string(HD_glob) + "xbf16>";
     const std::string out0_t  = tc.return_full_logits
         ? ("tensor<" + std::to_string(B) + "x" + std::to_string(V) + "xf32>")
         : ("tensor<" + std::to_string(B) + "xi32>");
@@ -647,20 +723,29 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const TpuModelSpec& spec,
     em.ss << "    %w_ffn_gate: tensor<" << L << "x" << F_sh << "x" << D << "x" << wel << ">,\n"
           << "    %w_ffn_up: tensor<" << L << "x" << F_sh << "x" << D << "x" << wel << ">,\n"
           << "    %w_ffn_down: tensor<" << L << "x" << D << "x" << F_sh << "x" << wel << ">,\n";
+    if (is_moe) {
+        em.ss << "    %w_moe_router: tensor<" << L << "x" << E << "x" << D << "xbf16>,\n"
+              << "    %w_moe_gu: tensor<" << L << "x" << E << "x" << GU_exp_sh << "x" << D << "x" << wel << ">,\n"
+              << "    %w_moe_dn: tensor<" << L << "x" << E << "x" << D << "x" << F_exp_sh << "x" << wel << ">,\n";
+    }
     if (has_swa) {
         em.ss << "    %w_swa_q: tensor<" << N_swa << "x" << Q_swa_sh << "x" << D << "x" << wel << ">,\n"
               << "    %w_swa_o: tensor<" << N_swa << "x" << D << "x" << Q_swa_sh << "x" << wel << ">,\n";
         if (has_swa_kv) {
-            em.ss << "    %w_swa_k: tensor<" << N_swa_kv << "x" << KV_swa_sh << "x" << D << "x" << wel << ">,\n"
-                  << "    %w_swa_v: tensor<" << N_swa_kv << "x" << KV_swa_sh << "x" << D << "x" << wel << ">,\n";
+            em.ss << "    %w_swa_k: tensor<" << N_swa_kv << "x" << KV_swa_sh << "x" << D << "x" << wel << ">,\n";
+            if (spec.has_swa_v) {
+                em.ss << "    %w_swa_v: tensor<" << N_swa_kv << "x" << KV_swa_sh << "x" << D << "x" << wel << ">,\n";
+            }
         }
     }
     if (has_glob) {
         em.ss << "    %w_glob_q: tensor<" << N_glob << "x" << Q_glob_sh << "x" << D << "x" << wel << ">,\n"
               << "    %w_glob_o: tensor<" << N_glob << "x" << D << "x" << Q_glob_sh << "x" << wel << ">,\n";
         if (has_glob_kv) {
-            em.ss << "    %w_glob_k: tensor<" << N_glob_kv << "x" << KV_glob_sh << "x" << D << "x" << wel << ">,\n"
-                  << "    %w_glob_v: tensor<" << N_glob_kv << "x" << KV_glob_sh << "x" << D << "x" << wel << ">,\n";
+            em.ss << "    %w_glob_k: tensor<" << N_glob_kv << "x" << KV_glob_sh << "x" << D << "x" << wel << ">,\n";
+            if (spec.has_glob_v) {
+                em.ss << "    %w_glob_v: tensor<" << N_glob_kv << "x" << KV_glob_sh << "x" << D << "x" << wel << ">,\n";
+            }
         }
     }
     em.ss << "    %w_lm_head: tensor<" << V_sh << "x" << D << "x" << wel << ">,\n";
@@ -676,20 +761,28 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const TpuModelSpec& spec,
         em.ss << "    %s_ffn_gate: tensor<" << L << "x" << F_sh << "xf32>,\n"
               << "    %s_ffn_up: tensor<" << L << "x" << F_sh << "xf32>,\n"
               << "    %s_ffn_down: tensor<" << L << "x" << D << "xf32>,\n";
+        if (is_moe) {
+            em.ss << "    %s_moe_gu: tensor<" << L << "x" << E << "x" << GU_exp_sh << "xf32>,\n"
+                  << "    %s_moe_dn: tensor<" << L << "x" << E << "x" << D << "xf32>,\n";
+        }
         if (has_swa) {
             em.ss << "    %s_swa_q: tensor<" << N_swa << "x" << Q_swa_sh << "xf32>,\n"
                   << "    %s_swa_o: tensor<" << N_swa << "x" << D << "xf32>,\n";
             if (has_swa_kv) {
-                em.ss << "    %s_swa_k: tensor<" << N_swa_kv << "x" << KV_swa_sh << "xf32>,\n"
-                      << "    %s_swa_v: tensor<" << N_swa_kv << "x" << KV_swa_sh << "xf32>,\n";
+                em.ss << "    %s_swa_k: tensor<" << N_swa_kv << "x" << KV_swa_sh << "xf32>,\n";
+                if (spec.has_swa_v) {
+                    em.ss << "    %s_swa_v: tensor<" << N_swa_kv << "x" << KV_swa_sh << "xf32>,\n";
+                }
             }
         }
         if (has_glob) {
             em.ss << "    %s_glob_q: tensor<" << N_glob << "x" << Q_glob_sh << "xf32>,\n"
                   << "    %s_glob_o: tensor<" << N_glob << "x" << D << "xf32>,\n";
             if (has_glob_kv) {
-                em.ss << "    %s_glob_k: tensor<" << N_glob_kv << "x" << KV_glob_sh << "xf32>,\n"
-                      << "    %s_glob_v: tensor<" << N_glob_kv << "x" << KV_glob_sh << "xf32>,\n";
+                em.ss << "    %s_glob_k: tensor<" << N_glob_kv << "x" << KV_glob_sh << "xf32>,\n";
+                if (spec.has_glob_v) {
+                    em.ss << "    %s_glob_v: tensor<" << N_glob_kv << "x" << KV_glob_sh << "xf32>,\n";
+                }
             }
         }
         em.ss << "    %s_lm_head: tensor<" << V_sh << "xf32>,\n";
@@ -706,15 +799,19 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const TpuModelSpec& spec,
         if (has_swa) {
             em.ss << "    %b_swa_q: tensor<" << N_swa << "x" << Q_swa_sh << "xf32>,\n";
             if (has_swa_kv) {
-                em.ss << "    %b_swa_k: tensor<" << N_swa_kv << "x" << KV_swa_sh << "xf32>,\n"
-                      << "    %b_swa_v: tensor<" << N_swa_kv << "x" << KV_swa_sh << "xf32>,\n";
+                em.ss << "    %b_swa_k: tensor<" << N_swa_kv << "x" << KV_swa_sh << "xf32>,\n";
+                if (spec.has_swa_v) {
+                    em.ss << "    %b_swa_v: tensor<" << N_swa_kv << "x" << KV_swa_sh << "xf32>,\n";
+                }
             }
         }
         if (has_glob) {
             em.ss << "    %b_glob_q: tensor<" << N_glob << "x" << Q_glob_sh << "xf32>,\n";
             if (has_glob_kv) {
-                em.ss << "    %b_glob_k: tensor<" << N_glob_kv << "x" << KV_glob_sh << "xf32>,\n"
-                      << "    %b_glob_v: tensor<" << N_glob_kv << "x" << KV_glob_sh << "xf32>,\n";
+                em.ss << "    %b_glob_k: tensor<" << N_glob_kv << "x" << KV_glob_sh << "xf32>,\n";
+                if (spec.has_glob_v) {
+                    em.ss << "    %b_glob_v: tensor<" << N_glob_kv << "x" << KV_glob_sh << "xf32>,\n";
+                }
             }
         }
     }
@@ -733,6 +830,18 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const TpuModelSpec& spec,
         em.ss << "    %w_post_attn_norm: tensor<" << L << "x" << D << "xf32>,\n";
     }
     em.ss << "    %w_ffn_norm: tensor<" << L << "x" << D << "xf32>,\n";
+    if (is_moe && spec.has_moe_router_scale) {
+        em.ss << "    %w_moe_rscale: tensor<" << L << "x" << D << "xf32>,\n";
+    }
+    if (is_moe && spec.has_post_ffn_norm_1) {
+        em.ss << "    %w_post_ffn_norm_1: tensor<" << L << "x" << D << "xf32>,\n";
+    }
+    if (is_moe && spec.has_pre_ffn_norm_2) {
+        em.ss << "    %w_pre_ffn_norm_2: tensor<" << L << "x" << D << "xf32>,\n";
+    }
+    if (is_moe && spec.has_post_ffn_norm_2) {
+        em.ss << "    %w_post_ffn_norm_2: tensor<" << L << "x" << D << "xf32>,\n";
+    }
     if (spec.has_post_ffn_norm) {
         em.ss << "    %w_post_ffn_norm: tensor<" << L << "x" << D << "xf32>,\n";
     }
@@ -984,7 +1093,10 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const TpuModelSpec& spec,
                                : (is_swa ? spec.last_swa_kv_idx : spec.last_glob_kv_idx);
         const int HD = is_swa ? HD_swa : HD_glob;
         const int Q_sh = is_swa ? Q_swa_sh : Q_glob_sh;
+        const int Hkv_sh = is_swa ? Hkv_swa_sh : Hkv_glob_sh;
+        const int G_sh = is_swa ? G_swa_sh : G_glob_sh;
         const int KV_sh = is_swa ? KV_swa_sh : KV_glob_sh;
+        const bool layer_has_v = is_swa ? spec.has_swa_v : spec.has_glob_v;
         const int N_type = is_swa ? N_swa : N_glob;
         const int N_kv_type = is_swa ? N_swa_kv : N_glob_kv;
         const std::string& cos_s = is_swa ? cos_swa_var : cos_glob_var;
@@ -1029,21 +1141,30 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const TpuModelSpec& spec,
                 is_swa ? "%w_swa_k" : "%w_glob_k",
                 is_swa ? "%s_swa_k" : "%s_glob_k",
                 kvi, N_kv_type, B, S, KV_sh, D, i8);
-            std::string v_flat = em.emit_linear_3d(x_an_bf,
-                is_swa ? "%w_swa_v" : "%w_glob_v",
-                is_swa ? "%s_swa_v" : "%s_glob_v",
-                kvi, N_kv_type, B, S, KV_sh, D, i8);
             if (spec.has_qkv_bias) {
                 k_flat = em.emit_add_bias_3d(k_flat, is_swa ? "%b_swa_k" : "%b_glob_k", kvi, N_kv_type, B, S, KV_sh);
-                v_flat = em.emit_add_bias_3d(v_flat, is_swa ? "%b_swa_v" : "%b_glob_v", kvi, N_kv_type, B, S, KV_sh);
+            }
+            std::string v_flat = k_flat; // Gemma 4 k_eq_v when layer_has_v == false
+            if (layer_has_v) {
+                v_flat = em.emit_linear_3d(x_an_bf,
+                    is_swa ? "%w_swa_v" : "%w_glob_v",
+                    is_swa ? "%s_swa_v" : "%s_glob_v",
+                    kvi, N_kv_type, B, S, KV_sh, D, i8);
+                if (spec.has_qkv_bias) {
+                    v_flat = em.emit_add_bias_3d(v_flat, is_swa ? "%b_swa_v" : "%b_glob_v", kvi, N_kv_type, B, S, KV_sh);
+                }
             }
             const std::string t_kv3    = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "x" + std::to_string(KV_sh) + "xf32>";
             const std::string t_kv4    = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "x" + std::to_string(Hkv_sh) + "x" + std::to_string(HD) + "xf32>";
             const std::string t_kv4_bf = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "x" + std::to_string(Hkv_sh) + "x" + std::to_string(HD) + "xbf16>";
 
-            std::string k_4d = em.tmp("k4"), v_4d = em.tmp("v4");
-            em.ss << "    " << k_4d << " = stablehlo.reshape " << k_flat << " : (" << t_kv3 << ") -> " << t_kv4 << "\n"
-                  << "    " << v_4d << " = stablehlo.reshape " << v_flat << " : (" << t_kv3 << ") -> " << t_kv4 << "\n";
+            std::string k_4d = em.tmp("k4");
+            em.ss << "    " << k_4d << " = stablehlo.reshape " << k_flat << " : (" << t_kv3 << ") -> " << t_kv4 << "\n";
+            std::string v_4d = k_4d;
+            if (layer_has_v) {
+                v_4d = em.tmp("v4");
+                em.ss << "    " << v_4d << " = stablehlo.reshape " << v_flat << " : (" << t_kv3 << ") -> " << t_kv4 << "\n";
+            }
             std::string k_pre_rope = k_4d;
             if (spec.has_k_norm) {
                 std::string k_nw = em.slice_1d_from_2d(is_swa ? "%w_swa_k_norm" : "%w_glob_k_norm", kvi, N_kv_type, HD);
@@ -1241,11 +1362,339 @@ std::string HavenTpuGemma4Engine::emit_stablehlo_mlir(const TpuModelSpec& spec,
         em.ss << "    " << f_act    << " = stablehlo.multiply " << f_gate_act << ", " << f_up << " : " << t_ff_f32 << "\n"
               << "    " << f_act_bf << " = stablehlo.convert " << f_act << " : (" << t_ff_f32 << ") -> " << t_ff_bf << "\n";
         std::string f_down_loc = em.emit_linear_3d(f_act_bf, "%w_ffn_down", "%s_ffn_down", l, L, B, S, D, F_sh, i8);
-        std::string f_down = em.emit_all_reduce_sum_3d(f_down_loc, B, S, D, R);
-        std::string f_final = f_down;
-        if (spec.has_post_ffn_norm) {
-            std::string pf_nw = em.slice_1d_from_2d("%w_post_ffn_norm", l, L, D);
-            f_final = em.emit_rms_norm_3d(f_down, pf_nw, B, S, D, spec.rms_norm_eps, c0_f32);
+        std::string f_final;
+        if (!is_moe) {
+            std::string f_down = em.emit_all_reduce_sum_3d(f_down_loc, B, S, D, R);
+            f_final = f_down;
+            if (spec.has_post_ffn_norm) {
+                std::string pf_nw = em.slice_1d_from_2d("%w_post_ffn_norm", l, L, D);
+                f_final = em.emit_rms_norm_3d(f_down, pf_nw, B, S, D, spec.rms_norm_eps, c0_f32);
+            }
+        } else {
+            // Parallel Sparse Mixture-of-Experts Branch (Gemma 4 26B-A4B / Ava 26B Turbo MoE)
+            const int N_tok = B * S;
+            const std::string t_nd_bf  = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(D) + "xbf16>";
+            const std::string t_nd_f32 = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(D) + "xf32>";
+            const std::string t_ne_f32 = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(E) + "xf32>";
+            const std::string t_ne_i32 = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(E) + "xi32>";
+            const std::string t_n1_f32 = "tensor<" + std::to_string(N_tok) + "xf32>";
+            const std::string t_nk_f32 = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(K_exp) + "xf32>";
+            const std::string t_nk_i32 = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(K_exp) + "xi32>";
+            const std::string t_bse_f32 = "tensor<" + std::to_string(B) + "x" + std::to_string(S) + "x" + std::to_string(E) + "xf32>";
+
+            // Router: RMSNorm(x_res1) * (1/sqrt(D)) * ffn_gate_inp.scale -> Linear -> Softmax -> Top-K + Renorm
+            std::string r_rn = em.emit_rms_norm_3d(x_res1, "", B, S, D, spec.rms_norm_eps, c0_f32);
+            std::string c_inv_sd = em.tmp("risd"), r_sc = em.tmp("rsc");
+            em.ss << "    " << c_inv_sd << " = stablehlo.constant dense<" << fmt_f32(1.0f / std::sqrt(static_cast<float>(D))) << "> : " << t_bsd_f32 << "\n"
+                  << "    " << r_sc << " = stablehlo.multiply " << r_rn << ", " << c_inv_sd << " : " << t_bsd_f32 << "\n";
+            std::string r_in = r_sc;
+            if (spec.has_moe_router_scale) {
+                std::string rs_1d = em.slice_1d_from_2d("%w_moe_rscale", l, L, D);
+                std::string rs_bc = em.tmp("rsbc"), r_mul = em.tmp("rmul");
+                em.ss << "    " << rs_bc << " = stablehlo.broadcast_in_dim " << rs_1d << ", dims = [2] : (tensor<" << D << "xf32>) -> " << t_bsd_f32 << "\n"
+                      << "    " << r_mul << " = stablehlo.multiply " << r_sc << ", " << rs_bc << " : " << t_bsd_f32 << "\n";
+                r_in = r_mul;
+            }
+            std::string r_bf = em.tmp("rbf");
+            em.ss << "    " << r_bf << " = stablehlo.convert " << r_in << " : (" << t_bsd_f32 << ") -> " << t_bsd_bf << "\n";
+            std::string r_lg3 = em.emit_linear_3d(r_bf, "%w_moe_router", "", l, L, B, S, E, D, false);
+            std::string r_lg2 = em.tmp("rlg2"), r_mx = em.tmp("rmx"), r_mxb = em.tmp("rmxb");
+            std::string r_sh = em.tmp("rsh"), r_ex = em.tmp("rex"), r_se = em.tmp("rse"), r_seb = em.tmp("rseb"), r_pr = em.tmp("rpr");
+            std::string e_io = em.tmp("eio"), sp = em.tmp("sp"), si = em.tmp("si");
+            std::string tp = em.tmp("tp"), ti_v = em.tmp("ti"), tsum = em.tmp("tsum"), c_epsw = em.tmp("cepsw"), tcl = em.tmp("tcl"), tcb = em.tmp("tcb"), tw = em.tmp("tw");
+
+            em.ss << "    " << r_lg2 << " = stablehlo.reshape " << r_lg3 << " : (" << t_bse_f32 << ") -> " << t_ne_f32 << "\n"
+                  << "    " << r_mx  << " = stablehlo.reduce(" << r_lg2 << " init: " << c_ninf << ") across dimensions = [1] : (" << t_ne_f32 << ", tensor<f32>) -> " << t_n1_f32 << "\n"
+                  << "      reducer(%ra: tensor<f32>, %rb: tensor<f32>) {\n"
+                  << "        %rc = stablehlo.maximum %ra, %rb : tensor<f32>\n"
+                  << "        stablehlo.return %rc : tensor<f32>\n"
+                  << "      }\n"
+                  << "    " << r_mxb << " = stablehlo.broadcast_in_dim " << r_mx << ", dims = [0] : (" << t_n1_f32 << ") -> " << t_ne_f32 << "\n"
+                  << "    " << r_sh  << " = stablehlo.subtract " << r_lg2 << ", " << r_mxb << " : " << t_ne_f32 << "\n"
+                  << "    " << r_ex  << " = stablehlo.exponential " << r_sh << " : " << t_ne_f32 << "\n"
+                  << "    " << r_se  << " = stablehlo.reduce(" << r_ex << " init: " << c0_f32 << ") across dimensions = [1] : (" << t_ne_f32 << ", tensor<f32>) -> " << t_n1_f32 << "\n"
+                  << "      reducer(%ra: tensor<f32>, %rb: tensor<f32>) {\n"
+                  << "        %rc = stablehlo.add %ra, %rb : tensor<f32>\n"
+                  << "        stablehlo.return %rc : tensor<f32>\n"
+                  << "      }\n"
+                  << "    " << r_seb << " = stablehlo.broadcast_in_dim " << r_se << ", dims = [0] : (" << t_n1_f32 << ") -> " << t_ne_f32 << "\n"
+                  << "    " << r_pr  << " = stablehlo.divide " << r_ex << ", " << r_seb << " : " << t_ne_f32 << "\n"
+                  << "    " << e_io  << " = stablehlo.iota dim = 1 : " << t_ne_i32 << "\n"
+                  << "    " << sp << ", " << si << " = \"stablehlo.sort\"(" << r_pr << ", " << e_io << ") ({\n"
+                  << "    ^bb0(%sa: tensor<f32>, %sb: tensor<f32>, %ia: tensor<i32>, %ib: tensor<i32>):\n"
+                  << "      %sgt = stablehlo.compare GT, %sa, %sb, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>\n"
+                  << "      stablehlo.return %sgt : tensor<i1>\n"
+                  << "    }) {\n"
+                  << "      dimension = 1 : i64,\n"
+                  << "      is_stable = true\n"
+                  << "    } : (" << t_ne_f32 << ", " << t_ne_i32 << ") -> (" << t_ne_f32 << ", " << t_ne_i32 << ")\n"
+                  << "    " << tp    << " = stablehlo.slice " << sp << " [0:" << N_tok << ", 0:" << K_exp << "] : (" << t_ne_f32 << ") -> " << t_nk_f32 << "\n"
+                  << "    " << ti_v  << " = stablehlo.slice " << si << " [0:" << N_tok << ", 0:" << K_exp << "] : (" << t_ne_i32 << ") -> " << t_nk_i32 << "\n"
+                  << "    " << tsum  << " = stablehlo.reduce(" << tp << " init: " << c0_f32 << ") across dimensions = [1] : (" << t_nk_f32 << ", tensor<f32>) -> " << t_n1_f32 << "\n"
+                  << "      reducer(%ra: tensor<f32>, %rb: tensor<f32>) {\n"
+                  << "        %rc = stablehlo.add %ra, %rb : tensor<f32>\n"
+                  << "        stablehlo.return %rc : tensor<f32>\n"
+                  << "      }\n"
+                  << "    " << c_epsw << " = stablehlo.constant dense<6.1035156e-05> : " << t_n1_f32 << "\n"
+                  << "    " << tcl    << " = stablehlo.maximum " << tsum << ", " << c_epsw << " : " << t_n1_f32 << "\n"
+                  << "    " << tcb    << " = stablehlo.broadcast_in_dim " << tcl << ", dims = [0] : (" << t_n1_f32 << ") -> " << t_nk_f32 << "\n"
+                  << "    " << tw     << " = stablehlo.divide " << tp << ", " << tcb << " : " << t_nk_f32 << "\n";
+
+            // Pre-FFN Norm 2 on x_res1 -> [N_tok, D] BF16
+            std::string x_m2 = x_res1;
+            if (spec.has_pre_ffn_norm_2) {
+                std::string p2_nw = em.slice_1d_from_2d("%w_pre_ffn_norm_2", l, L, D);
+                x_m2 = em.emit_rms_norm_3d(x_res1, p2_nw, B, S, D, spec.rms_norm_eps, c0_f32);
+            }
+            std::string xm2_bf3 = em.tmp("xm2b"), xm2_bf = em.tmp("xm2");
+            em.ss << "    " << xm2_bf3 << " = stablehlo.convert " << x_m2 << " : (" << t_bsd_f32 << ") -> " << t_bsd_bf << "\n"
+                  << "    " << xm2_bf  << " = stablehlo.reshape " << xm2_bf3 << " : (" << t_bsd_bf << ") -> " << t_nd_bf << "\n";
+
+            // Slice layer l from 4D expert weight stacks
+            const std::string t_wgu4 = "tensor<" + std::to_string(L) + "x" + std::to_string(E) + "x" + std::to_string(GU_exp_sh) + "x" + std::to_string(D) + "x" + wel + ">";
+            const std::string t_wgu1 = "tensor<1x" + std::to_string(E) + "x" + std::to_string(GU_exp_sh) + "x" + std::to_string(D) + "x" + wel + ">";
+            const std::string t_wgu3 = "tensor<" + std::to_string(E) + "x" + std::to_string(GU_exp_sh) + "x" + std::to_string(D) + "x" + wel + ">";
+            const std::string t_wdn4 = "tensor<" + std::to_string(L) + "x" + std::to_string(E) + "x" + std::to_string(D) + "x" + std::to_string(F_exp_sh) + "x" + wel + ">";
+            const std::string t_wdn1 = "tensor<1x" + std::to_string(E) + "x" + std::to_string(D) + "x" + std::to_string(F_exp_sh) + "x" + wel + ">";
+            const std::string t_wdn3 = "tensor<" + std::to_string(E) + "x" + std::to_string(D) + "x" + std::to_string(F_exp_sh) + "x" + wel + ">";
+
+            std::string wgu_s = em.tmp("wgus"), wgu_l = em.tmp("wgul"), wdn_s = em.tmp("wdns"), wdn_l = em.tmp("wdnl");
+            em.ss << "    " << wgu_s << " = stablehlo.slice %w_moe_gu [" << l << ":" << (l + 1) << ", 0:" << E << ", 0:" << GU_exp_sh << ", 0:" << D << "] : (" << t_wgu4 << ") -> " << t_wgu1 << "\n"
+                  << "    " << wgu_l << " = stablehlo.reshape " << wgu_s << " : (" << t_wgu1 << ") -> " << t_wgu3 << "\n"
+                  << "    " << wdn_s << " = stablehlo.slice %w_moe_dn [" << l << ":" << (l + 1) << ", 0:" << E << ", 0:" << D << ", 0:" << F_exp_sh << "] : (" << t_wdn4 << ") -> " << t_wdn1 << "\n"
+                  << "    " << wdn_l << " = stablehlo.reshape " << wdn_s << " : (" << t_wdn1 << ") -> " << t_wdn3 << "\n";
+
+            std::string sgu_l, sdn_l;
+            const std::string t_sgu2 = "tensor<" + std::to_string(E) + "x" + std::to_string(GU_exp_sh) + "xf32>";
+            const std::string t_sdn2 = "tensor<" + std::to_string(E) + "x" + std::to_string(D) + "xf32>";
+            if (i8) {
+                const std::string t_sgu3 = "tensor<" + std::to_string(L) + "x" + std::to_string(E) + "x" + std::to_string(GU_exp_sh) + "xf32>";
+                const std::string t_sgu1 = "tensor<1x" + std::to_string(E) + "x" + std::to_string(GU_exp_sh) + "xf32>";
+                const std::string t_sdn3 = "tensor<" + std::to_string(L) + "x" + std::to_string(E) + "x" + std::to_string(D) + "xf32>";
+                const std::string t_sdn1 = "tensor<1x" + std::to_string(E) + "x" + std::to_string(D) + "xf32>";
+                std::string sg_s = em.tmp("sgus"), sd_s = em.tmp("sdns");
+                sgu_l = em.tmp("sgul"); sdn_l = em.tmp("sdnl");
+                em.ss << "    " << sg_s  << " = stablehlo.slice %s_moe_gu [" << l << ":" << (l + 1) << ", 0:" << E << ", 0:" << GU_exp_sh << "] : (" << t_sgu3 << ") -> " << t_sgu1 << "\n"
+                      << "    " << sgu_l << " = stablehlo.reshape " << sg_s << " : (" << t_sgu1 << ") -> " << t_sgu2 << "\n"
+                      << "    " << sd_s  << " = stablehlo.slice %s_moe_dn [" << l << ":" << (l + 1) << ", 0:" << E << ", 0:" << D << "] : (" << t_sdn3 << ") -> " << t_sdn1 << "\n"
+                      << "    " << sdn_l << " = stablehlo.reshape " << sd_s << " : (" << t_sdn1 << ") -> " << t_sdn2 << "\n";
+            }
+
+            std::string moe_2d;
+            if (N_tok <= 8) {
+                // Regime 1 (Interactive / Small-Batch): Sparse Top-K Gather (reads only K_exp/E = 6.25% of HBM3!)
+                const std::string t_idx3   = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(K_exp) + "x1xi32>";
+                const std::string t_ggu    = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(K_exp) + "x" + std::to_string(GU_exp_sh) + "x" + std::to_string(D) + "x" + wel + ">";
+                const std::string t_ggub   = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(K_exp) + "x" + std::to_string(GU_exp_sh) + "x" + std::to_string(D) + "xbf16>";
+                const std::string t_gu_f32 = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(K_exp) + "x" + std::to_string(GU_exp_sh) + "xf32>";
+                const std::string t_ef_f32 = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(K_exp) + "x" + std::to_string(F_exp_sh) + "xf32>";
+                const std::string t_ef_bf  = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(K_exp) + "x" + std::to_string(F_exp_sh) + "xbf16>";
+                const std::string t_gdn    = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(K_exp) + "x" + std::to_string(D) + "x" + std::to_string(F_exp_sh) + "x" + wel + ">";
+                const std::string t_gdnb   = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(K_exp) + "x" + std::to_string(D) + "x" + std::to_string(F_exp_sh) + "xbf16>";
+                const std::string t_dn_f32 = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(K_exp) + "x" + std::to_string(D) + "xf32>";
+
+                std::string ti3 = em.tmp("ti3"), ggu = em.tmp("ggu");
+                em.ss << "    " << ti3 << " = stablehlo.reshape " << ti_v << " : (" << t_nk_i32 << ") -> " << t_idx3 << "\n"
+                      << "    " << ggu << " = \"stablehlo.gather\"(" << wgu_l << ", " << ti3 << ") {\n"
+                      << "      dimension_numbers = #stablehlo.gather<\n"
+                      << "        offset_dims = [2, 3],\n"
+                      << "        collapsed_slice_dims = [0],\n"
+                      << "        start_index_map = [0],\n"
+                      << "        index_vector_dim = 2\n"
+                      << "      >,\n"
+                      << "      indices_are_sorted = false,\n"
+                      << "      slice_sizes = array<i64: 1, " << GU_exp_sh << ", " << D << ">\n"
+                      << "    } : (" << t_wgu3 << ", " << t_idx3 << ") -> " << t_ggu << "\n";
+                std::string ggu_bf = ggu;
+                if (i8) {
+                    ggu_bf = em.tmp("ggub");
+                    em.ss << "    " << ggu_bf << " = stablehlo.convert " << ggu << " : (" << t_ggu << ") -> " << t_ggub << "\n";
+                }
+                std::string gu_dot = em.tmp("gudot");
+                em.ss << "    " << gu_dot << " = stablehlo.dot_general " << xm2_bf << ", " << ggu_bf
+                      << ", batching_dims = [0] x [0], contracting_dims = [1] x [3] : (" << t_nd_bf << ", " << t_ggub << ") -> " << t_gu_f32 << "\n";
+                std::string gu_cur = gu_dot;
+                if (i8) {
+                    std::string gsgu = em.tmp("gsgu"), gu_sc = em.tmp("gusc");
+                    em.ss << "    " << gsgu << " = \"stablehlo.gather\"(" << sgu_l << ", " << ti3 << ") {\n"
+                          << "      dimension_numbers = #stablehlo.gather<\n"
+                          << "        offset_dims = [2],\n"
+                          << "        collapsed_slice_dims = [0],\n"
+                          << "        start_index_map = [0],\n"
+                          << "        index_vector_dim = 2\n"
+                          << "      >,\n"
+                          << "      indices_are_sorted = false,\n"
+                          << "      slice_sizes = array<i64: 1, " << GU_exp_sh << ">\n"
+                          << "    } : (" << t_sgu2 << ", " << t_idx3 << ") -> " << t_gu_f32 << "\n"
+                          << "    " << gu_sc << " = stablehlo.multiply " << gu_dot << ", " << gsgu << " : " << t_gu_f32 << "\n";
+                    gu_cur = gu_sc;
+                }
+                std::string eg = em.tmp("eg"), eu = em.tmp("eu");
+                em.ss << "    " << eg << " = stablehlo.slice " << gu_cur << " [0:" << N_tok << ", 0:" << K_exp << ", 0:" << F_exp_sh << "] : (" << t_gu_f32 << ") -> " << t_ef_f32 << "\n"
+                      << "    " << eu << " = stablehlo.slice " << gu_cur << " [0:" << N_tok << ", 0:" << K_exp << ", " << F_exp_sh << ":" << GU_exp_sh << "] : (" << t_gu_f32 << ") -> " << t_ef_f32 << "\n";
+                std::string eg_act = (spec.ffn_activation == FfnActivation::GELU)
+                    ? em.emit_gelu_3d(eg, N_tok, K_exp, F_exp_sh)
+                    : em.emit_silu_3d(eg, N_tok, K_exp, F_exp_sh);
+                std::string eact = em.tmp("eact"), eact_bf = em.tmp("eab"), gdn = em.tmp("gdn");
+                em.ss << "    " << eact    << " = stablehlo.multiply " << eg_act << ", " << eu << " : " << t_ef_f32 << "\n"
+                      << "    " << eact_bf << " = stablehlo.convert " << eact << " : (" << t_ef_f32 << ") -> " << t_ef_bf << "\n"
+                      << "    " << gdn << " = \"stablehlo.gather\"(" << wdn_l << ", " << ti3 << ") {\n"
+                      << "      dimension_numbers = #stablehlo.gather<\n"
+                      << "        offset_dims = [2, 3],\n"
+                      << "        collapsed_slice_dims = [0],\n"
+                      << "        start_index_map = [0],\n"
+                      << "        index_vector_dim = 2\n"
+                      << "      >,\n"
+                      << "      indices_are_sorted = false,\n"
+                      << "      slice_sizes = array<i64: 1, " << D << ", " << F_exp_sh << ">\n"
+                      << "    } : (" << t_wdn3 << ", " << t_idx3 << ") -> " << t_gdn << "\n";
+                std::string gdn_bf = gdn;
+                if (i8) {
+                    gdn_bf = em.tmp("gdnb");
+                    em.ss << "    " << gdn_bf << " = stablehlo.convert " << gdn << " : (" << t_gdn << ") -> " << t_gdnb << "\n";
+                }
+                std::string dn_dot = em.tmp("dndot");
+                em.ss << "    " << dn_dot << " = stablehlo.dot_general " << eact_bf << ", " << gdn_bf
+                      << ", batching_dims = [0, 1] x [0, 1], contracting_dims = [2] x [3] : (" << t_ef_bf << ", " << t_gdnb << ") -> " << t_dn_f32 << "\n";
+                std::string dn_cur = dn_dot;
+                if (i8) {
+                    std::string gsdn = em.tmp("gsdn"), dn_sc = em.tmp("dnsc");
+                    em.ss << "    " << gsdn << " = \"stablehlo.gather\"(" << sdn_l << ", " << ti3 << ") {\n"
+                          << "      dimension_numbers = #stablehlo.gather<\n"
+                          << "        offset_dims = [2],\n"
+                          << "        collapsed_slice_dims = [0],\n"
+                          << "        start_index_map = [0],\n"
+                          << "        index_vector_dim = 2\n"
+                          << "      >,\n"
+                          << "      indices_are_sorted = false,\n"
+                          << "      slice_sizes = array<i64: 1, " << D << ">\n"
+                          << "    } : (" << t_sdn2 << ", " << t_idx3 << ") -> " << t_dn_f32 << "\n"
+                          << "    " << dn_sc << " = stablehlo.multiply " << dn_dot << ", " << gsdn << " : " << t_dn_f32 << "\n";
+                    dn_cur = dn_sc;
+                }
+                std::string twb = em.tmp("twb"), dnw = em.tmp("dnw");
+                moe_2d = em.tmp("moe2");
+                em.ss << "    " << twb    << " = stablehlo.broadcast_in_dim " << tw << ", dims = [0, 1] : (" << t_nk_f32 << ") -> " << t_dn_f32 << "\n"
+                      << "    " << dnw    << " = stablehlo.multiply " << dn_cur << ", " << twb << " : " << t_dn_f32 << "\n"
+                      << "    " << moe_2d << " = stablehlo.reduce(" << dnw << " init: " << c0_f32 << ") across dimensions = [1] : (" << t_dn_f32 << ", tensor<f32>) -> " << t_nd_f32 << "\n"
+                      << "      reducer(%ra: tensor<f32>, %rb: tensor<f32>) {\n"
+                      << "        %rc = stablehlo.add %ra, %rb : tensor<f32>\n"
+                      << "        stablehlo.return %rc : tensor<f32>\n"
+                      << "      }\n";
+            } else {
+                // Regime 2 (Continuous Batching B>=16 / MXU Prefill S>=16): Single-Pass Dense-Masked MXU GEMM!
+                const std::string t_nk1_i32 = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(K_exp) + "x1xi32>";
+                const std::string t_nk2_i32 = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(K_exp) + "x2xi32>";
+                const std::string t_wgu3b   = "tensor<" + std::to_string(E) + "x" + std::to_string(GU_exp_sh) + "x" + std::to_string(D) + "xbf16>";
+                const std::string t_wdn3b   = "tensor<" + std::to_string(E) + "x" + std::to_string(D) + "x" + std::to_string(F_exp_sh) + "xbf16>";
+                const std::string t_gu_f32  = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(E) + "x" + std::to_string(GU_exp_sh) + "xf32>";
+                const std::string t_ef_f32  = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(E) + "x" + std::to_string(F_exp_sh) + "xf32>";
+                const std::string t_ef_bf   = "tensor<" + std::to_string(N_tok) + "x" + std::to_string(E) + "x" + std::to_string(F_exp_sh) + "xbf16>";
+
+                std::string n_io = em.tmp("nio"), n_io3 = em.tmp("nio3"), ti3 = em.tmp("ti3"), sc_idx = em.tmp("msc");
+                std::string z_ne = em.tmp("zne"), w_rt = em.tmp("wrt");
+                em.ss << "    " << n_io   << " = stablehlo.iota dim = 0 : " << t_nk_i32 << "\n"
+                      << "    " << n_io3  << " = stablehlo.reshape " << n_io << " : (" << t_nk_i32 << ") -> " << t_nk1_i32 << "\n"
+                      << "    " << ti3    << " = stablehlo.reshape " << ti_v << " : (" << t_nk_i32 << ") -> " << t_nk1_i32 << "\n"
+                      << "    " << sc_idx << " = stablehlo.concatenate " << n_io3 << ", " << ti3 << ", dim = 2 : (" << t_nk1_i32 << ", " << t_nk1_i32 << ") -> " << t_nk2_i32 << "\n"
+                      << "    " << z_ne   << " = stablehlo.constant dense<0.0000000e+00> : " << t_ne_f32 << "\n"
+                      << "    " << w_rt   << " = \"stablehlo.scatter\"(" << z_ne << ", " << sc_idx << ", " << tw << ") ({\n"
+                      << "    ^bb0(%old: tensor<f32>, %new: tensor<f32>):\n"
+                      << "      stablehlo.return %new : tensor<f32>\n"
+                      << "    }) {\n"
+                      << "      scatter_dimension_numbers = #stablehlo.scatter<\n"
+                      << "        update_window_dims = [],\n"
+                      << "        inserted_window_dims = [0, 1],\n"
+                      << "        scatter_dims_to_operand_dims = [0, 1],\n"
+                      << "        index_vector_dim = 2\n"
+                      << "      >,\n"
+                      << "      indices_are_sorted = false,\n"
+                      << "      unique_indices = true\n"
+                      << "    } : (" << t_ne_f32 << ", " << t_nk2_i32 << ", " << t_nk_f32 << ") -> " << t_ne_f32 << "\n";
+
+                std::string wgu_bf = wgu_l;
+                if (i8) {
+                    wgu_bf = em.tmp("wgub");
+                    em.ss << "    " << wgu_bf << " = stablehlo.convert " << wgu_l << " : (" << t_wgu3 << ") -> " << t_wgu3b << "\n";
+                }
+                std::string gu_dot = em.tmp("gudot");
+                em.ss << "    " << gu_dot << " = stablehlo.dot_general " << xm2_bf << ", " << wgu_bf
+                      << ", contracting_dims = [1] x [2] : (" << t_nd_bf << ", " << t_wgu3b << ") -> " << t_gu_f32 << "\n";
+                std::string gu_cur = gu_dot;
+                if (i8) {
+                    std::string sgub = em.tmp("sgub"), gu_sc = em.tmp("gusc");
+                    em.ss << "    " << sgub  << " = stablehlo.broadcast_in_dim " << sgu_l << ", dims = [1, 2] : (" << t_sgu2 << ") -> " << t_gu_f32 << "\n"
+                          << "    " << gu_sc << " = stablehlo.multiply " << gu_dot << ", " << sgub << " : " << t_gu_f32 << "\n";
+                    gu_cur = gu_sc;
+                }
+                std::string eg = em.tmp("eg"), eu = em.tmp("eu");
+                em.ss << "    " << eg << " = stablehlo.slice " << gu_cur << " [0:" << N_tok << ", 0:" << E << ", 0:" << F_exp_sh << "] : (" << t_gu_f32 << ") -> " << t_ef_f32 << "\n"
+                      << "    " << eu << " = stablehlo.slice " << gu_cur << " [0:" << N_tok << ", 0:" << E << ", " << F_exp_sh << ":" << GU_exp_sh << "] : (" << t_gu_f32 << ") -> " << t_ef_f32 << "\n";
+                std::string eg_act = (spec.ffn_activation == FfnActivation::GELU)
+                    ? em.emit_gelu_3d(eg, N_tok, E, F_exp_sh)
+                    : em.emit_silu_3d(eg, N_tok, E, F_exp_sh);
+                std::string eact = em.tmp("eact"), wrtb = em.tmp("wrtb"), eact_w = em.tmp("eactw"), eact_bf = em.tmp("eab");
+                em.ss << "    " << eact    << " = stablehlo.multiply " << eg_act << ", " << eu << " : " << t_ef_f32 << "\n"
+                      << "    " << wrtb    << " = stablehlo.broadcast_in_dim " << w_rt << ", dims = [0, 1] : (" << t_ne_f32 << ") -> " << t_ef_f32 << "\n"
+                      << "    " << eact_w  << " = stablehlo.multiply " << eact << ", " << wrtb << " : " << t_ef_f32 << "\n"
+                      << "    " << eact_bf << " = stablehlo.convert " << eact_w << " : (" << t_ef_f32 << ") -> " << t_ef_bf << "\n";
+
+                std::string wdn_bf = wdn_l;
+                if (i8) {
+                    wdn_bf = em.tmp("wdnb");
+                    em.ss << "    " << wdn_bf << " = stablehlo.convert " << wdn_l << " : (" << t_wdn3 << ") -> " << t_wdn3b << "\n";
+                    const std::string t_end_f32 = "tensor<" + std::to_string(E) + "x" + std::to_string(N_tok) + "x" + std::to_string(D) + "xf32>";
+                    std::string dne = em.tmp("dne"), sdnb = em.tmp("sdnb"), dnsc = em.tmp("dnsc");
+                    moe_2d = em.tmp("moe2");
+                    em.ss << "    " << dne    << " = stablehlo.dot_general " << eact_bf << ", " << wdn_bf
+                          << ", batching_dims = [1] x [0], contracting_dims = [2] x [2] : (" << t_ef_bf << ", " << t_wdn3b << ") -> " << t_end_f32 << "\n"
+                          << "    " << sdnb   << " = stablehlo.broadcast_in_dim " << sdn_l << ", dims = [0, 2] : (" << t_sdn2 << ") -> " << t_end_f32 << "\n"
+                          << "    " << dnsc   << " = stablehlo.multiply " << dne << ", " << sdnb << " : " << t_end_f32 << "\n"
+                          << "    " << moe_2d << " = stablehlo.reduce(" << dnsc << " init: " << c0_f32 << ") across dimensions = [0] : (" << t_end_f32 << ", tensor<f32>) -> " << t_nd_f32 << "\n"
+                          << "      reducer(%ra: tensor<f32>, %rb: tensor<f32>) {\n"
+                          << "        %rc = stablehlo.add %ra, %rb : tensor<f32>\n"
+                          << "        stablehlo.return %rc : tensor<f32>\n"
+                          << "      }\n";
+                } else {
+                    moe_2d = em.tmp("moe2");
+                    em.ss << "    " << moe_2d << " = stablehlo.dot_general " << eact_bf << ", " << wdn_bf
+                          << ", contracting_dims = [1, 2] x [0, 2] : (" << t_ef_bf << ", " << t_wdn3b << ") -> " << t_nd_f32 << "\n";
+                }
+            }
+
+            std::string moe_loc = em.tmp("moel");
+            em.ss << "    " << moe_loc << " = stablehlo.reshape " << moe_2d << " : (" << t_nd_f32 << ") -> " << t_bsd_f32 << "\n";
+
+            // Fused Single Optical ICI AllReduce for BOTH Shared-MLP and Sparse-MoE branches!
+            std::string mlp_ar = f_down_loc;
+            std::string moe_ar = moe_loc;
+            if (R > 1) {
+                const std::string t_2bsd = "tensor<" + std::to_string(2 * B) + "x" + std::to_string(S) + "x" + std::to_string(D) + "xf32>";
+                std::string both_loc = em.tmp("bothl");
+                em.ss << "    " << both_loc << " = stablehlo.concatenate " << f_down_loc << ", " << moe_loc << ", dim = 0 : ("
+                      << t_bsd_f32 << ", " << t_bsd_f32 << ") -> " << t_2bsd << "\n";
+                std::string both_ar = em.emit_all_reduce_sum_3d(both_loc, 2 * B, S, D, R);
+                mlp_ar = em.tmp("mlpar");
+                moe_ar = em.tmp("moear");
+                em.ss << "    " << mlp_ar << " = stablehlo.slice " << both_ar << " [0:" << B << ", 0:" << S << ", 0:" << D << "] : (" << t_2bsd << ") -> " << t_bsd_f32 << "\n"
+                      << "    " << moe_ar << " = stablehlo.slice " << both_ar << " [" << B << ":" << (2 * B) << ", 0:" << S << ", 0:" << D << "] : (" << t_2bsd << ") -> " << t_bsd_f32 << "\n";
+            }
+
+            if (spec.has_post_ffn_norm_1) {
+                std::string p1_nw = em.slice_1d_from_2d("%w_post_ffn_norm_1", l, L, D);
+                mlp_ar = em.emit_rms_norm_3d(mlp_ar, p1_nw, B, S, D, spec.rms_norm_eps, c0_f32);
+            }
+            if (spec.has_post_ffn_norm_2) {
+                std::string p2_nw = em.slice_1d_from_2d("%w_post_ffn_norm_2", l, L, D);
+                moe_ar = em.emit_rms_norm_3d(moe_ar, p2_nw, B, S, D, spec.rms_norm_eps, c0_f32);
+            }
+            std::string f_comb = em.tmp("fcomb");
+            em.ss << "    " << f_comb << " = stablehlo.add " << mlp_ar << ", " << moe_ar << " : " << t_bsd_f32 << "\n";
+            f_final = f_comb;
+            if (spec.has_post_ffn_norm) {
+                std::string pf_nw = em.slice_1d_from_2d("%w_post_ffn_norm", l, L, D);
+                f_final = em.emit_rms_norm_3d(f_comb, pf_nw, B, S, D, spec.rms_norm_eps, c0_f32);
+            }
         }
         std::string x_after_ffn = em.tmp("res2");
         em.ss << "    " << x_after_ffn << " = stablehlo.add " << x_res1 << ", " << f_final << " : " << t_bsd_f32 << "\n";
@@ -1454,8 +1903,8 @@ bool HavenTpuGemma4Engine::build_and_upload_weights(const HavenEngine& host_engi
 
     const int V_sh = V / R;
     const int H_sh = H / R;
-    const int Hkv_sh = compute_hkv_shard(Hkv, R);
-    const int gqa_ratio = std::max(1, H / Hkv);
+    const int Hkv_swa = (spec_.num_kv_heads_swa > 0) ? spec_.num_kv_heads_swa : Hkv;
+    const int Hkv_glob = (spec_.num_kv_heads_glob > 0) ? spec_.num_kv_heads_glob : Hkv;
     const int HD_swa = spec_.head_dim_swa;
     const int HD_glob = spec_.head_dim_glob;
     const int P_dim = spec_.pleias_dim;
@@ -1486,10 +1935,14 @@ bool HavenTpuGemma4Engine::build_and_upload_weights(const HavenEngine& host_engi
                                     const std::function<const TensorDesc*(int)>& getter,
                                     int full_rows, int full_cols,
                                     bool shard_rows, bool shard_cols,
-                                    bool is_kv_head_shard) -> bool {
+                                    bool is_kv_head_shard,
+                                    int layer_hkv = 0) -> bool {
         const int cnt = static_cast<int>(layer_list.size());
         if (cnt <= 0) return true;
-        const int r_sh = shard_rows ? (is_kv_head_shard ? (full_rows / Hkv * Hkv_sh) : (full_rows / R)) : full_rows;
+        const int eff_hkv = (layer_hkv > 0) ? layer_hkv : Hkv;
+        const int eff_hkv_sh = compute_hkv_shard(eff_hkv, R);
+        const int eff_gqa = std::max(1, H / eff_hkv);
+        const int r_sh = shard_rows ? (is_kv_head_shard ? (full_rows / eff_hkv * eff_hkv_sh) : (full_rows / R)) : full_rows;
         const int c_sh = shard_cols ? (full_cols / R) : full_cols;
 
         const size_t shard_elems = static_cast<size_t>(cnt) * static_cast<size_t>(r_sh) * static_cast<size_t>(c_sh);
@@ -1514,8 +1967,8 @@ bool HavenTpuGemma4Engine::build_and_upload_weights(const HavenEngine& host_engi
                 int r_off = 0;
                 if (shard_rows) {
                     if (is_kv_head_shard) {
-                        int kv_head_start = (rep * H_sh) / gqa_ratio;
-                        r_off = kv_head_start * (full_rows / Hkv);
+                        int kv_head_start = (rep * H_sh) / eff_gqa;
+                        r_off = kv_head_start * (full_rows / eff_hkv);
                     } else {
                         r_off = rep * r_sh;
                     }
@@ -1624,20 +2077,193 @@ bool HavenTpuGemma4Engine::build_and_upload_weights(const HavenEngine& host_engi
     if (!upload_sharded_stack(all_layers, [&](int l){ return host_engine.get_layer_tensors(l).ffn_gate; }, F, D, true, false, false)) return false;
     if (!upload_sharded_stack(all_layers, [&](int l){ return host_engine.get_layer_tensors(l).ffn_up; },   F, D, true, false, false)) return false;
     if (!upload_sharded_stack(all_layers, [&](int l){ return host_engine.get_layer_tensors(l).ffn_down; }, D, F, false, true, false)) return false;
+
+    // 1b. Sparse Mixture-of-Experts 4D weight stacks (streamed replica-by-replica to keep peak host RAM minimal!)
+    if (spec_.is_moe) {
+        const int E = spec_.num_experts;
+        const int F_exp = spec_.expert_ffn_dim;
+        const int F_exp_sh = F_exp / R;
+        const int GU_exp_sh = 2 * F_exp_sh;
+
+        // %w_moe_router: [L, E, D] BF16 (replicated across R chips)
+        {
+            const size_t r_elems = static_cast<size_t>(L) * static_cast<size_t>(E) * static_cast<size_t>(D);
+            std::vector<uint16_t> r_bf(r_elems, 0);
+            std::vector<float> mat;
+            for (int l = 0; l < L; ++l) {
+                dequantize_full_matrix_f32(host_engine.get_layer_tensors(l).ffn_gate_inp, E, D, mat);
+                HavenTpuPjrtBackend::convert_f32_to_bf16(mat.data(), r_bf.data() + static_cast<size_t>(l) * mat.size(), mat.size());
+            }
+            for (int rep = 0; rep < R; ++rep) {
+                const int dev = replica_dev_indices_[static_cast<size_t>(rep)];
+                PJRT_Buffer* b = backend_->upload_bf16_nd(r_bf.data(), {L, E, D}, dev);
+                if (!b) return false;
+                replica_weight_bufs_[static_cast<size_t>(rep)].push_back(b);
+                total_bytes += r_elems * sizeof(uint16_t);
+            }
+        }
+
+        // %w_moe_gu: [L, E, 2*F_exp_sh, D] (exact split gate[0..F_exp_sh-1] + up[F_exp_sh..2*F_exp_sh-1] per replica!)
+        {
+            const size_t shard_elems = static_cast<size_t>(L) * static_cast<size_t>(E) * static_cast<size_t>(GU_exp_sh) * static_cast<size_t>(D);
+            const size_t scale_elems = static_cast<size_t>(L) * static_cast<size_t>(E) * static_cast<size_t>(GU_exp_sh);
+            for (int rep = 0; rep < R; ++rep) {
+                const int dev = replica_dev_indices_[static_cast<size_t>(rep)];
+                std::vector<uint16_t> bf_buf(i8 ? 0 : shard_elems, 0);
+                std::vector<int8_t>   s8_buf(i8 ? shard_elems : 0, 0);
+                std::vector<float>    sc_buf(i8 ? scale_elems : 0, 1.0f);
+
+                for (int l = 0; l < L; ++l) {
+                    const auto& lt = host_engine.get_layer_tensors(static_cast<uint32_t>(l));
+                    const bool fused_gu = (lt.ffn_gate_up_exps != nullptr);
+                    #pragma omp parallel
+                    {
+                        std::vector<float> row_f32(static_cast<size_t>(D), 0.0f);
+                        #pragma omp for schedule(static)
+                        for (int e = 0; e < E; ++e) {
+                            const size_t base_row_out = (static_cast<size_t>(l) * static_cast<size_t>(E) + static_cast<size_t>(e)) * static_cast<size_t>(GU_exp_sh);
+                            for (int half = 0; half < 2; ++half) {
+                                const TensorDesc* src_td = fused_gu ? lt.ffn_gate_up_exps : (half == 0 ? lt.ffn_gate_exps : lt.ffn_up_exps);
+                                for (int rr = 0; rr < F_exp_sh; ++rr) {
+                                    const int src_row = fused_gu
+                                        ? (e * (2 * F_exp) + half * F_exp + rep * F_exp_sh + rr)
+                                        : (e * F_exp + rep * F_exp_sh + rr);
+                                    if (src_td && src_td->data) {
+                                        Avx2Math::dequantize_row(row_f32.data(), *src_td, src_row, D);
+                                    } else {
+                                        std::fill(row_f32.begin(), row_f32.end(), 0.0f);
+                                    }
+                                    const size_t out_row_idx = base_row_out + static_cast<size_t>(half * F_exp_sh + rr);
+                                    const size_t out_elem_off = out_row_idx * static_cast<size_t>(D);
+                                    if (!i8) {
+                                        HavenTpuPjrtBackend::convert_f32_to_bf16(row_f32.data(), bf_buf.data() + out_elem_off, static_cast<size_t>(D));
+                                    } else {
+                                        float max_abs = 0.0f;
+                                        for (int c = 0; c < D; ++c) {
+                                            float a = std::fabs(row_f32[static_cast<size_t>(c)]);
+                                            if (a > max_abs) max_abs = a;
+                                        }
+                                        const float scale = (max_abs > 1e-12f) ? (max_abs / 127.0f) : 1.0f;
+                                        const float inv_scale = (max_abs > 1e-12f) ? (127.0f / max_abs) : 0.0f;
+                                        sc_buf[out_row_idx] = scale;
+                                        int8_t* dst_r = s8_buf.data() + out_elem_off;
+                                        for (int c = 0; c < D; ++c) {
+                                            int q = static_cast<int>(std::lrintf(row_f32[static_cast<size_t>(c)] * inv_scale));
+                                            dst_r[c] = static_cast<int8_t>(std::clamp(q, -127, 127));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                PJRT_Buffer* wb = nullptr;
+                if (!i8) {
+                    wb = backend_->upload_bf16_nd(bf_buf.data(), {L, E, GU_exp_sh, D}, dev);
+                    total_bytes += shard_elems * sizeof(uint16_t);
+                } else {
+                    wb = backend_->upload_s8_nd(s8_buf.data(), {L, E, GU_exp_sh, D}, dev);
+                    PJRT_Buffer* sb = backend_->upload_f32_nd(sc_buf.data(), {L, E, GU_exp_sh}, dev);
+                    if (!sb) { backend_->destroy_buffer(wb); return false; }
+                    replica_scale_bufs[static_cast<size_t>(rep)].push_back(sb);
+                    total_bytes += shard_elems + scale_elems * sizeof(float);
+                }
+                if (!wb) return false;
+                replica_weight_bufs_[static_cast<size_t>(rep)].push_back(wb);
+            }
+        }
+
+        // %w_moe_dn: [L, E, D, F_exp_sh] (column-sharded along F_exp, with ffn_down_exps.scale[e] pre-folded!)
+        {
+            const size_t shard_elems = static_cast<size_t>(L) * static_cast<size_t>(E) * static_cast<size_t>(D) * static_cast<size_t>(F_exp_sh);
+            const size_t scale_elems = static_cast<size_t>(L) * static_cast<size_t>(E) * static_cast<size_t>(D);
+            for (int rep = 0; rep < R; ++rep) {
+                const int dev = replica_dev_indices_[static_cast<size_t>(rep)];
+                std::vector<uint16_t> bf_buf(i8 ? 0 : shard_elems, 0);
+                std::vector<int8_t>   s8_buf(i8 ? shard_elems : 0, 0);
+                std::vector<float>    sc_buf(i8 ? scale_elems : 0, 1.0f);
+
+                for (int l = 0; l < L; ++l) {
+                    const auto& lt = host_engine.get_layer_tensors(static_cast<uint32_t>(l));
+                    const auto down_s = extract_f32_1d(lt.ffn_down_exps_scale, E, 1.0f);
+                    const int col_off = rep * F_exp_sh;
+                    #pragma omp parallel
+                    {
+                        std::vector<float> full_row(static_cast<size_t>(F_exp), 0.0f);
+                        std::vector<float> slice_row(static_cast<size_t>(F_exp_sh), 0.0f);
+                        #pragma omp for schedule(static)
+                        for (int e = 0; e < E; ++e) {
+                            const float es = down_s[static_cast<size_t>(e)];
+                            const size_t base_row_out = (static_cast<size_t>(l) * static_cast<size_t>(E) + static_cast<size_t>(e)) * static_cast<size_t>(D);
+                            for (int r = 0; r < D; ++r) {
+                                if (lt.ffn_down_exps && lt.ffn_down_exps->data) {
+                                    Avx2Math::dequantize_row(full_row.data(), *lt.ffn_down_exps, e * D + r, F_exp);
+                                    for (int c = 0; c < F_exp_sh; ++c) {
+                                        slice_row[static_cast<size_t>(c)] = full_row[static_cast<size_t>(col_off + c)] * es;
+                                    }
+                                } else {
+                                    std::fill(slice_row.begin(), slice_row.end(), 0.0f);
+                                }
+                                const size_t out_row_idx = base_row_out + static_cast<size_t>(r);
+                                const size_t out_elem_off = out_row_idx * static_cast<size_t>(F_exp_sh);
+                                if (!i8) {
+                                    HavenTpuPjrtBackend::convert_f32_to_bf16(slice_row.data(), bf_buf.data() + out_elem_off, static_cast<size_t>(F_exp_sh));
+                                } else {
+                                    float max_abs = 0.0f;
+                                    for (int c = 0; c < F_exp_sh; ++c) {
+                                        float a = std::fabs(slice_row[static_cast<size_t>(c)]);
+                                        if (a > max_abs) max_abs = a;
+                                    }
+                                    const float scale = (max_abs > 1e-12f) ? (max_abs / 127.0f) : 1.0f;
+                                    const float inv_scale = (max_abs > 1e-12f) ? (127.0f / max_abs) : 0.0f;
+                                    sc_buf[out_row_idx] = scale;
+                                    int8_t* dst_r = s8_buf.data() + out_elem_off;
+                                    for (int c = 0; c < F_exp_sh; ++c) {
+                                        int q = static_cast<int>(std::lrintf(slice_row[static_cast<size_t>(c)] * inv_scale));
+                                        dst_r[c] = static_cast<int8_t>(std::clamp(q, -127, 127));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                PJRT_Buffer* wb = nullptr;
+                if (!i8) {
+                    wb = backend_->upload_bf16_nd(bf_buf.data(), {L, E, D, F_exp_sh}, dev);
+                    total_bytes += shard_elems * sizeof(uint16_t);
+                } else {
+                    wb = backend_->upload_s8_nd(s8_buf.data(), {L, E, D, F_exp_sh}, dev);
+                    PJRT_Buffer* sb = backend_->upload_f32_nd(sc_buf.data(), {L, E, D}, dev);
+                    if (!sb) { backend_->destroy_buffer(wb); return false; }
+                    replica_scale_bufs[static_cast<size_t>(rep)].push_back(sb);
+                    total_bytes += shard_elems + scale_elems * sizeof(float);
+                }
+                if (!wb) return false;
+                replica_weight_bufs_[static_cast<size_t>(rep)].push_back(wb);
+            }
+        }
+    }
+
     if (N_swa > 0) {
         if (!upload_sharded_stack(swa_layers,    [&](int l){ return host_engine.get_layer_tensors(l).attn_q; },      H * HD_swa, D, true, false, false)) return false;
         if (!upload_sharded_stack(swa_layers,    [&](int l){ return host_engine.get_layer_tensors(l).attn_output; }, D, H * HD_swa, false, true, false)) return false;
         if (N_swa_kv > 0) {
-            if (!upload_sharded_stack(swa_kv_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_k; }, Hkv * HD_swa, D, (R > 1), false, true)) return false;
-            if (!upload_sharded_stack(swa_kv_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_v; }, Hkv * HD_swa, D, (R > 1), false, true)) return false;
+            if (!upload_sharded_stack(swa_kv_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_k; }, Hkv_swa * HD_swa, D, (R > 1), false, true, Hkv_swa)) return false;
+            if (spec_.has_swa_v) {
+                if (!upload_sharded_stack(swa_kv_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_v; }, Hkv_swa * HD_swa, D, (R > 1), false, true, Hkv_swa)) return false;
+            }
         }
     }
     if (N_glob > 0) {
         if (!upload_sharded_stack(glob_layers,    [&](int l){ return host_engine.get_layer_tensors(l).attn_q; },      H * HD_glob, D, true, false, false)) return false;
         if (!upload_sharded_stack(glob_layers,    [&](int l){ return host_engine.get_layer_tensors(l).attn_output; }, D, H * HD_glob, false, true, false)) return false;
         if (N_glob_kv > 0) {
-            if (!upload_sharded_stack(glob_kv_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_k; }, Hkv * HD_glob, D, (R > 1), false, true)) return false;
-            if (!upload_sharded_stack(glob_kv_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_v; }, Hkv * HD_glob, D, (R > 1), false, true)) return false;
+            if (!upload_sharded_stack(glob_kv_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_k; }, Hkv_glob * HD_glob, D, (R > 1), false, true, Hkv_glob)) return false;
+            if (spec_.has_glob_v) {
+                if (!upload_sharded_stack(glob_kv_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_v; }, Hkv_glob * HD_glob, D, (R > 1), false, true, Hkv_glob)) return false;
+            }
         }
     }
 
@@ -1665,16 +2291,20 @@ bool HavenTpuGemma4Engine::build_and_upload_weights(const HavenEngine& host_engi
     if (spec_.has_qkv_bias) {
         auto upload_sharded_bias = [&](const std::vector<int>& layer_list,
                                        const std::function<const TensorDesc*(int)>& getter,
-                                       int full_dim, bool is_kv_head_shard) -> bool {
+                                       int full_dim, bool is_kv_head_shard,
+                                       int layer_hkv = 0) -> bool {
             const int cnt = static_cast<int>(layer_list.size());
             if (cnt <= 0) return true;
-            const int d_sh = is_kv_head_shard ? (full_dim / Hkv * Hkv_sh) : (full_dim / R);
+            const int eff_hkv = (layer_hkv > 0) ? layer_hkv : Hkv;
+            const int eff_hkv_sh = compute_hkv_shard(eff_hkv, R);
+            const int eff_gqa = std::max(1, H / eff_hkv);
+            const int d_sh = is_kv_head_shard ? (full_dim / eff_hkv * eff_hkv_sh) : (full_dim / R);
             std::vector<std::vector<float>> rep_data(static_cast<size_t>(R),
                 std::vector<float>(static_cast<size_t>(cnt) * static_cast<size_t>(d_sh), 0.0f));
             for (int idx = 0; idx < cnt; ++idx) {
                 auto full_b = extract_f32_1d(getter(layer_list[static_cast<size_t>(idx)]), full_dim, 0.0f);
                 for (int rep = 0; rep < R; ++rep) {
-                    int off = is_kv_head_shard ? (((rep * H_sh) / gqa_ratio) * (full_dim / Hkv)) : (rep * d_sh);
+                    int off = is_kv_head_shard ? (((rep * H_sh) / eff_gqa) * (full_dim / eff_hkv)) : (rep * d_sh);
                     std::memcpy(rep_data[static_cast<size_t>(rep)].data() + static_cast<size_t>(idx) * static_cast<size_t>(d_sh),
                                 full_b.data() + off, static_cast<size_t>(d_sh) * sizeof(float));
                 }
@@ -1691,15 +2321,19 @@ bool HavenTpuGemma4Engine::build_and_upload_weights(const HavenEngine& host_engi
         if (N_swa > 0) {
             if (!upload_sharded_bias(swa_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_q_bias; }, H * HD_swa, false)) return false;
             if (N_swa_kv > 0) {
-                if (!upload_sharded_bias(swa_kv_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_k_bias; }, Hkv * HD_swa, true)) return false;
-                if (!upload_sharded_bias(swa_kv_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_v_bias; }, Hkv * HD_swa, true)) return false;
+                if (!upload_sharded_bias(swa_kv_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_k_bias; }, Hkv_swa * HD_swa, true, Hkv_swa)) return false;
+                if (spec_.has_swa_v) {
+                    if (!upload_sharded_bias(swa_kv_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_v_bias; }, Hkv_swa * HD_swa, true, Hkv_swa)) return false;
+                }
             }
         }
         if (N_glob > 0) {
             if (!upload_sharded_bias(glob_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_q_bias; }, H * HD_glob, false)) return false;
             if (N_glob_kv > 0) {
-                if (!upload_sharded_bias(glob_kv_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_k_bias; }, Hkv * HD_glob, true)) return false;
-                if (!upload_sharded_bias(glob_kv_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_v_bias; }, Hkv * HD_glob, true)) return false;
+                if (!upload_sharded_bias(glob_kv_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_k_bias; }, Hkv_glob * HD_glob, true, Hkv_glob)) return false;
+                if (spec_.has_glob_v) {
+                    if (!upload_sharded_bias(glob_kv_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_v_bias; }, Hkv_glob * HD_glob, true, Hkv_glob)) return false;
+                }
             }
         }
     }
@@ -1770,6 +2404,18 @@ bool HavenTpuGemma4Engine::build_and_upload_weights(const HavenEngine& host_engi
         if (!upload_rep_f32(stack_norms(all_layers, [&](int l){ return host_engine.get_layer_tensors(l).post_attention_norm; }, D), {L, D})) return false;
     }
     if (!upload_rep_f32(stack_norms(all_layers, [&](int l){ return host_engine.get_layer_tensors(l).ffn_norm; }, D), {L, D})) return false;
+    if (spec_.is_moe && spec_.has_moe_router_scale) {
+        if (!upload_rep_f32(stack_norms(all_layers, [&](int l){ return host_engine.get_layer_tensors(l).ffn_gate_inp_scale; }, D), {L, D})) return false;
+    }
+    if (spec_.is_moe && spec_.has_post_ffn_norm_1) {
+        if (!upload_rep_f32(stack_norms(all_layers, [&](int l){ return host_engine.get_layer_tensors(l).post_ffw_norm_1; }, D), {L, D})) return false;
+    }
+    if (spec_.is_moe && spec_.has_pre_ffn_norm_2) {
+        if (!upload_rep_f32(stack_norms(all_layers, [&](int l){ return host_engine.get_layer_tensors(l).pre_ffw_norm_2; }, D), {L, D})) return false;
+    }
+    if (spec_.is_moe && spec_.has_post_ffn_norm_2) {
+        if (!upload_rep_f32(stack_norms(all_layers, [&](int l){ return host_engine.get_layer_tensors(l).post_ffw_norm_2; }, D), {L, D})) return false;
+    }
     if (spec_.has_post_ffn_norm) {
         if (!upload_rep_f32(stack_norms(all_layers, [&](int l){ return host_engine.get_layer_tensors(l).post_ffw_norm; }, D), {L, D})) return false;
     }
@@ -1839,15 +2485,16 @@ bool HavenTpuGemma4Engine::allocate_zero_kv_cache() {
     const int R = cfg_.num_replicas;
     const int B = cfg_.batch_size;
     const int T = cfg_.max_seq_len;
-    const int Hkv_sh = compute_hkv_shard(spec_.num_kv_heads, R);
+    const int Hkv_swa_sh  = compute_hkv_shard(spec_.num_kv_heads_swa  > 0 ? spec_.num_kv_heads_swa  : spec_.num_kv_heads, R);
+    const int Hkv_glob_sh = compute_hkv_shard(spec_.num_kv_heads_glob > 0 ? spec_.num_kv_heads_glob : spec_.num_kv_heads, R);
 
     const int N_swa_kv = spec_.num_swa_kv_layers;
     const int N_glob_kv = spec_.num_glob_kv_layers;
 
-    const std::vector<int64_t> swa_dims  = {N_swa_kv,  B, Hkv_sh, T, spec_.head_dim_swa};
-    const std::vector<int64_t> glob_dims = {N_glob_kv, B, Hkv_sh, T, spec_.head_dim_glob};
-    const size_t swa_elems  = (N_swa_kv > 0)  ? (static_cast<size_t>(N_swa_kv)  * B * Hkv_sh * T * static_cast<size_t>(spec_.head_dim_swa))  : 0;
-    const size_t glob_elems = (N_glob_kv > 0) ? (static_cast<size_t>(N_glob_kv) * B * Hkv_sh * T * static_cast<size_t>(spec_.head_dim_glob)) : 0;
+    const std::vector<int64_t> swa_dims  = {N_swa_kv,  B, Hkv_swa_sh,  T, spec_.head_dim_swa};
+    const std::vector<int64_t> glob_dims = {N_glob_kv, B, Hkv_glob_sh, T, spec_.head_dim_glob};
+    const size_t swa_elems  = (N_swa_kv > 0)  ? (static_cast<size_t>(N_swa_kv)  * B * Hkv_swa_sh  * T * static_cast<size_t>(spec_.head_dim_swa))  : 0;
+    const size_t glob_elems = (N_glob_kv > 0) ? (static_cast<size_t>(N_glob_kv) * B * Hkv_glob_sh * T * static_cast<size_t>(spec_.head_dim_glob)) : 0;
 
     std::vector<uint16_t> z_swa(swa_elems, 0);
     std::vector<uint16_t> z_glob(glob_elems, 0);
@@ -1906,8 +2553,8 @@ bool HavenTpuGemma4Engine::initialize(HavenTpuPjrtBackend* backend,
         last_error_ = "Unsupported model for TPU on-chip engine: " + support_err;
         return false;
     }
-    if (cfg.num_replicas != 1 && cfg.num_replicas != 2 && cfg.num_replicas != 4) {
-        last_error_ = "num_replicas must be 1, 2, or 4.";
+    if (cfg.num_replicas != 1 && cfg.num_replicas != 2 && cfg.num_replicas != 4 && cfg.num_replicas != 8) {
+        last_error_ = "num_replicas must be 1, 2, 4, or 8.";
         return false;
     }
     if (static_cast<size_t>(cfg.num_replicas) > backend->get_device_count()) {
@@ -1919,8 +2566,9 @@ bool HavenTpuGemma4Engine::initialize(HavenTpuPjrtBackend* backend,
     TpuModelSpec spec = TpuModelSpec::from_model_config(mc, &host_engine);
     if ((spec.hidden_dim % cfg.num_replicas) != 0 ||
         (spec.num_heads % cfg.num_replicas) != 0 ||
-        (spec.vocab_size % cfg.num_replicas) != 0) {
-        last_error_ = "Model dims (hidden_dim/num_heads/vocab_size) must be divisible by num_replicas=" +
+        (spec.vocab_size % cfg.num_replicas) != 0 ||
+        (spec.is_moe && (spec.expert_ffn_dim % cfg.num_replicas) != 0)) {
+        last_error_ = "Model dims (hidden_dim/expert_ffn_dim/num_heads/vocab_size) must be divisible by num_replicas=" +
                       std::to_string(cfg.num_replicas) + ".";
         return false;
     }

@@ -24,6 +24,8 @@ enum class QuantType : uint32_t {
     Q5_K = 13,
     Q6_K = 14,
     Q8_K = 15,
+    IQ4_NL = 20,
+    IQ4_XS = 23,
     I8   = 24,
     I16  = 25,
     I32  = 26,
@@ -89,6 +91,37 @@ struct block_q5_K {
 };
 #pragma pack(pop)
 
+// 32-value quantized block for Q5_1
+#pragma pack(push, 1)
+struct block_q5_1 {
+    uint16_t d;       // FP16 delta
+    uint16_t m;       // FP16 min
+    uint8_t  qh[4];   // 32 high bits (1 bit per weight)
+    uint8_t  qs[16];  // 32 low 4-bit nibbles (2 per byte)
+};
+#pragma pack(pop)
+static_assert(sizeof(block_q5_1) == 24, "block_q5_1 must be 24 bytes");
+
+// 32-value non-linear 4-bit quantized block for IQ4_NL
+#pragma pack(push, 1)
+struct block_iq4_nl {
+    uint16_t d;       // FP16 scale factor
+    uint8_t  qs[16];  // 32 4-bit LUT indices (2 per byte)
+};
+#pragma pack(pop)
+static_assert(sizeof(block_iq4_nl) == 18, "block_iq4_nl must be 18 bytes");
+
+// 256-value non-linear 4-bit super-block for IQ4_XS
+#pragma pack(push, 1)
+struct block_iq4_xs {
+    uint16_t d;           // Super-block scale (FP16)
+    uint16_t scales_h;    // Upper 2 bits of 8 6-bit sub-block scales
+    uint8_t  scales_l[4]; // Lower 4 bits of 8 6-bit sub-block scales
+    uint8_t  qs[128];     // 256 4-bit LUT indices (2 per byte)
+};
+#pragma pack(pop)
+static_assert(sizeof(block_iq4_xs) == 136, "block_iq4_xs must be 136 bytes");
+
 // 256-value quantized block for Q3_K
 #pragma pack(push, 1)
 struct block_q3_K {
@@ -122,6 +155,7 @@ struct ModelConfig {
     uint32_t num_heads = 32;
     uint32_t num_kv_heads = 0;
     uint32_t head_dim = 0;
+    uint32_t head_dim_swa = 0;
     uint32_t max_context_length = 131072;
     float rope_freq_base = 1000000.0f;
     float rope_freq_base_swa = 10000.0f;
@@ -130,7 +164,13 @@ struct ModelConfig {
     uint32_t rope_dimension_count_swa = 256;
     float rms_norm_eps = 1e-5f;
     uint32_t sliding_window = 0;
-    uint32_t shared_kv_layers = 18;
+    uint32_t shared_kv_layers = 0;
+    bool has_shared_kv_layers_kv = false;
+    uint32_t expert_count = 0;
+    uint32_t expert_used_count = 0;
+    uint32_t expert_ffn_dim = 0;
+    std::vector<uint32_t> head_count_kv_per_layer;
+    std::vector<bool> sliding_window_pattern;
     float final_logit_softcapping = 0.0f;
     float attn_logit_softcapping = 0.0f;
     bool is_gemma = false;

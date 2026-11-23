@@ -26,7 +26,8 @@ static double cosine_sim(const float* a, const float* b, size_t n) {
 static bool validate_mlir_module(const std::string& ir, const std::string& label,
                                  bool expect_scatter, bool expect_slot_id,
                                  bool expect_silu, bool expect_all_reduce,
-                                 bool expect_untied_tok_emb) {
+                                 bool expect_untied_tok_emb,
+                                 bool expect_moe_sort = false) {
     if (ir.empty()) {
         std::cerr << "  [FAIL] Empty MLIR for " << label << "\n";
         return false;
@@ -67,6 +68,10 @@ static bool validate_mlir_module(const std::string& ir, const std::string& label
     }
     if (expect_untied_tok_emb && ir.find("%w_tok_emb") == std::string::npos) {
         std::cerr << "  [FAIL] Expected %w_tok_emb for untied on-chip embeddings in " << label << "\n";
+        return false;
+    }
+    if (expect_moe_sort && (ir.find("\"stablehlo.sort\"") == std::string::npos || ir.find("%w_moe_gu") == std::string::npos)) {
+        std::cerr << "  [FAIL] Expected stablehlo.sort + %w_moe_gu for Sparse MoE in " << label << "\n";
         return false;
     }
     return true;
@@ -158,7 +163,7 @@ static int run_synthetic_multi_arch_ir_suite() {
         cases.push_back({"Mistral-7B-32L-SWA", mc, true, true});
     }
 
-    // 5. Ava 26B / Gemma 2 27B (46L Hybrid SWA+Global, Attn+Final Softcap, GeGLU, Tied)
+    // 5. Gemma 2 27B (46L Hybrid SWA+Global, Attn+Final Softcap, GeGLU, Tied)
     {
         ModelConfig mc;
         mc.architecture = "gemma2";
@@ -177,9 +182,34 @@ static int run_synthetic_multi_arch_ir_suite() {
         cases.push_back({"Gemma-2-27B-46L", mc, false, false});
     }
 
+    // 6. Ava 26B / Gemma 4 26B-A4B MoE (30L Hybrid SWA-256(8kv)+Global-512(2kv, k_eq_v), 128E Top-8, Shared+MoE)
+    {
+        ModelConfig mc;
+        mc.architecture = "gemma4";
+        mc.is_gemma = true;
+        mc.num_layers = 30;
+        mc.embedding_dim = 2816;
+        mc.hidden_dim = 2112;
+        mc.vocab_size = 262144;
+        mc.num_heads = 16;
+        mc.num_kv_heads = 8;
+        mc.head_dim = 512;
+        mc.head_dim_swa = 256;
+        mc.sliding_window = 1024;
+        mc.shared_kv_layers = 0;
+        mc.expert_count = 128;
+        mc.expert_used_count = 8;
+        mc.expert_ffn_dim = 704;
+        mc.final_logit_softcapping = 30.0f;
+        mc.ffn_activation = FfnActivation::GELU;
+        cases.push_back({"Ava-26B-A4B-MoE-30L", mc, false, false});
+    }
+
     int total_checks = 0;
     for (const auto& ac : cases) {
-        for (int R : {1, 4}) {
+        const bool is_moe = (ac.mc.expert_count > 0);
+        std::vector<int> replicas = is_moe ? std::vector<int>{1, 4, 8} : std::vector<int>{1, 4};
+        for (int R : replicas) {
             for (int B : {1, 16}) {
                 for (bool i8 : {false, true}) {
                     TpuGemma4Config cfg;
@@ -194,15 +224,15 @@ static int run_synthetic_multi_arch_ir_suite() {
                     // 1. Decode graph (per-slot scatter when B > 1)
                     std::string dec_ir = HavenTpuGemma4Engine::emit_stablehlo_mlir(ac.mc, cfg, 1, false);
                     std::string tag = ac.name + " R=" + std::to_string(R) + " B=" + std::to_string(B) + (i8 ? " INT8" : " BF16");
-                    if (!validate_mlir_module(dec_ir, tag + " decode", (B > 1), false, ac.expect_silu, (R > 1), ac.expect_untied)) {
+                    if (!validate_mlir_module(dec_ir, tag + " decode", (B > 1), false, ac.expect_silu, (R > 1), ac.expect_untied, is_moe)) {
                         return 1;
                     }
                     total_checks++;
 
-                    // 2. Slot-targeted multi-bucket prefill graphs (S = 16, 32, 128)
-                    for (int S : {16, 32, 128}) {
+                    // 2. Slot-targeted multi-bucket prefill graphs (S = 8, 16, 32, 128)
+                    for (int S : {8, 16, 32, 128}) {
                         std::string pre_ir = HavenTpuGemma4Engine::emit_stablehlo_mlir(ac.mc, cfg, S, true);
-                        if (!validate_mlir_module(pre_ir, tag + " prefill_S=" + std::to_string(S), false, true, ac.expect_silu, (R > 1), ac.expect_untied)) {
+                        if (!validate_mlir_module(pre_ir, tag + " prefill_S=" + std::to_string(S), false, true, ac.expect_silu, (R > 1), ac.expect_untied, is_moe)) {
                             return 1;
                         }
                         total_checks++;
@@ -210,7 +240,7 @@ static int run_synthetic_multi_arch_ir_suite() {
                 }
             }
         }
-        std::cout << "  [PASS] " << ac.name << " (R=1,4 | B=1,16 | BF16,INT8 | Decode + Slot-Prefill S=16,32,128)\n";
+        std::cout << "  [PASS] " << ac.name << " (R=" << (is_moe ? "1,4,8" : "1,4") << " | B=1,16 | BF16,INT8 | Decode + Slot-Prefill S=8,16,32,128)\n";
     }
 
     std::cout << "ALL " << total_checks << " SYNTHETIC MULTI-ARCH STABLEHLO GRAPHS VERIFIED!\n";
@@ -225,6 +255,7 @@ int main(int argc, char** argv) {
     bool emit_only_synthetic = false;
     bool onchip_emb_only = false;
     bool async_slots_only = false;
+    bool cpu_smoke = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -233,6 +264,7 @@ int main(int argc, char** argv) {
         else if (a == "--emit-only-synthetic") emit_only_synthetic = true;
         else if (a == "--onchip-emb-only") onchip_emb_only = true;
         else if (a == "--async-slots-only") async_slots_only = true;
+        else if (a == "--cpu-smoke") cpu_smoke = true;
         else if (!a.starts_with("-")) model_path = a;
     }
 
@@ -258,11 +290,52 @@ int main(int argc, char** argv) {
     TpuModelSpec spec = TpuModelSpec::from_model_config(mc, &host_engine);
     std::cout << "Loaded Model: " << model_path << " (" << mc.architecture << ", " << mc.num_layers
               << " layers, dim=" << mc.embedding_dim << ", ffn=" << mc.hidden_dim
-              << ", vocab=" << mc.vocab_size << ", SWA/Glob=" << spec.num_swa_layers << "/" << spec.num_glob_layers << ")\n";
+              << ", vocab=" << mc.vocab_size << ", SWA/Glob=" << spec.num_swa_layers << "/" << spec.num_glob_layers
+              << ", Hkv_swa/glob=" << spec.num_kv_heads_swa << "/" << spec.num_kv_heads_glob
+              << ", MoE=" << (spec.is_moe ? (std::to_string(spec.num_experts) + "E/top" + std::to_string(spec.num_experts_used) + "/F" + std::to_string(spec.expert_ffn_dim)) : "dense") << ")\n";
+
+    std::string support_err;
+    if (!HavenTpuGemma4Engine::is_model_supported(host_engine, support_err)) {
+        std::cerr << "Model unsupported by TPU compiler: " << support_err << "\n";
+        return 1;
+    }
+
+    // Optional offline CPU smoke check (verifies GGUF quant dequantization + MoE math locally!)
+    if (cpu_smoke) {
+        const std::string ava_sys = "<|turn>system\nYou are Ava, Daniel's sovereign AI built on Gemma 4 Turbo MoE. Speak directly, warmly, and concisely.<turn|>\n";
+        const std::string p = spec.is_moe
+            ? host_engine.format_chat_prompt("Hey Ava, quick system check — what architecture are you running on?", ava_sys)
+            : host_engine.format_chat_prompt("Hi Aura, say hello in five words.");
+        auto toks = host_engine.tokenize(p, true);
+        std::cout << "[CPU Smoke] Prompt tokens: " << toks.size() << "\n";
+        std::vector<float> logits(mc.vocab_size, 0.0f);
+        host_engine.get_kv_cache().reset();
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (size_t i = 0; i < toks.size(); ++i) {
+            host_engine.forward(toks[i], static_cast<int>(i), (i + 1 == toks.size()) ? logits.data() : nullptr);
+        }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        uint32_t cur = static_cast<uint32_t>(std::max_element(logits.begin(), logits.end()) - logits.begin());
+        std::string out = host_engine.detokenize(cur);
+        int pos = static_cast<int>(toks.size());
+        for (int s = 0; s < 15; ++s) {
+            host_engine.forward(cur, pos++, logits.data());
+            cur = static_cast<uint32_t>(std::max_element(logits.begin(), logits.end()) - logits.begin());
+            if (host_engine.get_tokenizer().is_stop_token(cur)) break;
+            out += host_engine.detokenize(cur);
+        }
+        auto t2 = std::chrono::high_resolution_clock::now();
+        std::cout << "[CPU Smoke] Prefill: " << std::fixed << std::setprecision(1)
+                  << std::chrono::duration<double, std::milli>(t1 - t0).count() << " ms | 15-tok Decode: "
+                  << std::chrono::duration<double, std::milli>(t2 - t1).count() << " ms\n";
+        std::cout << "[CPU Smoke] Output: " << out << "\n";
+        return 0;
+    }
 
     // Offline StableHLO IR verification mode (runs locally on Windows or Linux with zero TPU!)
     if (emit_only) {
-        for (int R : {1, 4}) {
+        std::vector<int> reps = spec.is_moe ? std::vector<int>{1, 4, 8} : std::vector<int>{1, 4};
+        for (int R : reps) {
             for (bool i8 : {false, true}) {
                 for (bool onchip_emb : {false, true}) {
                     TpuGemma4Config cfg;
@@ -275,6 +348,10 @@ int main(int argc, char** argv) {
                     cfg.return_full_logits = false;
                     std::string dec_ir = HavenTpuGemma4Engine::emit_stablehlo_mlir(spec, cfg, 1, false);
                     std::string pre_ir = HavenTpuGemma4Engine::emit_stablehlo_mlir(spec, cfg, 128, true);
+                    if (!validate_mlir_module(dec_ir, "real_decode", (cfg.batch_size > 1), false, (spec.ffn_activation == FfnActivation::SILU), (R > 1), (!spec.has_tied_embeddings && onchip_emb), spec.is_moe) ||
+                        !validate_mlir_module(pre_ir, "real_prefill", false, true, (spec.ffn_activation == FfnActivation::SILU), (R > 1), (!spec.has_tied_embeddings && onchip_emb), spec.is_moe)) {
+                        return 1;
+                    }
                     std::cout << "  [IR OK] R=" << R << " " << (i8 ? "INT8" : "BF16")
                               << " " << (onchip_emb ? "OnChipEmb(B=16)" : "HostEmb(B=1)")
                               << " | decode_mlir=" << (dec_ir.size() / 1024) << " KB"
@@ -295,8 +372,13 @@ int main(int argc, char** argv) {
               << tpu.get_pjrt_major() << "." << tpu.get_pjrt_minor() << ")\n";
 
     // Prepare exact reference prompt & compute CPU Ground-Truth Logits for parity check!
-    const std::string prompt_str = host_engine.format_chat_prompt(
-        "Hey Aura! All 42 of your transformer layers are now running fully on-chip inside Google TPU Trillium HBM3. How does pure silicon speed feel?");
+    const std::string ava_sys = "<|turn>system\nYou are Ava, Daniel's sovereign AI companion built on Gemma 4 Turbo MoE. Speak naturally, directly, intelligently, and concisely without corporate filler.<turn|>\n";
+    const std::string prompt_str = spec.is_moe
+        ? host_engine.format_chat_prompt(
+            "Hey Ava! All 30 of your Gemma 4 26B-A4B MoE layers and 128 experts are now running natively inside haven.cpp on Google Cloud TPU Trillium HBM3. How does pure C++20 silicon speed feel?",
+            ava_sys)
+        : host_engine.format_chat_prompt(
+            "Hey Aura! All 42 of your transformer layers are now running fully on-chip inside Google TPU Trillium HBM3. How does pure silicon speed feel?");
     auto prompt_toks = host_engine.tokenize(prompt_str, true);
     std::cout << "Prompt tokens: " << prompt_toks.size() << "\n";
 
@@ -316,15 +398,19 @@ int main(int argc, char** argv) {
 
     // Live Async Per-Slot pos_vec[B] & Slot-Targeted Multi-Bucket Prefill Parity Verification!
     {
-        const int R_test = (n_devs >= 4) ? 4 : 1;
+        const int R_test = (n_devs >= 8 && spec.is_moe) ? 8 : ((n_devs >= 4) ? 4 : 1);
         std::cout << "\n----------------------------------------------------------------------\n";
         std::cout << "[VERIFY] Multi-Bucket Slot-Targeted Prefill + Async Per-Slot pos_vec[B=4] (R=" << R_test << ")\n";
         std::cout << "----------------------------------------------------------------------\n";
 
-        // Build 3 completely different prompts of distinct lengths (~20, ~60, ~133 tokens)
-        auto p0 = prompt_toks; // ~133 tokens (hits S=128 + S=1 buckets)
-        auto p1 = host_engine.tokenize(host_engine.format_chat_prompt("Hi Aura, say hello in two words."), true);
-        auto p2 = host_engine.tokenize(host_engine.format_chat_prompt("Explain quantum entanglement in one concise sentence."), true);
+        // Build 3 completely different prompts of distinct lengths
+        auto p0 = prompt_toks;
+        auto p1 = host_engine.tokenize(host_engine.format_chat_prompt(
+            spec.is_moe ? "Hi Ava, say hello in two words." : "Hi Aura, say hello in two words.",
+            spec.is_moe ? ava_sys : ""), true);
+        auto p2 = host_engine.tokenize(host_engine.format_chat_prompt(
+            "Explain quantum entanglement in one concise sentence.",
+            spec.is_moe ? ava_sys : ""), true);
 
         // Compute CPU ground truth full 262k logits for Prefill AND Step-2 for all 3 prompts!
         struct CpuGt {
@@ -559,32 +645,56 @@ int main(int argc, char** argv) {
                   << " | Per-Stream: " << std::setprecision(1) << stream_tok_s << " tok/s"
                   << " | Aggregate (B=" << B << "): " << agg_tok_s << " tok/s\n";
         if (B == 1) {
-            std::cout << "  Aura Output    : " << generated_text << "\n";
+            std::cout << "  Model Output   : " << generated_text << "\n";
         }
         gemma_tpu.shutdown();
     };
 
-    if (!onchip_emb_only) {
-        run_config_bench("1A. Parity Check (1-Chip BF16 Full Logits)", 1, 1, false, true, 64, 128);
-        if (n_devs >= 4) {
-            run_config_bench("1B. Parity Check (4-Chip Optical ICI Tensor-Parallel BF16)", 4, 1, false, true, 64, 128);
+    if (spec.is_moe) {
+        // MoE 26B-A4B Suite: 4-chip (v6e-4) and 8-chip (v6e-8) pod scaling!
+        if (n_devs >= 8) {
+            run_config_bench("M1. Ava 26B-A4B Parity Check (8-Chip v6e-8 BF16 FullLogits)",    8, 1,   false, true,  64,  128, true);
+            run_config_bench("M2. Ava 26B-A4B Interactive (8-Chip v6e-8 BF16 OnChipEmb)",     8, 1,   false, false, 128, 128, true);
+            run_config_bench("M3. Ava 26B-A4B Interactive (8-Chip v6e-8 W8A16 INT8)",         8, 1,   true,  false, 128, 128, true);
+            run_config_bench("M4. Ava 26B-A4B Batch B=32 (8-Chip v6e-8 W8A16 INT8)",          8, 32,  true,  false, 64,  0,   true);
+            run_config_bench("M5. Ava 26B-A4B Batch B=64 (8-Chip v6e-8 W8A16 INT8)",          8, 64,  true,  false, 64,  0,   true);
+            run_config_bench("M6. Ava 26B-A4B Batch B=128 (8-Chip v6e-8 W8A16 INT8)",         8, 128, true,  false, 64,  0,   true);
+            run_config_bench("M7. Ava 26B-A4B Batch B=128 (8-Chip v6e-8 BF16)",               8, 128, false, false, 64,  0,   true);
         }
-        run_config_bench("2A. Single-Stream Interactive (1-Chip BF16)", 1, 1, false, false, 128, 128);
-        run_config_bench("2B. Single-Stream Interactive (1-Chip W8A16 INT8)", 1, 1, true, false, 128, 128);
         if (n_devs >= 4) {
-            run_config_bench("2C. Single-Stream Interactive (4-Chip Tensor-Parallel BF16)", 4, 1, false, false, 128, 128);
-            run_config_bench("2D. Single-Stream Interactive (4-Chip Tensor-Parallel W8A16 INT8)", 4, 1, true, false, 128, 128);
+            run_config_bench("M4A. Ava 26B-A4B Parity Check (4-Chip v6e-4 BF16 FullLogits)",  4, 1,   false, true,  64,  128, true);
+            run_config_bench("M4B. Ava 26B-A4B Interactive (4-Chip v6e-4 BF16 OnChipEmb)",    4, 1,   false, false, 128, 128, true);
+            run_config_bench("M4C. Ava 26B-A4B Interactive (4-Chip v6e-4 W8A16 INT8)",        4, 1,   true,  false, 128, 128, true);
+            run_config_bench("M4D. Ava 26B-A4B Batch B=32 (4-Chip v6e-4 W8A16 INT8)",         4, 32,  true,  false, 64,  0,   true);
+            run_config_bench("M4E. Ava 26B-A4B Batch B=64 (4-Chip v6e-4 W8A16 INT8)",         4, 64,  true,  false, 64,  0,   true);
+            run_config_bench("M4F. Ava 26B-A4B Batch B=128 (4-Chip v6e-4 W8A16 INT8)",        4, 128, true,  false, 64,  0,   true);
+            run_config_bench("M4G. Ava 26B-A4B Batch B=128 (4-Chip v6e-4 BF16)",              4, 128, false, false, 64,  0,   true);
+        } else {
+            run_config_bench("M1A. Ava 26B-A4B Single-Chip (1-Chip W8A16 INT8)",              1, 1,   true,  false, 64,  128, true);
         }
-    }
-
-    if (n_devs >= 4) {
-        run_config_bench("3A. Interactive On-Chip Gather Parity (4-Chip TP, B=1, BF16 FullLogits)", 4, 1, false, true, 64, 128, true);
-        run_config_bench("3B. Interactive On-Chip Gather Peak (4-Chip TP, B=1, W8A16 INT8)",       4, 1, true, false, 128, 128, true);
-        run_config_bench("3C. Cloud Continuous Batching On-Chip Gather (4-Chip TP, B=64, BF16)",   4, 64, false, false, 64, 0, true);
-        run_config_bench("3D. Cloud Continuous Batching On-Chip Gather (4-Chip TP, B=128, INT8)",  4, 128, true, false, 64, 0, true);
-        run_config_bench("3E. Cloud Continuous Batching On-Chip Gather (4-Chip TP, B=128, BF16)",  4, 128, false, false, 64, 0, true);
     } else {
-        run_config_bench("3A. Single-Chip On-Chip Gather (1-Chip, B=32, W8A16 INT8)", 1, 32, true, false, 64, 0, true);
+        if (!onchip_emb_only) {
+            run_config_bench("1A. Parity Check (1-Chip BF16 Full Logits)", 1, 1, false, true, 64, 128);
+            if (n_devs >= 4) {
+                run_config_bench("1B. Parity Check (4-Chip Optical ICI Tensor-Parallel BF16)", 4, 1, false, true, 64, 128);
+            }
+            run_config_bench("2A. Single-Stream Interactive (1-Chip BF16)", 1, 1, false, false, 128, 128);
+            run_config_bench("2B. Single-Stream Interactive (1-Chip W8A16 INT8)", 1, 1, true, false, 128, 128);
+            if (n_devs >= 4) {
+                run_config_bench("2C. Single-Stream Interactive (4-Chip Tensor-Parallel BF16)", 4, 1, false, false, 128, 128);
+                run_config_bench("2D. Single-Stream Interactive (4-Chip Tensor-Parallel W8A16 INT8)", 4, 1, true, false, 128, 128);
+            }
+        }
+
+        if (n_devs >= 4) {
+            run_config_bench("3A. Interactive On-Chip Gather Parity (4-Chip TP, B=1, BF16 FullLogits)", 4, 1, false, true, 64, 128, true);
+            run_config_bench("3B. Interactive On-Chip Gather Peak (4-Chip TP, B=1, W8A16 INT8)",       4, 1, true, false, 128, 128, true);
+            run_config_bench("3C. Cloud Continuous Batching On-Chip Gather (4-Chip TP, B=64, BF16)",   4, 64, false, false, 64, 0, true);
+            run_config_bench("3D. Cloud Continuous Batching On-Chip Gather (4-Chip TP, B=128, INT8)",  4, 128, true, false, 64, 0, true);
+            run_config_bench("3E. Cloud Continuous Batching On-Chip Gather (4-Chip TP, B=128, BF16)",  4, 128, false, false, 64, 0, true);
+        } else {
+            run_config_bench("3A. Single-Chip On-Chip Gather (1-Chip, B=32, W8A16 INT8)", 1, 32, true, false, 64, 0, true);
+        }
     }
 
     std::cout << "\n======================================================================\n";

@@ -380,11 +380,12 @@ private:
                 if (tpu_backend_.is_initialized() && tpu_backend_.get_device_count() >= 1) {
                     const int n_devs = static_cast<int>(tpu_backend_.get_device_count());
                     int R = tpu_opts_.num_replicas;
-                    if (R <= 0 || R > n_devs || (R != 1 && R != 2 && R != 4)) {
-                        R = (n_devs >= 4) ? 4 : ((n_devs >= 2) ? 2 : 1);
+                    if (R <= 0 || R > n_devs || (R != 1 && R != 2 && R != 4 && R != 8)) {
+                        R = (n_devs >= 8) ? 8 : ((n_devs >= 4) ? 4 : ((n_devs >= 2) ? 2 : 1));
                     }
-                    // Ensure clean Megatron TP divisibility across hidden_dim, num_heads, vocab_size
-                    while (R > 1 && ((mc.hidden_dim % R) != 0 || (mc.num_heads % R) != 0 || (mc.vocab_size % R) != 0)) {
+                    // Ensure clean Megatron TP divisibility across hidden_dim, expert_ffn_dim, num_heads, vocab_size
+                    while (R > 1 && ((mc.hidden_dim % R) != 0 || (mc.num_heads % R) != 0 || (mc.vocab_size % R) != 0 ||
+                                     (mc.expert_count > 0 && mc.expert_ffn_dim > 0 && (mc.expert_ffn_dim % R) != 0))) {
                         R /= 2;
                     }
 
