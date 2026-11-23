@@ -87,6 +87,7 @@ public:
     PJRT_Buffer* upload_bf16_nd(const uint16_t* host_data, const std::vector<int64_t>& dims, int device_index = 0);
     PJRT_Buffer* upload_f32_nd(const float* host_data, const std::vector<int64_t>& dims, int device_index = 0);
     PJRT_Buffer* upload_s8_nd(const int8_t* host_data, const std::vector<int64_t>& dims, int device_index = 0);
+    PJRT_Buffer* upload_f8e4m3fn_nd(const uint8_t* host_data, const std::vector<int64_t>& dims, int device_index = 0);
     PJRT_Buffer* upload_i32_nd(const int32_t* host_data, const std::vector<int64_t>& dims, int device_index = 0);
     bool download_f32(PJRT_Buffer* buf, float* host_out, size_t num_elems);
     bool download_bf16(PJRT_Buffer* buf, uint16_t* host_out, size_t num_elems);

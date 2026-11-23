@@ -216,23 +216,24 @@ static int run_synthetic_multi_arch_ir_suite() {
         for (int R : replicas) {
             for (int B : {1, 16, 128}) {
                 for (bool i8 : {false, true}) {
-                    for (bool kv_i8 : {false, true}) {
-                        if (kv_i8 && !i8) continue; // Test BF16+BF16KV, INT8+BF16KV, and INT8+INT8KV
+                    for (bool kv_fp8 : {false, true}) {
+                        if (kv_fp8 && !i8) continue; // Test BF16+BF16KV, INT8+BF16KV, and INT8+FP8KV
                         TpuGemma4Config cfg;
                         cfg.batch_size = B;
                         cfg.max_seq_len = 2048;
                         cfg.prefill_chunk_size = 128;
                         cfg.num_replicas = R;
                         cfg.use_int8_weights = i8;
-                        cfg.use_int8_kv = kv_i8;
+                        cfg.use_fp8_kv = kv_fp8;
                         cfg.use_onchip_embeddings = true;
                         cfg.return_full_logits = (B == 1);
 
                         // 1. Decode graph (per-slot scatter when B > 1)
                         std::string dec_ir = HavenTpuGemma4Engine::emit_stablehlo_mlir(ac.mc, cfg, 1, false);
                         std::string tag = ac.name + " R=" + std::to_string(R) + " B=" + std::to_string(B)
-                                        + (i8 ? " INT8" : " BF16") + (kv_i8 ? "+KV8" : "");
-                        if (!validate_mlir_module(dec_ir, tag + " decode", (B > 1), false, ac.expect_silu, (R > 1), ac.expect_untied, is_moe)) {
+                                        + (i8 ? " INT8" : " BF16") + (kv_fp8 ? "+FP8KV" : "");
+                        if (!validate_mlir_module(dec_ir, tag + " decode", (B > 1), false, ac.expect_silu, (R > 1), ac.expect_untied, is_moe) ||
+                            (kv_fp8 && dec_ir.find("f8E4M3FN") == std::string::npos)) {
                             return 1;
                         }
                         total_checks++;
@@ -240,7 +241,8 @@ static int run_synthetic_multi_arch_ir_suite() {
                         // 2. Slot-targeted multi-bucket prefill graphs (S = 8, 16, 32, 128)
                         for (int S : {8, 16, 32, 128}) {
                             std::string pre_ir = HavenTpuGemma4Engine::emit_stablehlo_mlir(ac.mc, cfg, S, true);
-                            if (!validate_mlir_module(pre_ir, tag + " prefill_S=" + std::to_string(S), false, true, ac.expect_silu, (R > 1), ac.expect_untied, is_moe)) {
+                            if (!validate_mlir_module(pre_ir, tag + " prefill_S=" + std::to_string(S), false, true, ac.expect_silu, (R > 1), ac.expect_untied, is_moe) ||
+                                (kv_fp8 && pre_ir.find("f8E4M3FN") == std::string::npos)) {
                                 return 1;
                             }
                             total_checks++;
@@ -519,13 +521,13 @@ int main(int argc, char** argv) {
         if (async_slots_only) return 0;
     }
 
-    // Helper to benchmark any (R, B, use_int8, return_logits, onchip_emb, use_int8_kv) configuration end-to-end!
-    auto run_config_bench = [&](const std::string& label, int R, int B, bool use_int8, bool full_logits, int gen_steps, int prefill_chunk, bool onchip_emb = false, bool use_int8_kv = false) {
+    // Helper to benchmark any (R, B, use_int8, return_logits, onchip_emb, use_fp8_kv) configuration end-to-end!
+    auto run_config_bench = [&](const std::string& label, int R, int B, bool use_int8, bool full_logits, int gen_steps, int prefill_chunk, bool onchip_emb = false, bool use_fp8_kv = false) {
         if (R > n_devs) return;
         std::cout << "\n----------------------------------------------------------------------\n";
         std::cout << "[BENCH] " << label << " (R=" << R << ", B=" << B
                   << ", " << (use_int8 ? "HadW8-INT8" : "BF16")
-                  << ", KV=" << (use_int8_kv ? "INT8" : "BF16")
+                  << ", KV=" << (use_fp8_kv ? "FP8-E4M3FN" : "BF16")
                   << ", " << (full_logits ? "FullLogits" : "OnChipArgmax")
                   << ", " << (onchip_emb ? "OnChipEmb" : "HostEmb") << ")\n";
         std::cout << "----------------------------------------------------------------------\n";
@@ -536,7 +538,7 @@ int main(int argc, char** argv) {
         cfg.prefill_chunk_size = prefill_chunk;
         cfg.num_replicas = R;
         cfg.use_int8_weights = use_int8;
-        cfg.use_int8_kv = use_int8_kv;
+        cfg.use_fp8_kv = use_fp8_kv;
         cfg.return_full_logits = full_logits;
         cfg.use_onchip_embeddings = onchip_emb;
         cfg.donate_kv_cache = true;
@@ -672,12 +674,13 @@ int main(int argc, char** argv) {
             run_config_bench("M7. Ava 26B-A4B Batch B=128 (8-Chip v6e-8 BF16)",               8, 128, false, false, 64,  0,   true);
             run_config_bench("M2. Ava 26B-A4B Interactive (8-Chip v6e-8 BF16 OnChipEmb)",     8, 1,   false, false, 128, 128, true);
         } else if (n_devs >= 4) {
-            run_config_bench("M4C. Ava 26B-A4B Interactive (4-Chip Hadamard INT8 + INT8-KV)",   4, 1,   true,  false, 128, 128, true,  true);
-            run_config_bench("M4C-P. Ava 26B-A4B Hadamard INT8 + INT8-KV Parity (FullLogits)",4, 1,   true,  true,  32,  128, true,  true);
-            run_config_bench("M4D. Ava 26B-A4B Batch B=32 (4-Chip Hadamard INT8 + INT8-KV)",  4, 32,  true,  false, 64,  0,   true,  true);
-            run_config_bench("M4E. Ava 26B-A4B Batch B=64 (4-Chip Hadamard INT8 + INT8-KV)",  4, 64,  true,  false, 64,  0,   true,  true);
-            run_config_bench("M4F. Ava 26B-A4B Batch B=128 (4-Chip Hadamard INT8 + INT8-KV)", 4, 128, true,  false, 64,  0,   true,  true);
-            run_config_bench("M4H. Ava 26B-A4B Batch B=256 (4-Chip Hadamard INT8 + INT8-KV)", 4, 256, true,  false, 64,  0,   true,  true);
+            run_config_bench("M4C. Ava 26B-A4B Interactive (4-Chip Hadamard INT8 + FP8-KV)",     4, 1,   true,  false, 128, 128, true,  true);
+            run_config_bench("M4C-P. Ava 26B-A4B Hadamard INT8 + FP8-KV Parity (FullLogits)", 4, 1,   true,  true,  32,  128, true,  true);
+            run_config_bench("M4C-H. Ava 26B-A4B Hadamard INT8 + BF16-KV Parity (FullLogits)",4, 1,   true,  true,  32,  128, true,  false);
+            run_config_bench("M4D. Ava 26B-A4B Batch B=32 (4-Chip Hadamard INT8 + FP8-KV)",   4, 32,  true,  false, 64,  0,   true,  true);
+            run_config_bench("M4E. Ava 26B-A4B Batch B=64 (4-Chip Hadamard INT8 + FP8-KV)",   4, 64,  true,  false, 64,  0,   true,  true);
+            run_config_bench("M4F. Ava 26B-A4B Batch B=128 (4-Chip Hadamard INT8 + FP8-KV)",  4, 128, true,  false, 64,  0,   true,  true);
+            run_config_bench("M4H. Ava 26B-A4B Batch B=256 (4-Chip Hadamard INT8 + FP8-KV)",  4, 256, true,  false, 64,  0,   true,  true);
             run_config_bench("M4G. Ava 26B-A4B Batch B=128 (4-Chip Pure BF16)",               4, 128, false, false, 64,  0,   true,  false);
             run_config_bench("M4B. Ava 26B-A4B Interactive (4-Chip Pure BF16 OnChipEmb)",     4, 1,   false, false, 128, 128, true,  false);
         } else {

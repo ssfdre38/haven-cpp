@@ -45,7 +45,7 @@ namespace haven {
 struct TpuServerOptions {
     bool enable_onchip = false;
     bool use_int8 = true;
-    bool use_int8_kv = false;
+    bool use_fp8_kv = false;
     bool use_onchip_embeddings = true;
     bool use_onchip_argmax = false; // true = 4B/slot on-chip argmax for max multi-tenant throughput
     int num_replicas = 0; // 0 = auto (max power-of-2 <= addressable TPU chips, capped at 8)
@@ -396,7 +396,7 @@ private:
                     tcfg.prefill_chunk_size = 128; // Auto-compiles slot-targeted {128, 64, 32} (+ 1 when B>1)
                     tcfg.num_replicas = R;
                     tcfg.use_int8_weights = tpu_opts_.use_int8;
-                    tcfg.use_int8_kv = tpu_opts_.use_int8_kv;
+                    tcfg.use_fp8_kv = tpu_opts_.use_fp8_kv;
                     tcfg.return_full_logits = !tpu_opts_.use_onchip_argmax;
                     tcfg.use_onchip_embeddings = tpu_opts_.use_onchip_embeddings;
                     tcfg.donate_kv_cache = true;
@@ -404,8 +404,8 @@ private:
                     std::cout << "[HavenServer] Initializing Model-General On-Chip TPU Engine (" << mc.architecture
                               << ", " << mc.num_layers << "L, R=" << R
                               << ", B=" << tcfg.batch_size
-                              << ", " << (tcfg.use_int8_weights ? "W8A16/W8A8-INT8" : "BF16")
-                              << ", KV=" << (tcfg.use_int8_kv ? "INT8" : "BF16")
+                              << ", " << (tcfg.use_int8_weights ? "HadW8-INT8" : "BF16")
+                              << ", KV=" << (tcfg.use_fp8_kv ? "FP8-E4M3FN" : "BF16")
                               << ", " << (tcfg.return_full_logits ? "FullSampler" : "OnChipArgmax")
                               << ", max_seq=" << tcfg.max_seq_len
                               << ", onchip_emb=" << (tcfg.use_onchip_embeddings ? "true" : "false") << ")...\n" << std::flush;
@@ -2983,7 +2983,10 @@ int main(int argc, char** argv) {
     }
     if (const char* env_batch = std::getenv("HAVEN_TPU_BATCH"); env_batch && *env_batch) {
         uint32_t b = 1;
-        if (parse_u32_range(env_batch, 1, 128, b)) tpu_opts.batch_size = static_cast<int>(b);
+        if (parse_u32_range(env_batch, 1, 256, b)) tpu_opts.batch_size = static_cast<int>(b);
+    }
+    if (const char* env_kvfp8 = std::getenv("HAVEN_TPU_KV_FP8"); env_kvfp8 && std::string(env_kvfp8) == "1") {
+        tpu_opts.use_fp8_kv = true;
     }
     if (const char* env_lib = std::getenv("HAVEN_LIBTPU_PATH"); env_lib && *env_lib) {
         tpu_opts.libtpu_path = env_lib;
@@ -2999,10 +3002,11 @@ int main(int argc, char** argv) {
                       << "  --port <port>             HTTP server port (default: 11436)\n"
                       << "  --api-key <key>           Require Authorization: Bearer <key> on API routes (or HAVEN_API_KEY)\n"
                       << "  --model <path>            GGUF or MLX model path to load\n"
-                      << "  --tpu, --tpu-onchip       Serve dense transformers directly on Cloud TPU HBM3 via libtpu.so\n"
-                      << "  --tpu-replicas <1|2|4>    Tensor-parallel TPU chips over Optical ICI (default: auto)\n"
-                      << "  --tpu-batch <1..128>      Multi-tenant HBM3 KV slots (1=interactive, 16/32/64=continuous batching)\n"
-                      << "  --tpu-bf16 / --tpu-int8   HBM3 weight precision (default: --tpu-int8 W8A16)\n"
+                      << "  --tpu, --tpu-onchip       Serve dense/MoE transformers directly on Cloud TPU HBM3 via libtpu.so\n"
+                      << "  --tpu-replicas <1|2|4|8>  Tensor-parallel TPU chips over Optical ICI (default: auto)\n"
+                      << "  --tpu-batch <1..256>      Multi-tenant HBM3 KV slots (1=interactive, 16..256=continuous batching)\n"
+                      << "  --tpu-bf16 / --tpu-int8   HBM3 weight precision (default: --tpu-int8 Hadamard W8)\n"
+                      << "  --tpu-kv-fp8              Scale-free FP8 E4M3FN coalesced 3D KV cache (50% HBM3 footprint & BW)\n"
                       << "  --tpu-argmax              Use on-chip TPU argmax (4B/slot D2H) for peak multi-tenant tok/s\n"
                       << "  --tpu-max-seq <N>         Static HBM3 KV cache length (default: 2048)\n"
                       << "  --tpu-host-emb            Use host-side embedding lookup instead of on-chip HBM3 gather\n"
@@ -3026,9 +3030,9 @@ int main(int argc, char** argv) {
         } else if (arg == "--tpu-int8") {
             tpu_opts.enable_onchip = true;
             tpu_opts.use_int8 = true;
-        } else if (arg == "--tpu-kv-int8") {
+        } else if (arg == "--tpu-kv-fp8") {
             tpu_opts.enable_onchip = true;
-            tpu_opts.use_int8_kv = true;
+            tpu_opts.use_fp8_kv = true;
         } else if (arg == "--tpu-argmax") {
             tpu_opts.enable_onchip = true;
             tpu_opts.use_onchip_argmax = true;

@@ -72,6 +72,7 @@ PJRT_Buffer* HavenTpuPjrtBackend::upload_f32_2d(const float*, int64_t, int64_t, 
 PJRT_Buffer* HavenTpuPjrtBackend::upload_bf16_nd(const uint16_t*, const std::vector<int64_t>&, int) { return nullptr; }
 PJRT_Buffer* HavenTpuPjrtBackend::upload_f32_nd(const float*, const std::vector<int64_t>&, int) { return nullptr; }
 PJRT_Buffer* HavenTpuPjrtBackend::upload_s8_nd(const int8_t*, const std::vector<int64_t>&, int) { return nullptr; }
+PJRT_Buffer* HavenTpuPjrtBackend::upload_f8e4m3fn_nd(const uint8_t*, const std::vector<int64_t>&, int) { return nullptr; }
 PJRT_Buffer* HavenTpuPjrtBackend::upload_i32_nd(const int32_t*, const std::vector<int64_t>&, int) { return nullptr; }
 bool HavenTpuPjrtBackend::download_f32(PJRT_Buffer*, float*, size_t) { return false; }
 bool HavenTpuPjrtBackend::download_bf16(PJRT_Buffer*, uint16_t*, size_t) { return false; }
@@ -473,6 +474,30 @@ PJRT_Buffer* HavenTpuPjrtBackend::upload_s8_nd(const int8_t* host_data, const st
 
     if (PJRT_Error* err = api_->PJRT_Client_BufferFromHostBuffer(&args)) {
         last_error_ = "BufferFromHostBuffer(S8) failed: " + consume_error(err);
+        return nullptr;
+    }
+    if (args.done_with_host_buffer) {
+        await_and_destroy_event(args.done_with_host_buffer);
+    }
+    return args.buffer;
+}
+
+PJRT_Buffer* HavenTpuPjrtBackend::upload_f8e4m3fn_nd(const uint8_t* host_data, const std::vector<int64_t>& dims, int device_index) {
+    if (!initialized_ || !host_data || device_index < 0 || static_cast<size_t>(device_index) >= devices_.size()) {
+        return nullptr;
+    }
+    PJRT_Client_BufferFromHostBuffer_Args args{};
+    args.struct_size = PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE;
+    args.client = client_;
+    args.data = host_data;
+    args.type = PJRT_Buffer_Type_F8E4M3FN;
+    args.dims = dims.empty() ? nullptr : dims.data();
+    args.num_dims = dims.size();
+    args.host_buffer_semantics = PJRT_HostBufferSemantics_kImmutableOnlyDuringCall;
+    args.device = devices_[static_cast<size_t>(device_index)];
+
+    if (PJRT_Error* err = api_->PJRT_Client_BufferFromHostBuffer(&args)) {
+        last_error_ = "BufferFromHostBuffer(F8E4M3FN) failed: " + consume_error(err);
         return nullptr;
     }
     if (args.done_with_host_buffer) {

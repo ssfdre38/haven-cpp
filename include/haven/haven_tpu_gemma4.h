@@ -68,8 +68,8 @@ struct TpuModelSpec {
     std::vector<int>  layer_type_idx;
     std::vector<int>  layer_kv_idx;
 
-    int num_kv_buffers(bool int8_kv = false) const {
-        return (int8_kv ? 4 : 2) * (num_swa_kv_layers + num_glob_kv_layers);
+    int num_kv_buffers() const {
+        return 2 * (num_swa_kv_layers + num_glob_kv_layers);
     }
 
     // Derive exact TPU execution graph specification from a loaded HavenEngine
@@ -78,13 +78,13 @@ struct TpuModelSpec {
 };
 
 struct TpuGemma4Config {
-    int batch_size = 1;            // Concurrent KV cache slot capacity (1 = interactive, 16/32/64/128 = continuous batching)
+    int batch_size = 1;            // Concurrent KV cache slot capacity (1 = interactive, 16/32/64/128/256 = continuous batching)
     int max_seq_len = 2048;        // Static on-chip HBM3 KV cache capacity per sequence slot
     int prefill_chunk_size = 128;  // Max batched prefill bucket (0 = skip prefill graph compilation)
     std::vector<int> prefill_buckets; // Explicit bucket list (empty = auto {128, 32, 16} when prefill_chunk_size >= 128)
     int num_replicas = 1;          // 1 = single Trillium chip, 2/4/8 = Megatron Tensor-Parallel over Optical ICI
     bool use_int8_weights = false; // false = BF16, true = W8A16/W8A8 INT8 + Block-256 Hadamard MoE (~2x HBM3 BW)
-    bool use_int8_kv = false;      // false = BF16 KV cache, true = Symmetric INT8 KV cache + per-head scales (2x less KV HBM3 BW, unlocks B=256!)
+    bool use_fp8_kv = false;       // false = BF16 KV cache, true = Scale-Free FP8 E4M3FN KV cache (50% KV HBM3 BW, zero scales, unlocks B=256!)
     bool return_full_logits = false; // true = return [B, vocab] F32 logits, false = on-chip argmax [B] i32 (4B/slot PCIe)
     bool use_onchip_embeddings = false; // true = upload only [B, S] i32 token IDs & gather embeddings on-chip in HBM3
     bool donate_kv_cache = true;   // Emit tf.aliasing_output on KV cache buffers for zero-copy in-place HBM3 updates
