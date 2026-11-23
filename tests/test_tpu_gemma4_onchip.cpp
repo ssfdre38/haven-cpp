@@ -657,23 +657,21 @@ int main(int argc, char** argv) {
     if (spec.is_moe) {
         // MoE 26B-A4B Suite: 4-chip (v6e-4) and 8-chip (v6e-8) pod scaling!
         if (n_devs >= 8) {
-            run_config_bench("M1. Ava 26B-A4B Parity Check (8-Chip v6e-8 BF16 FullLogits)",    8, 1,   false, true,  64,  128, true);
-            run_config_bench("M2. Ava 26B-A4B Interactive (8-Chip v6e-8 BF16 OnChipEmb)",     8, 1,   false, false, 128, 128, true);
             run_config_bench("M3. Ava 26B-A4B Interactive (8-Chip v6e-8 W8A16 INT8)",         8, 1,   true,  false, 128, 128, true);
-            run_config_bench("M3-P. Ava 26B-A4B INT8 Parity Check (8-Chip v6e-8 FullLogits)", 8, 1,   true,  true,  32,  128, true);
-            run_config_bench("M4. Ava 26B-A4B Batch B=32 (8-Chip v6e-8 W8A16 INT8)",          8, 32,  true,  false, 64,  0,   true);
-            run_config_bench("M5. Ava 26B-A4B Batch B=64 (8-Chip v6e-8 W8A16 INT8)",          8, 64,  true,  false, 64,  0,   true);
-            run_config_bench("M6. Ava 26B-A4B Batch B=128 (8-Chip v6e-8 W8A16 INT8)",         8, 128, true,  false, 64,  0,   true);
+            run_config_bench("M3-P. Ava 26B-A4B W8A8/W8A16 INT8 Parity (8-Chip FullLogits)",  8, 1,   true,  true,  32,  128, true);
+            run_config_bench("M4. Ava 26B-A4B Batch B=32 (8-Chip v6e-8 W8A8 INT8)",           8, 32,  true,  false, 64,  0,   true);
+            run_config_bench("M5. Ava 26B-A4B Batch B=64 (8-Chip v6e-8 W8A8 INT8)",           8, 64,  true,  false, 64,  0,   true);
+            run_config_bench("M6. Ava 26B-A4B Batch B=128 (8-Chip v6e-8 W8A8 INT8)",          8, 128, true,  false, 64,  0,   true);
             run_config_bench("M7. Ava 26B-A4B Batch B=128 (8-Chip v6e-8 BF16)",               8, 128, false, false, 64,  0,   true);
+            run_config_bench("M2. Ava 26B-A4B Interactive (8-Chip v6e-8 BF16 OnChipEmb)",     8, 1,   false, false, 128, 128, true);
         } else if (n_devs >= 4) {
-            run_config_bench("M4A. Ava 26B-A4B Parity Check (4-Chip v6e-4 BF16 FullLogits)",  4, 1,   false, true,  64,  128, true);
-            run_config_bench("M4B. Ava 26B-A4B Interactive (4-Chip v6e-4 BF16 OnChipEmb)",    4, 1,   false, false, 128, 128, true);
-            run_config_bench("M4C. Ava 26B-A4B Interactive (4-Chip v6e-4 W8A16 INT8)",        4, 1,   true,  false, 128, 128, true);
+            run_config_bench("M4C. Ava 26B-A4B Interactive (4-Chip v6e-4 W8A16/W8A8 INT8)",   4, 1,   true,  false, 128, 128, true);
             run_config_bench("M4C-P. Ava 26B-A4B INT8 Parity Check (4-Chip v6e-4 FullLogits)",4, 1,   true,  true,  32,  128, true);
-            run_config_bench("M4D. Ava 26B-A4B Batch B=32 (4-Chip v6e-4 W8A16 INT8)",         4, 32,  true,  false, 64,  0,   true);
-            run_config_bench("M4E. Ava 26B-A4B Batch B=64 (4-Chip v6e-4 W8A16 INT8)",         4, 64,  true,  false, 64,  0,   true);
-            run_config_bench("M4F. Ava 26B-A4B Batch B=128 (4-Chip v6e-4 W8A16 INT8)",        4, 128, true,  false, 64,  0,   true);
+            run_config_bench("M4D. Ava 26B-A4B Batch B=32 (4-Chip v6e-4 W8A8 INT8)",          4, 32,  true,  false, 64,  0,   true);
+            run_config_bench("M4E. Ava 26B-A4B Batch B=64 (4-Chip v6e-4 W8A8 INT8)",          4, 64,  true,  false, 64,  0,   true);
+            run_config_bench("M4F. Ava 26B-A4B Batch B=128 (4-Chip v6e-4 W8A8 INT8)",         4, 128, true,  false, 64,  0,   true);
             run_config_bench("M4G. Ava 26B-A4B Batch B=128 (4-Chip v6e-4 BF16)",              4, 128, false, false, 64,  0,   true);
+            run_config_bench("M4B. Ava 26B-A4B Interactive (4-Chip v6e-4 BF16 OnChipEmb)",    4, 1,   false, false, 128, 128, true);
         } else {
             run_config_bench("M1A. Ava 26B-A4B Single-Chip (1-Chip W8A16 INT8)",              1, 1,   true,  false, 64,  128, true);
         }
