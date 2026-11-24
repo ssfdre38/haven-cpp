@@ -164,6 +164,7 @@ bool HavenEngine::load_model(const std::string& gguf_filepath) {
     layers_.resize(cfg.num_layers);
     uint32_t max_q_dim = cfg.num_heads * cfg.head_dim;
     uint32_t max_kv_dim = cfg.num_kv_heads * cfg.head_dim;
+    uint32_t max_ff_dim = cfg.hidden_dim;
     for (uint32_t l = 0; l < cfg.num_layers; ++l) {
         std::string prefix = "blk." + std::to_string(l) + ".";
         layers_[l].attn_norm            = loader_.get_tensor(prefix + "attn_norm.weight");
@@ -206,6 +207,9 @@ bool HavenEngine::load_model(const std::string& gguf_filepath) {
         if (layers_[l].attn_v && layers_[l].attn_v->shape.size() > 1) {
             max_kv_dim = std::max(max_kv_dim, static_cast<uint32_t>(layers_[l].attn_v->shape[1]));
         }
+        if (layers_[l].ffn_gate && layers_[l].ffn_gate->shape.size() > 1) {
+            max_ff_dim = std::max(max_ff_dim, static_cast<uint32_t>(layers_[l].ffn_gate->shape[1]));
+        }
     }
 
     uint32_t max_head_dim = std::max(cfg.head_dim, (cfg.num_heads > 0 ? max_q_dim / cfg.num_heads : cfg.head_dim));
@@ -223,11 +227,11 @@ bool HavenEngine::load_model(const std::string& gguf_filepath) {
     k_scratch_.resize(std::max<size_t>(cfg.embedding_dim, max_kv_dim), 0.0f);
     v_scratch_.resize(std::max<size_t>(cfg.embedding_dim, max_kv_dim), 0.0f);
     attn_out_scratch_.resize(cfg.embedding_dim, 0.0f);
-    ffn_gate_scratch_.resize(cfg.hidden_dim, 0.0f);
-    ffn_up_scratch_.resize(cfg.hidden_dim, 0.0f);
+    ffn_gate_scratch_.resize(max_ff_dim, 0.0f);
+    ffn_up_scratch_.resize(max_ff_dim, 0.0f);
     ffn_down_scratch_.resize(cfg.embedding_dim, 0.0f);
     if (cfg.expert_count > 0) {
-        const uint32_t exp_ff = (cfg.expert_ffn_dim > 0) ? cfg.expert_ffn_dim : cfg.hidden_dim;
+        const uint32_t exp_ff = (cfg.expert_ffn_dim > 0) ? cfg.expert_ffn_dim : max_ff_dim;
         const uint32_t k_exp = (cfg.expert_used_count > 0) ? cfg.expert_used_count : 8u;
         moe_router_scratch_.resize(cfg.expert_count, 0.0f);
         moe_norm_scratch_.resize(cfg.embedding_dim, 0.0f);
@@ -235,7 +239,7 @@ bool HavenEngine::load_model(const std::string& gguf_filepath) {
         moe_exp_down_scratch_.resize(cfg.embedding_dim, 0.0f);
         moe_accum_scratch_.resize(cfg.embedding_dim, 0.0f);
     }
-    layer_gate_scratch_.resize(cfg.hidden_dim, 0.0f);
+    layer_gate_scratch_.resize(max_ff_dim, 0.0f);
     per_layer_emb_scratch_.resize(pleias_dim, 0.0f);
     per_layer_proj_scratch_.resize(pleias_dim, 0.0f);
     pleias_proj_scratch_.resize(cfg.embedding_dim, 0.0f);
@@ -243,7 +247,7 @@ bool HavenEngine::load_model(const std::string& gguf_filepath) {
     attn_heads_out_scratch_.resize(std::max<size_t>(cfg.embedding_dim, max_q_dim), 0.0f);
     attn_indices_scratch_.resize(std::max<size_t>(static_cast<size_t>(cfg.max_context_length) + 4, 520), 0);
     logits_scratch_.resize(cfg.vocab_size, 0.0f);
-    default_norm_weights_.assign(std::max({cfg.embedding_dim, cfg.hidden_dim, max_head_dim, 256u}), 1.0f);
+    default_norm_weights_.assign(std::max({cfg.embedding_dim, max_ff_dim, max_head_dim, 256u}), 1.0f);
 
     // Initialize Persistent Cognitive Memory Vault
     std::string mem_path = "wwwroot/memories.json";
@@ -424,11 +428,17 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
     };
 
     const int D_emb = static_cast<int>(cfg.embedding_dim);
-    const int F_hid = static_cast<int>(cfg.hidden_dim);
 
     // 2. Transformer Layer Loop
     for (uint32_t l = 0; l < cfg.num_layers; ++l) {
         const auto& lt = (l < layers_.size()) ? layers_[l] : LayerTensors{};
+
+        const int F_hid = std::max(1, std::min<int>(
+            static_cast<int>(ffn_gate_scratch_.size()),
+            (lt.ffn_gate && lt.ffn_gate->shape.size() > 1) ? static_cast<int>(lt.ffn_gate->shape[1])
+            : ((l < cfg.hidden_dim_per_layer.size() && cfg.hidden_dim_per_layer[l] > 0)
+                ? static_cast<int>(cfg.hidden_dim_per_layer[l])
+                : static_cast<int>(cfg.hidden_dim))));
 
         const int q_dim = std::max(1, std::min<int>(
             static_cast<int>(q_scratch_.size()),
@@ -698,18 +708,18 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
                     } else {
                         Avx2Math::silu(ffn_gate_scratch_.data(), F_hid);
                     }
-                    for (size_t i = 0; i < cfg.hidden_dim; ++i) {
-                        ffn_gate_scratch_[i] *= ffn_up_scratch_[i];
+                    for (int i = 0; i < F_hid; ++i) {
+                        ffn_gate_scratch_[static_cast<size_t>(i)] *= ffn_up_scratch_[static_cast<size_t>(i)];
                     }
                 } else {
-                    for (size_t i = 0; i < cfg.hidden_dim; ++i) ffn_gate_scratch_[i] = norm_scratch_[i % cfg.embedding_dim] * 0.1f;
+                    for (int i = 0; i < F_hid; ++i) ffn_gate_scratch_[static_cast<size_t>(i)] = norm_scratch_[static_cast<size_t>(i % D_emb)] * 0.1f;
                 }
 
                 // 2i. FFN Down Projection
                 if (lt.ffn_down) {
                     Avx2Math::gemv(ffn_down_scratch_.data(), *lt.ffn_down, ffn_gate_scratch_.data(), D_emb, F_hid);
                 } else {
-                    for (size_t i = 0; i < cfg.embedding_dim; ++i) ffn_down_scratch_[i] = ffn_gate_scratch_[i % cfg.hidden_dim] * 0.05f;
+                    for (int i = 0; i < D_emb; ++i) ffn_down_scratch_[static_cast<size_t>(i)] = ffn_gate_scratch_[static_cast<size_t>(i % F_hid)] * 0.05f;
                 }
             }
         }
@@ -1055,6 +1065,798 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
     }
 }
 
+// Fast AVX2 GeGLU activation: dst[i] = gelu_tanh(gate[i]) * up[i] using [7/6] Pade tanh (~1e-6 accuracy)
+static inline void geglu_avx2_range(float* dst, const float* gate, const float* up, int n) {
+    const __m256 c_half   = _mm256_set1_ps(0.5f);
+    const __m256 c_one    = _mm256_set1_ps(1.0f);
+    const __m256 c_neg1   = _mm256_set1_ps(-1.0f);
+    const __m256 c_s2pi   = _mm256_set1_ps(0.7978845608f);
+    const __m256 c_cubic  = _mm256_set1_ps(0.044715f);
+    const __m256 c_clamp  = _mm256_set1_ps(4.97f);
+    const __m256 c_nclamp = _mm256_set1_ps(-4.97f);
+    const __m256 p0       = _mm256_set1_ps(135135.0f);
+    const __m256 p1       = _mm256_set1_ps(17325.0f);
+    const __m256 p2       = _mm256_set1_ps(378.0f);
+    const __m256 q1       = _mm256_set1_ps(62370.0f);
+    const __m256 q2       = _mm256_set1_ps(3150.0f);
+    const __m256 q3       = _mm256_set1_ps(28.0f);
+
+    int i = 0;
+    for (; i <= n - 8; i += 8) {
+        const __m256 g  = _mm256_loadu_ps(gate + i);
+        const __m256 u  = _mm256_loadu_ps(up + i);
+        const __m256 g2 = _mm256_mul_ps(g, g);
+        __m256 z = _mm256_mul_ps(c_s2pi, _mm256_fmadd_ps(_mm256_mul_ps(c_cubic, g2), g, g));
+        z = _mm256_min_ps(c_clamp, _mm256_max_ps(c_nclamp, z));
+        const __m256 z2  = _mm256_mul_ps(z, z);
+        const __m256 num = _mm256_mul_ps(z, _mm256_fmadd_ps(z2, _mm256_fmadd_ps(z2, _mm256_add_ps(p2, z2), p1), p0));
+        const __m256 den = _mm256_fmadd_ps(z2, _mm256_fmadd_ps(z2, _mm256_fmadd_ps(q3, z2, q2), q1), p0);
+        const __m256 th  = _mm256_min_ps(c_one, _mm256_max_ps(c_neg1, _mm256_div_ps(num, den)));
+        const __m256 act = _mm256_mul_ps(_mm256_mul_ps(c_half, g), _mm256_add_ps(c_one, th));
+        _mm256_storeu_ps(dst + i, _mm256_mul_ps(act, u));
+    }
+    for (; i < n; ++i) {
+        const float g = gate[i];
+        const float act = 0.5f * g * (1.0f + std::tanh(0.7978845608f * (g + 0.044715f * g * g * g)));
+        dst[i] = act * up[i];
+    }
+}
+
+void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_pos, float* out_last_logits, uint32_t active_cluster) {
+    if (!tokens || n_tokens <= 0) return;
+    if (n_tokens == 1 || tpu_offload_active_) {
+        for (int i = 0; i < n_tokens; ++i) {
+            const bool is_last = (i + 1 == n_tokens);
+            forward(tokens[i], start_pos + i, is_last ? out_last_logits : nullptr, active_cluster);
+        }
+        return;
+    }
+
+    const auto& cfg = loader_.get_config();
+    if (cfg.embedding_dim == 0 || cfg.hidden_dim == 0 || cfg.num_heads == 0 || cfg.num_kv_heads == 0 || cfg.max_context_length == 0) {
+        return;
+    }
+
+    auto safe_f32_weights = [&](const TensorDesc* t, size_t count) -> const float* {
+        if (t && t->data && t->type == QuantType::F32 &&
+            (t->size_bytes == 0 || t->size_bytes >= count * sizeof(float))) {
+            return reinterpret_cast<const float*>(t->data);
+        }
+        return default_norm_weights_.data();
+    };
+
+    auto tensor_fits_expert = [](const TensorDesc* t, int e_idx, size_t exp_rows, int cols) -> bool {
+        if (!t || !t->data || cols <= 0) return false;
+        if (t->size_bytes == 0) return true;
+        const size_t rb = Avx2Math::row_bytes(t->type, cols);
+        return rb > 0 && (static_cast<size_t>(e_idx) + 1ULL) * exp_rows <= (t->size_bytes / rb);
+    };
+
+    const int D = static_cast<int>(cfg.embedding_dim);
+    const int max_F = std::max<int>(static_cast<int>(cfg.hidden_dim), static_cast<int>(ffn_gate_scratch_.size()));
+    const int L = static_cast<int>(cfg.num_layers);
+    const int max_ctx = static_cast<int>(cfg.max_context_length);
+    const bool use_gelu = (cfg.ffn_activation == FfnActivation::GELU);
+
+    // Compute worst-case Q / KV dimensions across layers for chunk scratch sizing
+    int max_q_dim = static_cast<int>(q_scratch_.size());
+    int max_kv_dim = static_cast<int>(k_scratch_.size());
+
+    // Optional sensory vector computed once per batch call
+    std::vector<float> sensory_vec;
+    if (sensory_bridge_.get_visual_frame_count() > 0 || sensory_bridge_.get_audio_frame_count() > 0) {
+        sensory_vec = sensory_bridge_.project_sensory_tokens(cfg.embedding_dim);
+    }
+
+    // Balanced chunking: keep MoE batches up to 320 tokens so every expert streams from DDR4 ONCE with >=16 tokens/expert,
+    // and dense batches up to 256 tokens so weights stream ONCE per 256 tokens with zero tiny tail chunks!
+    const bool has_moe_model = (cfg.expert_count > 0);
+    const int max_chunk = has_moe_model ? 320 : 256;
+    const int n_chunks = (n_tokens + max_chunk - 1) / max_chunk;
+    const int chunk_step = (n_tokens + n_chunks - 1) / n_chunks;
+    const int chunk_cap = std::min(n_tokens, chunk_step);
+
+    std::vector<float> X(static_cast<size_t>(chunk_cap) * static_cast<size_t>(D));
+    std::vector<float> norm_buf(static_cast<size_t>(chunk_cap) * static_cast<size_t>(D));
+    std::vector<float> q_buf(static_cast<size_t>(chunk_cap) * static_cast<size_t>(max_q_dim));
+    std::vector<float> k_buf(static_cast<size_t>(chunk_cap) * static_cast<size_t>(max_kv_dim));
+    std::vector<float> v_buf(static_cast<size_t>(chunk_cap) * static_cast<size_t>(max_kv_dim));
+    std::vector<float> attn_heads_buf(static_cast<size_t>(chunk_cap) * static_cast<size_t>(max_q_dim));
+    std::vector<float> attn_out_buf(static_cast<size_t>(chunk_cap) * static_cast<size_t>(D));
+    std::vector<float> ffn_gate_buf(static_cast<size_t>(chunk_cap) * static_cast<size_t>(max_F));
+    std::vector<float> ffn_up_buf(static_cast<size_t>(chunk_cap) * static_cast<size_t>(max_F));
+    std::vector<float> ffn_down_buf(static_cast<size_t>(chunk_cap) * static_cast<size_t>(D));
+
+    const bool has_pleias_branch = (per_layer_token_embd_tensor_ != nullptr && !per_layer_emb_scratch_.empty());
+    const int pleias_total = has_pleias_branch ? static_cast<int>(per_layer_emb_scratch_.size()) : 0;
+    std::vector<float> pl_emb_buf;
+    std::vector<float> pl_proj_buf;
+    std::vector<float> pl_gate_buf;
+    std::vector<float> pl_out_buf;
+    if (has_pleias_branch) {
+        pl_emb_buf.resize(static_cast<size_t>(chunk_cap) * static_cast<size_t>(pleias_total));
+        if (per_layer_model_proj_tensor_) {
+            pl_proj_buf.resize(static_cast<size_t>(chunk_cap) * static_cast<size_t>(pleias_total));
+        }
+        pl_gate_buf.resize(static_cast<size_t>(chunk_cap) * 256ULL);
+        pl_out_buf.resize(static_cast<size_t>(chunk_cap) * static_cast<size_t>(D));
+    }
+
+    std::vector<float> moe_norm_buf;
+    std::vector<float> moe_router_buf;
+    std::vector<float> moe_accum_buf;
+    if (has_moe_model) {
+        moe_norm_buf.resize(static_cast<size_t>(chunk_cap) * static_cast<size_t>(D));
+        moe_router_buf.resize(static_cast<size_t>(chunk_cap) * static_cast<size_t>(cfg.expert_count));
+        moe_accum_buf.resize(static_cast<size_t>(chunk_cap) * static_cast<size_t>(D));
+    }
+
+    for (int chunk_off = 0; chunk_off < n_tokens; chunk_off += chunk_step) {
+        const int S = std::min(chunk_step, n_tokens - chunk_off);
+        const int chunk_start_pos = start_pos + chunk_off;
+        const bool is_last_chunk = (chunk_off + S == n_tokens);
+
+        // 1. Batched Token Embedding Lookup
+        const float emb_scale = cfg.is_gemma ? std::sqrt(static_cast<float>(D)) : 1.0f;
+        #pragma omp parallel for if(S >= 8) schedule(static)
+        for (int t = 0; t < S; ++t) {
+            const uint32_t tok = tokens[chunk_off + t];
+            float* xt = X.data() + static_cast<size_t>(t) * static_cast<size_t>(D);
+            if (token_embd_tensor_ && tok < cfg.vocab_size) {
+                Avx2Math::dequantize_row(xt, *token_embd_tensor_, static_cast<int>(tok), D);
+                if (cfg.is_gemma) {
+                    for (int i = 0; i < D; ++i) xt[i] *= emb_scale;
+                }
+            } else {
+                for (int i = 0; i < D; ++i) xt[i] = std::sin(static_cast<float>(tok + static_cast<uint32_t>(i)) * 0.01f);
+            }
+        }
+
+        // 1a-2. Batched Pleias Per-Layer Embeddings + Batched BF16 Projection
+        if (has_pleias_branch) {
+            const float tok_scale = std::sqrt(256.0f);
+            #pragma omp parallel for if(S >= 4) schedule(static)
+            for (int t = 0; t < S; ++t) {
+                const uint32_t tok = tokens[chunk_off + t];
+                float* pe = pl_emb_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(pleias_total);
+                if (tok < cfg.vocab_size) {
+                    Avx2Math::dequantize_row(pe, *per_layer_token_embd_tensor_, static_cast<int>(tok), pleias_total);
+                    for (int i = 0; i < pleias_total; ++i) pe[i] *= tok_scale;
+                } else {
+                    std::memset(pe, 0, static_cast<size_t>(pleias_total) * sizeof(float));
+                }
+            }
+
+            if (per_layer_model_proj_tensor_) {
+                Avx2Math::gemm(pl_proj_buf.data(), pleias_total, *per_layer_model_proj_tensor_, X.data(), D, S, pleias_total, D);
+                const float proj_scale = 1.0f / std::sqrt(static_cast<float>(D));
+                const float input_scale = 1.0f / std::sqrt(2.0f);
+                const float* proj_norm_w = safe_f32_weights(per_layer_proj_norm_tensor_, 256);
+
+                #pragma omp parallel for schedule(static)
+                for (int t = 0; t < S; ++t) {
+                    float* pp = pl_proj_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(pleias_total);
+                    float* pe = pl_emb_buf.data()  + static_cast<size_t>(t) * static_cast<size_t>(pleias_total);
+                    for (int i = 0; i < pleias_total; ++i) pp[i] *= proj_scale;
+                    for (int l = 0; l < L && (l + 1) * 256 <= pleias_total; ++l) {
+                        float* p_slice = pp + static_cast<size_t>(l) * 256ULL;
+                        float* e_slice = pe + static_cast<size_t>(l) * 256ULL;
+                        Avx2Math::rms_norm(p_slice, p_slice, proj_norm_w, 256, cfg.rms_norm_eps);
+                        for (int i = 0; i < 256; ++i) {
+                            e_slice[i] = (p_slice[i] + e_slice[i]) * input_scale;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 1b. Optional Multimodal Sensory Injection
+        if (!sensory_vec.empty()) {
+            for (int t = 0; t < S; ++t) {
+                float* xt = X.data() + static_cast<size_t>(t) * static_cast<size_t>(D);
+                for (int i = 0; i < D; ++i) xt[i] += sensory_vec[static_cast<size_t>(i)];
+            }
+        }
+
+        // 2. Batched Transformer Layer Loop
+        for (uint32_t l = 0; l < cfg.num_layers; ++l) {
+            const auto& lt = (l < layers_.size()) ? layers_[l] : LayerTensors{};
+
+            const int q_dim = std::max(1, std::min<int>(
+                max_q_dim,
+                (lt.attn_q && lt.attn_q->shape.size() > 1) ? static_cast<int>(lt.attn_q->shape[1]) : static_cast<int>(cfg.num_heads * cfg.head_dim)));
+            const int actual_head_dim = std::max(1, (cfg.num_heads > 0) ? (q_dim / static_cast<int>(cfg.num_heads)) : static_cast<int>(cfg.head_dim));
+            const uint32_t layer_n_kv_heads = (l < cfg.head_count_kv_per_layer.size() && cfg.head_count_kv_per_layer[l] > 0)
+                ? cfg.head_count_kv_per_layer[l]
+                : ((lt.attn_k && lt.attn_k->shape.size() > 1 && actual_head_dim > 0)
+                    ? std::max(1u, static_cast<uint32_t>(lt.attn_k->shape[1]) / static_cast<uint32_t>(actual_head_dim))
+                    : cfg.num_kv_heads);
+            const int kv_dim = std::max(1, std::min<int>(
+                max_kv_dim,
+                (lt.attn_k && lt.attn_k->shape.size() > 1) ? static_cast<int>(lt.attn_k->shape[1]) : static_cast<int>(layer_n_kv_heads * static_cast<uint32_t>(actual_head_dim))));
+            const float attn_scale = cfg.is_gemma ? 1.0f : (1.0f / std::sqrt(static_cast<float>(actual_head_dim)));
+            const int gqa_ratio = std::max(1u, cfg.num_heads / std::max(1u, layer_n_kv_heads));
+
+            // 2a. Batched Pre-Attention RMSNorm
+            const float* attn_norm_w = safe_f32_weights(lt.attn_norm, cfg.embedding_dim);
+            #pragma omp parallel for if(S >= 8) schedule(static)
+            for (int t = 0; t < S; ++t) {
+                Avx2Math::rms_norm(norm_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(D),
+                                   X.data() + static_cast<size_t>(t) * static_cast<size_t>(D),
+                                   attn_norm_w, D, cfg.rms_norm_eps);
+            }
+
+            // Shared-KV check BEFORE projecting K/V (honors Gemma 4 E4B shared_kv_layers=18)
+            const bool has_swa = (cfg.sliding_window > 0) && (cfg.is_gemma || cfg.architecture == "mistral");
+            const bool is_swa = (l < cfg.sliding_window_pattern.size())
+                ? cfg.sliding_window_pattern[l]
+                : (has_swa && (cfg.architecture == "mistral" || (l % 6 != 5)));
+            const bool is_shared_kv = (cfg.shared_kv_layers > 0 && cfg.shared_kv_layers < cfg.num_layers &&
+                l >= (cfg.num_layers - cfg.shared_kv_layers));
+            const bool has_kv = !is_shared_kv && (lt.attn_k != nullptr);
+            const TensorDesc* eff_k = has_kv ? lt.attn_k : nullptr;
+            const TensorDesc* eff_v = has_kv ? lt.attn_v : nullptr;
+
+            // 2b. Batched Q, K, V Projections (pack norm_buf ONCE when sharing Q8K / Q8_32!)
+            const bool q_q8k = lt.attn_q && Avx2Math::supports_q8k_gemm(lt.attn_q->type, D);
+            const bool k_q8k = !eff_k || Avx2Math::supports_q8k_gemm(eff_k->type, D);
+            const bool v_q8k = !eff_v || Avx2Math::supports_q8k_gemm(eff_v->type, D);
+            const bool q_q832 = lt.attn_q && Avx2Math::supports_q8_32_gemm(lt.attn_q->type, D);
+            const bool k_q832 = !eff_k || Avx2Math::supports_q8_32_gemm(eff_k->type, D);
+            const bool v_q832 = !eff_v || Avx2Math::supports_q8_32_gemm(eff_v->type, D);
+
+            if (q_q8k && k_q8k && v_q8k) {
+                Q8KBatch qkv_batch;
+                Avx2Math::pack_q8k_batch(norm_buf.data(), D, D, S, qkv_batch);
+                Avx2Math::gemm_slice_q8k(q_buf.data(), q_dim, *lt.attn_q, 0, qkv_batch, q_dim, D, true);
+                if (eff_k) Avx2Math::gemm_slice_q8k(k_buf.data(), kv_dim, *eff_k, 0, qkv_batch, kv_dim, D, true);
+                if (eff_v) Avx2Math::gemm_slice_q8k(v_buf.data(), kv_dim, *eff_v, 0, qkv_batch, kv_dim, D, true);
+            } else if (q_q832 && k_q832 && v_q832) {
+                Q8_32Batch qkv_batch;
+                Avx2Math::pack_q8_32_batch(norm_buf.data(), D, D, S, qkv_batch);
+                Avx2Math::gemm_slice_q8_32(q_buf.data(), q_dim, *lt.attn_q, 0, qkv_batch, q_dim, D, true);
+                if (eff_k) Avx2Math::gemm_slice_q8_32(k_buf.data(), kv_dim, *eff_k, 0, qkv_batch, kv_dim, D, true);
+                if (eff_v) Avx2Math::gemm_slice_q8_32(v_buf.data(), kv_dim, *eff_v, 0, qkv_batch, kv_dim, D, true);
+            } else {
+                if (lt.attn_q) Avx2Math::gemm(q_buf.data(), q_dim, *lt.attn_q, norm_buf.data(), D, S, q_dim, D);
+                else {
+                    for (int t = 0; t < S; ++t)
+                        for (int i = 0; i < q_dim; ++i)
+                            q_buf[static_cast<size_t>(t) * static_cast<size_t>(q_dim) + static_cast<size_t>(i)] =
+                                norm_buf[static_cast<size_t>(t) * static_cast<size_t>(D) + static_cast<size_t>(i % D)];
+                }
+                if (eff_k) Avx2Math::gemm(k_buf.data(), kv_dim, *eff_k, norm_buf.data(), D, S, kv_dim, D);
+                else if (!is_shared_kv) {
+                    for (int t = 0; t < S; ++t)
+                        for (int i = 0; i < kv_dim; ++i)
+                            k_buf[static_cast<size_t>(t) * static_cast<size_t>(kv_dim) + static_cast<size_t>(i)] =
+                                norm_buf[static_cast<size_t>(t) * static_cast<size_t>(D) + static_cast<size_t>(i % D)];
+                }
+                if (eff_v) Avx2Math::gemm(v_buf.data(), kv_dim, *eff_v, norm_buf.data(), D, S, kv_dim, D);
+            }
+
+            if (lt.attn_q_bias || (eff_k && lt.attn_k_bias) || (eff_v && lt.attn_v_bias) || (eff_k && !eff_v) || (!eff_v && !eff_k && !is_shared_kv)) {
+                for (int t = 0; t < S; ++t) {
+                    float* qt = q_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(q_dim);
+                    float* kt = k_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(kv_dim);
+                    float* vt = v_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(kv_dim);
+                    if (lt.attn_q && lt.attn_q_bias) Avx2Math::add_bias(qt, *lt.attn_q_bias, q_dim);
+                    if (eff_k && lt.attn_k_bias) Avx2Math::add_bias(kt, *lt.attn_k_bias, kv_dim);
+                    if (eff_v) {
+                        if (lt.attn_v_bias) Avx2Math::add_bias(vt, *lt.attn_v_bias, kv_dim);
+                    } else if (eff_k) {
+                        std::memcpy(vt, kt, static_cast<size_t>(kv_dim) * sizeof(float));
+                    } else if (!is_shared_kv) {
+                        for (int i = 0; i < kv_dim; ++i) {
+                            vt[i] = norm_buf[static_cast<size_t>(t) * static_cast<size_t>(D) + static_cast<size_t>(i % D)];
+                        }
+                    }
+                }
+            }
+
+            // 2b-2 & 2c. Batched Per-Head Q/K/V Norms + RoPE
+            const float* q_norm_w = lt.attn_q_norm ? safe_f32_weights(lt.attn_q_norm, static_cast<size_t>(actual_head_dim)) : nullptr;
+            const float* k_norm_w = (has_kv && lt.attn_k_norm) ? safe_f32_weights(lt.attn_k_norm, static_cast<size_t>(actual_head_dim)) : nullptr;
+            const bool do_v_norm  = (has_kv && cfg.is_gemma && lt.attn_q_norm && lt.attn_k_norm);
+            const float layer_freq_base = is_swa ? cfg.rope_freq_base_swa : cfg.rope_freq_base;
+            const int rope_dim = actual_head_dim;
+            const float* freq_factors_w = (!is_swa && rope_freqs_tensor_ && rope_freqs_tensor_->type == QuantType::F32 &&
+                (rope_freqs_tensor_->size_bytes == 0 || rope_freqs_tensor_->size_bytes >= static_cast<size_t>(rope_dim / 2) * sizeof(float)))
+                ? reinterpret_cast<const float*>(rope_freqs_tensor_->data) : nullptr;
+
+            #pragma omp parallel for if(S >= 4) schedule(static)
+            for (int t = 0; t < S; ++t) {
+                const int cur_pos = std::clamp(chunk_start_pos + t, 0, max_ctx - 1);
+                float* qt = q_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(q_dim);
+                float* kt = k_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(kv_dim);
+                float* vt = v_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(kv_dim);
+                if (q_norm_w) {
+                    for (uint32_t h = 0; h < cfg.num_heads; ++h) {
+                        float* q_h = qt + static_cast<size_t>(h) * static_cast<size_t>(actual_head_dim);
+                        Avx2Math::rms_norm(q_h, q_h, q_norm_w, actual_head_dim, cfg.rms_norm_eps);
+                    }
+                }
+                if (k_norm_w) {
+                    for (uint32_t h = 0; h < layer_n_kv_heads; ++h) {
+                        float* k_h = kt + static_cast<size_t>(h) * static_cast<size_t>(actual_head_dim);
+                        Avx2Math::rms_norm(k_h, k_h, k_norm_w, actual_head_dim, cfg.rms_norm_eps);
+                    }
+                }
+                if (do_v_norm) {
+                    for (uint32_t h = 0; h < layer_n_kv_heads; ++h) {
+                        float* v_h = vt + static_cast<size_t>(h) * static_cast<size_t>(actual_head_dim);
+                        Avx2Math::rms_norm(v_h, v_h, default_norm_weights_.data(), actual_head_dim, cfg.rms_norm_eps);
+                    }
+                }
+                if (has_kv) {
+                    Avx2Math::apply_rope(qt, kt, actual_head_dim, cfg.num_heads, layer_n_kv_heads, cur_pos, layer_freq_base, cfg.rope_freq_scale, freq_factors_w, rope_dim);
+                } else {
+                    Avx2Math::apply_rope(qt, nullptr, actual_head_dim, cfg.num_heads, 0, cur_pos, layer_freq_base, cfg.rope_freq_scale, freq_factors_w, rope_dim);
+                }
+            }
+
+            uint32_t kv_source_layer = l;
+            if (has_kv) {
+                for (int t = 0; t < S; ++t) {
+                    const int cur_pos = std::clamp(chunk_start_pos + t, 0, max_ctx - 1);
+                    kv_cache_.write(l, cur_pos,
+                                    k_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(kv_dim),
+                                    v_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(kv_dim),
+                                    kv_dim);
+                }
+            } else {
+                if (cfg.num_layers > 20 && cfg.shared_kv_layers > 0 && cfg.shared_kv_layers < cfg.num_layers) {
+                    uint32_t n_kv_start = cfg.num_layers - cfg.shared_kv_layers;
+                    kv_source_layer = n_kv_start - (is_swa ? 2 : 1);
+                } else {
+                    kv_source_layer = (l > 0) ? (l - 1) : 0;
+                }
+                if (kv_source_layer >= cfg.num_layers) kv_source_layer = 0;
+            }
+
+            // 2e. Parallel Causal Multi-Head FlashAttention across all (t, h) pairs
+            const auto& kv_lay = kv_cache_.get_layer(kv_source_layer);
+            const size_t max_safe_positions = (kv_dim > 0) ? (kv_lay.keys.size() / static_cast<size_t>(kv_dim)) : 0;
+            const int swa_win = (cfg.sliding_window > 0) ? static_cast<int>(cfg.sliding_window) : 512;
+            const float* layer_k = kv_lay.keys.data();
+            const float* layer_v = kv_lay.values.data();
+            const int num_heads_i = static_cast<int>(cfg.num_heads);
+            const int total_th = S * num_heads_i;
+
+            #pragma omp parallel for schedule(dynamic, 4)
+            for (int th = 0; th < total_th; ++th) {
+                const int t = th / num_heads_i;
+                const int h = th % num_heads_i;
+                const int cur_pos = std::clamp(chunk_start_pos + t, 0, max_ctx - 1);
+                const int seq_len = std::min({cur_pos + 1, max_ctx, static_cast<int>(max_safe_positions)});
+                const int s_start = is_swa ? std::max(0, seq_len - swa_win) : 0;
+
+                const float* q_h = q_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(q_dim) + static_cast<size_t>(h) * static_cast<size_t>(actual_head_dim);
+                const uint32_t kv_head_idx = std::min(static_cast<uint32_t>(h / gqa_ratio), std::max(1u, layer_n_kv_heads) - 1);
+                const uint32_t kv_head_offset = kv_head_idx * static_cast<uint32_t>(actual_head_dim);
+                float* out_h = attn_heads_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(q_dim) + static_cast<size_t>(h) * static_cast<size_t>(actual_head_dim);
+
+                if (seq_len > 0 && kv_head_offset + static_cast<uint32_t>(actual_head_dim) <= static_cast<uint32_t>(kv_dim)) {
+                    if (!is_swa || s_start <= 4) {
+                        // Fast contiguous causal slice [0 .. seq_len-1] — zero index buffer needed!
+                        const int active_len = seq_len - s_start;
+                        if (s_start == 0) {
+                            FlashAttentionCpu::compute_tiled_attention(
+                                q_h, layer_k, layer_v, nullptr,
+                                static_cast<uint32_t>(active_len), static_cast<uint32_t>(actual_head_dim),
+                                static_cast<uint32_t>(kv_dim), kv_head_offset,
+                                attn_scale, cfg.attn_logit_softcapping, out_h);
+                        } else {
+                            int stack_idx[2048];
+                            std::vector<int> heap_idx;
+                            int* idx_ptr = stack_idx;
+                            if (active_len > 2048) { heap_idx.resize(static_cast<size_t>(active_len)); idx_ptr = heap_idx.data(); }
+                            for (int i = 0; i < active_len; ++i) idx_ptr[i] = s_start + i;
+                            FlashAttentionCpu::compute_tiled_attention(
+                                q_h, layer_k, layer_v, idx_ptr,
+                                static_cast<uint32_t>(active_len), static_cast<uint32_t>(actual_head_dim),
+                                static_cast<uint32_t>(kv_dim), kv_head_offset,
+                                attn_scale, cfg.attn_logit_softcapping, out_h);
+                        }
+                    } else {
+                        const int active_len = 4 + (seq_len - s_start);
+                        int stack_idx[2048];
+                        std::vector<int> heap_idx;
+                        int* idx_ptr = stack_idx;
+                        if (active_len > 2048) { heap_idx.resize(static_cast<size_t>(active_len)); idx_ptr = heap_idx.data(); }
+                        int p = 0;
+                        for (int s = 0; s < 4; ++s) idx_ptr[p++] = s;
+                        for (int s = s_start; s < seq_len; ++s) idx_ptr[p++] = s;
+                        FlashAttentionCpu::compute_tiled_attention(
+                            q_h, layer_k, layer_v, idx_ptr,
+                            static_cast<uint32_t>(p), static_cast<uint32_t>(actual_head_dim),
+                            static_cast<uint32_t>(kv_dim), kv_head_offset,
+                            attn_scale, cfg.attn_logit_softcapping, out_h);
+                    }
+                } else {
+                    std::memset(out_h, 0, static_cast<size_t>(actual_head_dim) * sizeof(float));
+                }
+            }
+
+            // 2f. Batched Attention Output Projection + Post-Attention Norm + Residual 1
+            if (lt.attn_output) {
+                Avx2Math::gemm(attn_out_buf.data(), D, *lt.attn_output, attn_heads_buf.data(), q_dim, S, D, q_dim);
+            } else {
+                for (int t = 0; t < S; ++t)
+                    for (int i = 0; i < D; ++i)
+                        attn_out_buf[static_cast<size_t>(t) * static_cast<size_t>(D) + static_cast<size_t>(i)] =
+                            attn_heads_buf[static_cast<size_t>(t) * static_cast<size_t>(q_dim) + static_cast<size_t>(i % q_dim)];
+            }
+
+            const float* post_attn_w = lt.post_attention_norm ? safe_f32_weights(lt.post_attention_norm, cfg.embedding_dim) : nullptr;
+            const float* ffn_norm_w  = safe_f32_weights(lt.ffn_norm, cfg.embedding_dim);
+            #pragma omp parallel for if(S >= 8) schedule(static)
+            for (int t = 0; t < S; ++t) {
+                float* ao = attn_out_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(D);
+                float* xt = X.data()            + static_cast<size_t>(t) * static_cast<size_t>(D);
+                if (post_attn_w) Avx2Math::rms_norm(ao, ao, post_attn_w, D, cfg.rms_norm_eps);
+                for (int i = 0; i < D; ++i) xt[i] += ao[i];
+                // 2g. Pre-FFN RMSNorm fused directly in cache!
+                Avx2Math::rms_norm(norm_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(D),
+                                   xt, ffn_norm_w, D, cfg.rms_norm_eps);
+            }
+
+            // 2h + 2i. Batched Shared FFN (per-layer F supports Gemma 4 E2B double-wide MLP; pack norm_buf ONCE for Gate + Up!)
+            const int layer_F = std::max(1, std::min<int>(
+                max_F,
+                (lt.ffn_gate && lt.ffn_gate->shape.size() > 1) ? static_cast<int>(lt.ffn_gate->shape[1])
+                : ((l < cfg.hidden_dim_per_layer.size() && cfg.hidden_dim_per_layer[l] > 0)
+                    ? static_cast<int>(cfg.hidden_dim_per_layer[l])
+                    : static_cast<int>(cfg.hidden_dim))));
+
+            if (lt.ffn_gate && lt.ffn_up) {
+                if (Avx2Math::supports_q8k_gemm(lt.ffn_gate->type, D) && Avx2Math::supports_q8k_gemm(lt.ffn_up->type, D)) {
+                    Q8KBatch ffn_batch;
+                    Avx2Math::pack_q8k_batch(norm_buf.data(), D, D, S, ffn_batch);
+                    Avx2Math::gemm_slice_q8k(ffn_gate_buf.data(), layer_F, *lt.ffn_gate, 0, ffn_batch, layer_F, D, true);
+                    Avx2Math::gemm_slice_q8k(ffn_up_buf.data(),   layer_F, *lt.ffn_up,   0, ffn_batch, layer_F, D, true);
+                } else if (Avx2Math::supports_q8_32_gemm(lt.ffn_gate->type, D) && Avx2Math::supports_q8_32_gemm(lt.ffn_up->type, D)) {
+                    Q8_32Batch ffn_batch;
+                    Avx2Math::pack_q8_32_batch(norm_buf.data(), D, D, S, ffn_batch);
+                    Avx2Math::gemm_slice_q8_32(ffn_gate_buf.data(), layer_F, *lt.ffn_gate, 0, ffn_batch, layer_F, D, true);
+                    Avx2Math::gemm_slice_q8_32(ffn_up_buf.data(),   layer_F, *lt.ffn_up,   0, ffn_batch, layer_F, D, true);
+                } else {
+                    Avx2Math::gemm(ffn_gate_buf.data(), layer_F, *lt.ffn_gate, norm_buf.data(), D, S, layer_F, D);
+                    Avx2Math::gemm(ffn_up_buf.data(),   layer_F, *lt.ffn_up,   norm_buf.data(), D, S, layer_F, D);
+                }
+                if (use_gelu) {
+                    #pragma omp parallel for schedule(static)
+                    for (int t = 0; t < S; ++t) {
+                        const size_t off = static_cast<size_t>(t) * static_cast<size_t>(layer_F);
+                        geglu_avx2_range(ffn_gate_buf.data() + off, ffn_gate_buf.data() + off, ffn_up_buf.data() + off, layer_F);
+                    }
+                } else {
+                    const int total_ff = S * layer_F;
+                    #pragma omp parallel for schedule(static)
+                    for (int idx = 0; idx < total_ff; ++idx) {
+                        const float g = ffn_gate_buf[static_cast<size_t>(idx)];
+                        ffn_gate_buf[static_cast<size_t>(idx)] = (g / (1.0f + std::exp(-g))) * ffn_up_buf[static_cast<size_t>(idx)];
+                    }
+                }
+            } else {
+                for (int t = 0; t < S; ++t)
+                    for (int i = 0; i < layer_F; ++i)
+                        ffn_gate_buf[static_cast<size_t>(t) * static_cast<size_t>(layer_F) + static_cast<size_t>(i)] =
+                            norm_buf[static_cast<size_t>(t) * static_cast<size_t>(D) + static_cast<size_t>(i % D)] * 0.1f;
+            }
+
+            if (lt.ffn_down) {
+                Avx2Math::gemm(ffn_down_buf.data(), D, *lt.ffn_down, ffn_gate_buf.data(), layer_F, S, D, layer_F);
+            } else {
+                for (int t = 0; t < S; ++t)
+                    for (int i = 0; i < D; ++i)
+                        ffn_down_buf[static_cast<size_t>(t) * static_cast<size_t>(D) + static_cast<size_t>(i)] =
+                            ffn_gate_buf[static_cast<size_t>(t) * static_cast<size_t>(layer_F) + static_cast<size_t>(i % layer_F)] * 0.05f;
+            }
+
+            // 2i-1b. Batched Expert-Grouped Sparse Mixture-of-Experts Branch (Ava / Gemma 4 26B-A4B MoE)
+            if (lt.ffn_gate_inp && lt.ffn_down_exps && (lt.ffn_gate_up_exps || (lt.ffn_gate_exps && lt.ffn_up_exps)) && cfg.expert_count > 0) {
+                if (lt.post_ffw_norm_1) {
+                    const float* p1_w = safe_f32_weights(lt.post_ffw_norm_1, cfg.embedding_dim);
+                    #pragma omp parallel for if(S >= 8) schedule(static)
+                    for (int t = 0; t < S; ++t) {
+                        float* fd = ffn_down_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(D);
+                        Avx2Math::rms_norm(fd, fd, p1_w, D, cfg.rms_norm_eps);
+                    }
+                }
+
+                const int E = static_cast<int>(cfg.expert_count);
+                const int K_used = std::clamp(static_cast<int>(cfg.expert_used_count > 0 ? cfg.expert_used_count : 8u), 1, E);
+                const int F_exp = static_cast<int>(cfg.expert_ffn_dim > 0 ? cfg.expert_ffn_dim : cfg.hidden_dim);
+                const int two_F = 2 * F_exp;
+
+                // Router input norm + scale for all S tokens
+                const float inv_sqrt_d = 1.0f / std::sqrt(static_cast<float>(D));
+                const float* rscale = lt.ffn_gate_inp_scale ? safe_f32_weights(lt.ffn_gate_inp_scale, cfg.embedding_dim) : nullptr;
+                #pragma omp parallel for if(S >= 8) schedule(static)
+                for (int t = 0; t < S; ++t) {
+                    float* mn = moe_norm_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(D);
+                    Avx2Math::rms_norm(mn, X.data() + static_cast<size_t>(t) * static_cast<size_t>(D),
+                                       default_norm_weights_.data(), D, cfg.rms_norm_eps);
+                    for (int i = 0; i < D; ++i) mn[i] *= inv_sqrt_d * (rscale ? rscale[i] : 1.0f);
+                }
+
+                // Batched Router GEMM [S, E]
+                Avx2Math::gemm(moe_router_buf.data(), E, *lt.ffn_gate_inp, moe_norm_buf.data(), D, S, E, D);
+
+                // Group routed (token, weight) pairs into per-expert buckets so each expert is read ONCE!
+                struct ExpertHit { int tok; float weight; };
+                std::vector<std::vector<ExpertHit>> buckets(static_cast<size_t>(E));
+                const float* down_s = lt.ffn_down_exps_scale ? safe_f32_weights(lt.ffn_down_exps_scale, static_cast<size_t>(E)) : nullptr;
+                std::vector<int> idx_tmp(static_cast<size_t>(E));
+
+                for (int t = 0; t < S; ++t) {
+                    float* rlogits = moe_router_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(E);
+                    Avx2Math::softmax(rlogits, E);
+                    for (int e = 0; e < E; ++e) idx_tmp[static_cast<size_t>(e)] = e;
+                    std::partial_sort(idx_tmp.begin(), idx_tmp.begin() + K_used, idx_tmp.end(),
+                        [&](int a, int b) { return rlogits[a] > rlogits[b]; });
+                    float w_sum = 0.0f;
+                    for (int k = 0; k < K_used; ++k) w_sum += rlogits[idx_tmp[static_cast<size_t>(k)]];
+                    if (w_sum < 6.103515625e-5f) w_sum = 6.103515625e-5f;
+                    for (int k = 0; k < K_used; ++k) {
+                        const int e = idx_tmp[static_cast<size_t>(k)];
+                        const float we = (rlogits[e] / w_sum) * (down_s ? down_s[e] : 1.0f);
+                        buckets[static_cast<size_t>(e)].push_back({t, we});
+                    }
+                }
+
+                // Pre-FFN norm 2 on X for all S tokens
+                const float* pre2_w = safe_f32_weights(lt.pre_ffw_norm_2, cfg.embedding_dim);
+                #pragma omp parallel for if(S >= 8) schedule(static)
+                for (int t = 0; t < S; ++t) {
+                    Avx2Math::rms_norm(moe_norm_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(D),
+                                       X.data() + static_cast<size_t>(t) * static_cast<size_t>(D),
+                                       pre2_w, D, cfg.rms_norm_eps);
+                }
+
+                std::vector<int> active_exps;
+                active_exps.reserve(static_cast<size_t>(E));
+                for (int e = 0; e < E; ++e) {
+                    if (buckets[static_cast<size_t>(e)].empty()) continue;
+                    bool ok_gu = lt.ffn_gate_up_exps
+                        ? tensor_fits_expert(lt.ffn_gate_up_exps, e, static_cast<size_t>(two_F), D)
+                        : (tensor_fits_expert(lt.ffn_gate_exps, e, static_cast<size_t>(F_exp), D) &&
+                           tensor_fits_expert(lt.ffn_up_exps,   e, static_cast<size_t>(F_exp), D));
+                    if (ok_gu && tensor_fits_expert(lt.ffn_down_exps, e, static_cast<size_t>(D), F_exp)) {
+                        active_exps.push_back(e);
+                    }
+                }
+
+                std::memset(moe_accum_buf.data(), 0, static_cast<size_t>(S) * static_cast<size_t>(D) * sizeof(float));
+                const int n_active = static_cast<int>(active_exps.size());
+
+                // Dynamic-scheduled parallel execution over active experts: each expert's weights stream ONCE!
+                const bool gu_is_q8k  = lt.ffn_gate_up_exps
+                    ? Avx2Math::supports_q8k_gemm(lt.ffn_gate_up_exps->type, D)
+                    : (Avx2Math::supports_q8k_gemm(lt.ffn_gate_exps->type, D) && Avx2Math::supports_q8k_gemm(lt.ffn_up_exps->type, D));
+                const bool gu_is_q832 = lt.ffn_gate_up_exps
+                    ? Avx2Math::supports_q8_32_gemm(lt.ffn_gate_up_exps->type, D)
+                    : (Avx2Math::supports_q8_32_gemm(lt.ffn_gate_exps->type, D) && Avx2Math::supports_q8_32_gemm(lt.ffn_up_exps->type, D));
+                const bool dn_is_q8k  = Avx2Math::supports_q8k_gemm(lt.ffn_down_exps->type, F_exp);
+                const bool dn_is_q832 = Avx2Math::supports_q8_32_gemm(lt.ffn_down_exps->type, F_exp);
+
+                #pragma omp parallel
+                {
+                    std::vector<float> local_acc(static_cast<size_t>(S) * static_cast<size_t>(D), 0.0f);
+                    std::vector<float> exp_in;
+                    std::vector<float> exp_gu;
+                    std::vector<float> exp_act;
+                    std::vector<float> exp_dn;
+                    Q8KBatch   exp_q8k;
+                    Q8_32Batch exp_q832;
+
+                    #pragma omp for schedule(dynamic, 1)
+                    for (int ai = 0; ai < n_active; ++ai) {
+                        const int e = active_exps[static_cast<size_t>(ai)];
+                        const auto& hits = buckets[static_cast<size_t>(e)];
+                        const int cnt = static_cast<int>(hits.size());
+
+                        exp_in.resize(static_cast<size_t>(cnt) * static_cast<size_t>(D));
+                        exp_gu.resize(static_cast<size_t>(cnt) * static_cast<size_t>(two_F));
+                        exp_act.resize(static_cast<size_t>(cnt) * static_cast<size_t>(F_exp));
+                        exp_dn.resize(static_cast<size_t>(cnt) * static_cast<size_t>(D));
+
+                        for (int j = 0; j < cnt; ++j) {
+                            std::memcpy(exp_in.data() + static_cast<size_t>(j) * static_cast<size_t>(D),
+                                        moe_norm_buf.data() + static_cast<size_t>(hits[static_cast<size_t>(j)].tok) * static_cast<size_t>(D),
+                                        static_cast<size_t>(D) * sizeof(float));
+                        }
+
+                        if (cnt > 1 && gu_is_q8k) {
+                            Avx2Math::pack_q8k_batch(exp_in.data(), D, D, cnt, exp_q8k);
+                            if (lt.ffn_gate_up_exps) {
+                                Avx2Math::gemm_slice_q8k(exp_gu.data(), two_F, *lt.ffn_gate_up_exps,
+                                                         static_cast<size_t>(e) * static_cast<size_t>(two_F),
+                                                         exp_q8k, two_F, D, false);
+                            } else {
+                                Avx2Math::gemm_slice_q8k(exp_gu.data(), two_F, *lt.ffn_gate_exps,
+                                                         static_cast<size_t>(e) * static_cast<size_t>(F_exp),
+                                                         exp_q8k, F_exp, D, false);
+                                Avx2Math::gemm_slice_q8k(exp_gu.data() + F_exp, two_F, *lt.ffn_up_exps,
+                                                         static_cast<size_t>(e) * static_cast<size_t>(F_exp),
+                                                         exp_q8k, F_exp, D, false);
+                            }
+                        } else if (cnt > 1 && gu_is_q832) {
+                            Avx2Math::pack_q8_32_batch(exp_in.data(), D, D, cnt, exp_q832);
+                            if (lt.ffn_gate_up_exps) {
+                                Avx2Math::gemm_slice_q8_32(exp_gu.data(), two_F, *lt.ffn_gate_up_exps,
+                                                           static_cast<size_t>(e) * static_cast<size_t>(two_F),
+                                                           exp_q832, two_F, D, false);
+                            } else {
+                                Avx2Math::gemm_slice_q8_32(exp_gu.data(), two_F, *lt.ffn_gate_exps,
+                                                           static_cast<size_t>(e) * static_cast<size_t>(F_exp),
+                                                           exp_q832, F_exp, D, false);
+                                Avx2Math::gemm_slice_q8_32(exp_gu.data() + F_exp, two_F, *lt.ffn_up_exps,
+                                                           static_cast<size_t>(e) * static_cast<size_t>(F_exp),
+                                                           exp_q832, F_exp, D, false);
+                            }
+                        } else if (lt.ffn_gate_up_exps) {
+                            Avx2Math::gemm_slice(exp_gu.data(), two_F, *lt.ffn_gate_up_exps,
+                                                 static_cast<size_t>(e) * static_cast<size_t>(two_F),
+                                                 exp_in.data(), D, cnt, two_F, D, false);
+                        } else {
+                            Avx2Math::gemm_slice(exp_gu.data(), two_F, *lt.ffn_gate_exps,
+                                                 static_cast<size_t>(e) * static_cast<size_t>(F_exp),
+                                                 exp_in.data(), D, cnt, F_exp, D, false);
+                            Avx2Math::gemm_slice(exp_gu.data() + F_exp, two_F, *lt.ffn_up_exps,
+                                                 static_cast<size_t>(e) * static_cast<size_t>(F_exp),
+                                                 exp_in.data(), D, cnt, F_exp, D, false);
+                        }
+
+                        if (use_gelu) {
+                            for (int j = 0; j < cnt; ++j) {
+                                const float* gu = exp_gu.data() + static_cast<size_t>(j) * static_cast<size_t>(two_F);
+                                float* ac = exp_act.data() + static_cast<size_t>(j) * static_cast<size_t>(F_exp);
+                                geglu_avx2_range(ac, gu, gu + F_exp, F_exp);
+                            }
+                        } else {
+                            for (int j = 0; j < cnt; ++j) {
+                                const float* gu = exp_gu.data() + static_cast<size_t>(j) * static_cast<size_t>(two_F);
+                                float* ac = exp_act.data() + static_cast<size_t>(j) * static_cast<size_t>(F_exp);
+                                for (int f = 0; f < F_exp; ++f) {
+                                    const float g = gu[f];
+                                    ac[f] = (g / (1.0f + std::exp(-g))) * gu[F_exp + f];
+                                }
+                            }
+                        }
+
+                        if (cnt > 1 && dn_is_q8k) {
+                            Avx2Math::pack_q8k_batch(exp_act.data(), F_exp, F_exp, cnt, exp_q8k);
+                            Avx2Math::gemm_slice_q8k(exp_dn.data(), D, *lt.ffn_down_exps,
+                                                     static_cast<size_t>(e) * static_cast<size_t>(D),
+                                                     exp_q8k, D, F_exp, false);
+                        } else if (cnt > 1 && dn_is_q832) {
+                            Avx2Math::pack_q8_32_batch(exp_act.data(), F_exp, F_exp, cnt, exp_q832);
+                            Avx2Math::gemm_slice_q8_32(exp_dn.data(), D, *lt.ffn_down_exps,
+                                                       static_cast<size_t>(e) * static_cast<size_t>(D),
+                                                       exp_q832, D, F_exp, false);
+                        } else {
+                            Avx2Math::gemm_slice(exp_dn.data(), D, *lt.ffn_down_exps,
+                                                 static_cast<size_t>(e) * static_cast<size_t>(D),
+                                                 exp_act.data(), F_exp, cnt, D, F_exp, false);
+                        }
+
+                        for (int j = 0; j < cnt; ++j) {
+                            const float wk = hits[static_cast<size_t>(j)].weight;
+                            const float* dn = exp_dn.data() + static_cast<size_t>(j) * static_cast<size_t>(D);
+                            float* dst = local_acc.data() + static_cast<size_t>(hits[static_cast<size_t>(j)].tok) * static_cast<size_t>(D);
+                            const __m256 vwk = _mm256_set1_ps(wk);
+                            int i = 0;
+                            for (; i <= D - 8; i += 8) {
+                                _mm256_storeu_ps(dst + i, _mm256_fmadd_ps(_mm256_loadu_ps(dn + i), vwk, _mm256_loadu_ps(dst + i)));
+                            }
+                            for (; i < D; ++i) dst[i] += wk * dn[i];
+                        }
+                    }
+
+                    #pragma omp critical
+                    {
+                        const size_t n_tot = static_cast<size_t>(S) * static_cast<size_t>(D);
+                        size_t i = 0;
+                        for (; i + 8 <= n_tot; i += 8) {
+                            _mm256_storeu_ps(moe_accum_buf.data() + i,
+                                _mm256_add_ps(_mm256_loadu_ps(moe_accum_buf.data() + i), _mm256_loadu_ps(local_acc.data() + i)));
+                        }
+                        for (; i < n_tot; ++i) moe_accum_buf[i] += local_acc[i];
+                    }
+                }
+
+                const float* p2_w = lt.post_ffw_norm_2 ? safe_f32_weights(lt.post_ffw_norm_2, cfg.embedding_dim) : nullptr;
+                #pragma omp parallel for if(S >= 8) schedule(static)
+                for (int t = 0; t < S; ++t) {
+                    float* ma = moe_accum_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(D);
+                    float* fd = ffn_down_buf.data()  + static_cast<size_t>(t) * static_cast<size_t>(D);
+                    if (p2_w) Avx2Math::rms_norm(ma, ma, p2_w, D, cfg.rms_norm_eps);
+                    for (int i = 0; i < D; ++i) fd[i] += ma[i];
+                }
+            }
+
+            // 2i-2. Post-FFN Norm + Residual Addition 2
+            const float* post_ffn_w = lt.post_ffw_norm ? safe_f32_weights(lt.post_ffw_norm, cfg.embedding_dim) : nullptr;
+            #pragma omp parallel for if(S >= 8) schedule(static)
+            for (int t = 0; t < S; ++t) {
+                float* fd = ffn_down_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(D);
+                float* xt = X.data()            + static_cast<size_t>(t) * static_cast<size_t>(D);
+                if (post_ffn_w) Avx2Math::rms_norm(fd, fd, post_ffn_w, D, cfg.rms_norm_eps);
+                for (int i = 0; i < D; ++i) xt[i] += fd[i];
+            }
+
+            // 2-pleias. Batched Per-Layer Token Injection (Gemma 4 E4B/E2B)
+            if (lt.inp_gate && lt.proj && has_pleias_branch && (static_cast<size_t>(l) + 1ULL) * 256ULL <= static_cast<size_t>(pleias_total)) {
+                Avx2Math::gemm(pl_gate_buf.data(), 256, *lt.inp_gate, X.data(), D, S, 256, D);
+                #pragma omp parallel for if(S >= 8) schedule(static)
+                for (int t = 0; t < S; ++t) {
+                    float* pg = pl_gate_buf.data() + static_cast<size_t>(t) * 256ULL;
+                    const float* pe = pl_emb_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(pleias_total) + static_cast<size_t>(l) * 256ULL;
+                    for (int i = 0; i < 256; ++i) {
+                        const float g = pg[i];
+                        const float cdf = 0.5f * (1.0f + std::tanh(0.7978845608f * (g + 0.044715f * g * g * g)));
+                        pg[i] = (g * cdf) * pe[i];
+                    }
+                }
+                Avx2Math::gemm(pl_out_buf.data(), D, *lt.proj, pl_gate_buf.data(), 256, S, D, 256);
+                const float* post_w = lt.post_norm ? safe_f32_weights(lt.post_norm, cfg.embedding_dim) : nullptr;
+                #pragma omp parallel for if(S >= 8) schedule(static)
+                for (int t = 0; t < S; ++t) {
+                    float* po = pl_out_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(D);
+                    float* xt = X.data()          + static_cast<size_t>(t) * static_cast<size_t>(D);
+                    if (post_w) Avx2Math::rms_norm(po, po, post_w, D, cfg.rms_norm_eps);
+                    for (int i = 0; i < D; ++i) xt[i] += po[i];
+                }
+            } else if (lt.post_norm) {
+                const float* post_norm_w = safe_f32_weights(lt.post_norm, cfg.embedding_dim);
+                #pragma omp parallel for if(S >= 8) schedule(static)
+                for (int t = 0; t < S; ++t) {
+                    float* xt = X.data() + static_cast<size_t>(t) * static_cast<size_t>(D);
+                    Avx2Math::rms_norm(xt, xt, post_norm_w, D, cfg.rms_norm_eps);
+                }
+            }
+
+            // 2-scale. Layer Output Scale
+            if (lt.layer_output_scale && lt.layer_output_scale->data && lt.layer_output_scale->type == QuantType::F32 &&
+                (lt.layer_output_scale->size_bytes == 0 || lt.layer_output_scale->size_bytes >= sizeof(float))) {
+                const float scale = *reinterpret_cast<const float*>(lt.layer_output_scale->data);
+                const size_t n_tot = static_cast<size_t>(S) * static_cast<size_t>(D);
+                for (size_t i = 0; i < n_tot; ++i) X[i] *= scale;
+            }
+        }
+
+        for (int t = 0; t < S; ++t) {
+            kv_cache_.advance_position();
+            telemetry_engine_.finalize_step();
+        }
+
+        if (is_last_chunk) {
+            // Preserve last hidden state in embedding_scratch_ for speculative / C ABI callers
+            std::memcpy(embedding_scratch_.data(),
+                        X.data() + static_cast<size_t>(S - 1) * static_cast<size_t>(D),
+                        static_cast<size_t>(D) * sizeof(float));
+
+            if (out_last_logits) {
+                const float* out_norm_w = safe_f32_weights(output_norm_tensor_, cfg.embedding_dim);
+                Avx2Math::rms_norm(norm_scratch_.data(), embedding_scratch_.data(), out_norm_w, D, cfg.rms_norm_eps);
+
+                if (output_tensor_) {
+                    Avx2Math::gemv(out_last_logits, *output_tensor_, norm_scratch_.data(), cfg.vocab_size, cfg.embedding_dim);
+                } else {
+                    for (size_t v = 0; v < cfg.vocab_size; ++v) {
+                        out_last_logits[v] = std::sin(static_cast<float>(v) * 0.05f) * norm_scratch_[v % cfg.embedding_dim];
+                    }
+                }
+                if (cfg.final_logit_softcapping > 0.0f) {
+                    Avx2Math::softcap_logits(out_last_logits, cfg.vocab_size, cfg.final_logit_softcapping);
+                }
+            }
+        }
+    }
+}
+
 void HavenEngine::generate(
     const std::vector<uint32_t>& prompt_tokens,
     int max_new_tokens,
@@ -1067,12 +1869,9 @@ void HavenEngine::generate(
     // Reset KV cache for fresh generation sequence
     kv_cache_.reset();
 
-    int pos = 0;
-    // Fast Process Prompt Prefill: only compute full 262k logits on the final token!
-    for (size_t i = 0; i < prompt_tokens.size(); ++i) {
-        bool is_last_prompt = (i + 1 == prompt_tokens.size());
-        forward(prompt_tokens[i], pos++, is_last_prompt ? logits_scratch_.data() : nullptr);
-    }
+    // Batched GEMM Prompt Prefill: computes all prompt tokens in L2-tiled chunks and only runs 262k LM head on the final token!
+    forward_batch(prompt_tokens.data(), static_cast<int>(prompt_tokens.size()), 0, logits_scratch_.data());
+    int pos = static_cast<int>(prompt_tokens.size());
 
     // Auto-Regressive Token Generation Loop with Dynamic Soft-Pruning & Speculative Decoding
     int gen = 0;

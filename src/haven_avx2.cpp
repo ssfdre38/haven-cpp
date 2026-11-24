@@ -1645,6 +1645,960 @@ void Avx2Math::gemv_slice(float* y, const TensorDesc& weight, size_t row_offset,
     }
 }
 
+// ============================================================================
+// High-Throughput Batched Multi-Token Register-Tiled AVX2 GEMM Kernels (1x8 & 1x4)
+// Unpacks each quantized weight block ONCE per 8 (or 4) tokens and tiles rows
+// in 64-row L2-resident blocks so weights stream from DDR4 RAM literally ONCE
+// across an entire S-token prompt prefill chunk (~217-247 GMAC/s on 6-core Xeon).
+// ============================================================================
+
+void Avx2Math::pack_q8k_batch(const float* X, int stride_x, int cols, int n_tokens, Q8KBatch& out) {
+    out.nb256 = (cols >= 256) ? (cols / 256) : 0;
+    out.n_tokens = (n_tokens > 0 && out.nb256 > 0) ? n_tokens : 0;
+    out.tiles.clear();
+    if (!X || out.n_tokens == 0) return;
+
+    const int n_tiles = (n_tokens + 7) / 8;
+    out.tiles.resize(static_cast<size_t>(n_tiles));
+
+    const __m256 sign_mask = _mm256_set1_ps(-0.0f);
+    const __m256 v127  = _mm256_set1_ps(127.0f);
+    const __m256 vn127 = _mm256_set1_ps(-127.0f);
+
+    for (int g = 0; g < n_tiles; ++g) {
+        auto& tile = out.tiles[static_cast<size_t>(g)];
+        const int t_base = g * 8;
+        const int n_tok = std::min(8, n_tokens - t_base);
+        tile.n_tok = n_tok;
+        tile.qs.assign(static_cast<size_t>(out.nb256) * 8ULL * 8ULL * 32ULL, 0);
+        tile.d.assign(static_cast<size_t>(out.nb256) * 8ULL, 0.0f);
+        tile.sumf.assign(static_cast<size_t>(out.nb256) * 8ULL * 8ULL, 0.0f);
+        tile.bsum16.assign(static_cast<size_t>(out.nb256) * 8ULL * 16ULL, 0);
+
+        for (int t = 0; t < n_tok; ++t) {
+            const float* xt = X + static_cast<size_t>(t_base + t) * static_cast<size_t>(stride_x);
+            for (int sb = 0; sb < out.nb256; ++sb) {
+                const float* xb = xt + static_cast<size_t>(sb) * 256ULL;
+                __m256 mmax = _mm256_setzero_ps();
+                for (int j = 0; j < 256; j += 8) {
+                    mmax = _mm256_max_ps(mmax, _mm256_andnot_ps(sign_mask, _mm256_loadu_ps(xb + j)));
+                }
+                __m128 m128 = _mm_max_ps(_mm256_castps256_ps128(mmax), _mm256_extractf128_ps(mmax, 1));
+                m128 = _mm_max_ps(m128, _mm_movehdup_ps(m128));
+                m128 = _mm_max_ps(m128, _mm_movehl_ps(m128, m128));
+                const float max_abs = _mm_cvtss_f32(m128);
+                if (max_abs < 1e-30f) {
+                    tile.d[static_cast<size_t>(sb) * 8ULL + static_cast<size_t>(t)] = 0.0f;
+                    continue;
+                }
+                tile.d[static_cast<size_t>(sb) * 8ULL + static_cast<size_t>(t)] = max_abs / 127.0f;
+                const __m256 vid = _mm256_set1_ps(127.0f / max_abs);
+                int16_t* bs_tok = tile.bsum16.data() + (static_cast<size_t>(sb) * 8ULL + static_cast<size_t>(t)) * 16ULL;
+
+                for (int ib = 0; ib < 8; ++ib) {
+                    const float* xg = xb + static_cast<size_t>(ib) * 32ULL;
+                    const __m256 x0 = _mm256_loadu_ps(xg + 0);
+                    const __m256 x1 = _mm256_loadu_ps(xg + 8);
+                    const __m256 x2 = _mm256_loadu_ps(xg + 16);
+                    const __m256 x3 = _mm256_loadu_ps(xg + 24);
+                    tile.sumf[(static_cast<size_t>(sb) * 8ULL + static_cast<size_t>(ib)) * 8ULL + static_cast<size_t>(t)] =
+                        hsum256_ps(_mm256_add_ps(_mm256_add_ps(x0, x1), _mm256_add_ps(x2, x3)));
+
+                    const __m256i i0 = _mm256_cvtps_epi32(_mm256_min_ps(_mm256_max_ps(_mm256_mul_ps(x0, vid), vn127), v127));
+                    const __m256i i1 = _mm256_cvtps_epi32(_mm256_min_ps(_mm256_max_ps(_mm256_mul_ps(x1, vid), vn127), v127));
+                    const __m256i i2 = _mm256_cvtps_epi32(_mm256_min_ps(_mm256_max_ps(_mm256_mul_ps(x2, vid), vn127), v127));
+                    const __m256i i3 = _mm256_cvtps_epi32(_mm256_min_ps(_mm256_max_ps(_mm256_mul_ps(x3, vid), vn127), v127));
+                    const __m256i s01 = _mm256_permute4x64_epi64(_mm256_packs_epi32(i0, i1), 0xD8);
+                    const __m256i s23 = _mm256_permute4x64_epi64(_mm256_packs_epi32(i2, i3), 0xD8);
+                    const __m256i q8  = _mm256_permute4x64_epi64(_mm256_packs_epi16(s01, s23), 0xD8);
+                    _mm256_storeu_si256(
+                        reinterpret_cast<__m256i*>(tile.qs.data() + ((static_cast<size_t>(sb) * 8ULL + static_cast<size_t>(ib)) * 8ULL + static_cast<size_t>(t)) * 32ULL),
+                        q8);
+
+                    bs_tok[2 * ib + 0] = static_cast<int16_t>(hsum256_epi32(_mm256_add_epi32(i0, i1)));
+                    bs_tok[2 * ib + 1] = static_cast<int16_t>(hsum256_epi32(_mm256_add_epi32(i2, i3)));
+                }
+            }
+        }
+    }
+}
+
+void Avx2Math::pack_q8_32_batch(const float* X, int stride_x, int cols, int n_tokens, Q8_32Batch& out) {
+    out.nb32 = (cols >= 32) ? (cols / 32) : 0;
+    out.n_tokens = (n_tokens > 0 && out.nb32 > 0) ? n_tokens : 0;
+    out.tiles.clear();
+    if (!X || out.n_tokens == 0) return;
+
+    const int n_tiles = (n_tokens + 7) / 8;
+    out.tiles.resize(static_cast<size_t>(n_tiles));
+
+    Q8Act32 tmp;
+    for (int g = 0; g < n_tiles; ++g) {
+        auto& tile = out.tiles[static_cast<size_t>(g)];
+        const int t_base = g * 8;
+        const int n_tok = std::min(8, n_tokens - t_base);
+        tile.n_tok = n_tok;
+        tile.qs.assign(static_cast<size_t>(out.nb32) * 8ULL * 32ULL, 0);
+        tile.d.assign(static_cast<size_t>(out.nb32) * 8ULL, 0.0f);
+        tile.sumf.assign(static_cast<size_t>(out.nb32) * 8ULL, 0.0f);
+        tile.bsum32.assign(static_cast<size_t>(out.nb32) * 8ULL, 0);
+
+        for (int t = 0; t < n_tok; ++t) {
+            quantize_q8_act(X + static_cast<size_t>(t_base + t) * static_cast<size_t>(stride_x), cols, tmp);
+            for (int b = 0; b < out.nb32; ++b) {
+                std::memcpy(tile.qs.data() + (static_cast<size_t>(b) * 8ULL + static_cast<size_t>(t)) * 32ULL,
+                            tmp.qs + static_cast<size_t>(b) * 32ULL, 32);
+                tile.d[static_cast<size_t>(b) * 8ULL + static_cast<size_t>(t)]      = tmp.d[b];
+                tile.sumf[static_cast<size_t>(b) * 8ULL + static_cast<size_t>(t)]   = tmp.sumf[b];
+                tile.bsum32[static_cast<size_t>(b) * 8ULL + static_cast<size_t>(t)] =
+                    static_cast<int16_t>(static_cast<int32_t>(tmp.bsum[2 * b]) + static_cast<int32_t>(tmp.bsum[2 * b + 1]));
+            }
+        }
+    }
+}
+
+bool Avx2Math::supports_q8k_gemm(QuantType type, int cols) {
+    if (cols < 256 || (cols % 256) != 0) return false;
+    return type == QuantType::IQ4_XS || type == QuantType::Q4_K ||
+           type == QuantType::Q5_K   || type == QuantType::Q6_K;
+}
+
+bool Avx2Math::supports_q8_32_gemm(QuantType type, int cols) {
+    if (cols < 32 || (cols % 32) != 0) return false;
+    return type == QuantType::IQ4_NL || type == QuantType::Q5_1 ||
+           type == QuantType::Q5_0   || type == QuantType::Q8_0 ||
+           type == QuantType::Q4_0;
+}
+
+template <int NTok>
+static inline void dot_iq4_xs_q8k_xN(const void* data, size_t row, const Q8KBatch::Tile& tile, int nb256, float* out) {
+    const auto* vx = reinterpret_cast<const block_iq4_xs*>(data) + row * static_cast<size_t>(nb256);
+    const __m256i lut256  = _mm256_broadcastsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_iq4nl)));
+    const __m128i mask_lo = _mm_set1_epi8(0x0F);
+
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+    __m256 acc4 = _mm256_setzero_ps(), acc5 = _mm256_setzero_ps();
+    __m256 acc6 = _mm256_setzero_ps(), acc7 = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb256; ++i) {
+        const float d_w = Avx2Math::fp16_to_fp32(vx[i].d);
+        const uint16_t scales_h = vx[i].scales_h;
+        const uint8_t* scales_l = vx[i].scales_l;
+        const uint8_t* qs = vx[i].qs;
+
+        __m256i s0 = _mm256_setzero_si256(), s1 = _mm256_setzero_si256();
+        __m256i s2 = _mm256_setzero_si256(), s3 = _mm256_setzero_si256();
+        __m256i s4 = _mm256_setzero_si256(), s5 = _mm256_setzero_si256();
+        __m256i s6 = _mm256_setzero_si256(), s7 = _mm256_setzero_si256();
+
+        for (int ib = 0; ib < 8; ++ib) {
+            const __m128i qb  = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qs));
+            const __m256i idx = mm256_concat_si128(_mm_and_si128(qb, mask_lo), _mm_and_si128(_mm_srli_epi16(qb, 4), mask_lo));
+            const __m256i w   = _mm256_shuffle_epi8(lut256, idx);
+            const __m256i aw  = _mm256_abs_epi8(w);
+
+            const int ls = (((scales_l[ib / 2] >> (4 * (ib % 2))) & 0x0F) | (((scales_h >> (2 * ib)) & 3) << 4)) - 32;
+            const __m256i vls = _mm256_set1_epi16(static_cast<int16_t>(ls));
+
+            const int8_t* yp = tile.qs.data() + static_cast<size_t>(i * 8 + ib) * 256ULL;
+            #define IQXS_MAC(T, SUMI) do { \
+                const __m256i y = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(yp + (T) * 32)); \
+                SUMI = _mm256_add_epi32(SUMI, _mm256_madd_epi16(_mm256_maddubs_epi16(aw, _mm256_sign_epi8(y, w)), vls)); \
+            } while (0)
+            IQXS_MAC(0, s0); IQXS_MAC(1, s1); IQXS_MAC(2, s2); IQXS_MAC(3, s3);
+            if constexpr (NTok > 4) {
+                IQXS_MAC(4, s4); IQXS_MAC(5, s5); IQXS_MAC(6, s6); IQXS_MAC(7, s7);
+            }
+            #undef IQXS_MAC
+            qs += 16;
+        }
+        const float* dp = tile.d.data() + static_cast<size_t>(i) * 8ULL;
+        acc0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s0), _mm256_set1_ps(d_w * dp[0]), acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s1), _mm256_set1_ps(d_w * dp[1]), acc1);
+        acc2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s2), _mm256_set1_ps(d_w * dp[2]), acc2);
+        acc3 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s3), _mm256_set1_ps(d_w * dp[3]), acc3);
+        if constexpr (NTok > 4) {
+            acc4 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s4), _mm256_set1_ps(d_w * dp[4]), acc4);
+            acc5 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s5), _mm256_set1_ps(d_w * dp[5]), acc5);
+            acc6 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s6), _mm256_set1_ps(d_w * dp[6]), acc6);
+            acc7 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s7), _mm256_set1_ps(d_w * dp[7]), acc7);
+        }
+    }
+    out[0] = hsum256_ps(acc0); out[1] = hsum256_ps(acc1);
+    out[2] = hsum256_ps(acc2); out[3] = hsum256_ps(acc3);
+    if constexpr (NTok > 4) {
+        out[4] = hsum256_ps(acc4); out[5] = hsum256_ps(acc5);
+        out[6] = hsum256_ps(acc6); out[7] = hsum256_ps(acc7);
+    }
+}
+
+template <int NTok>
+static inline void dot_q4_K_q8k_xN(const void* data, size_t row, const Q8KBatch::Tile& tile, int nb256, float* out) {
+    const auto* vx = reinterpret_cast<const block_q4_K*>(data) + row * static_cast<size_t>(nb256);
+    const __m256i mask_lo4 = _mm256_set1_epi8(0x0F);
+
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+    __m256 acc4 = _mm256_setzero_ps(), acc5 = _mm256_setzero_ps();
+    __m256 acc6 = _mm256_setzero_ps(), acc7 = _mm256_setzero_ps();
+    __m256 min_v = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb256; ++i) {
+        const float d   = Avx2Math::fp16_to_fp32(vx[i].d);
+        const float min = Avx2Math::fp16_to_fp32(vx[i].dmin);
+        const uint8_t* q = vx[i].qs;
+        __m256i s0 = _mm256_setzero_si256(), s1 = _mm256_setzero_si256();
+        __m256i s2 = _mm256_setzero_si256(), s3 = _mm256_setzero_si256();
+        __m256i s4 = _mm256_setzero_si256(), s5 = _mm256_setzero_si256();
+        __m256i s6 = _mm256_setzero_si256(), s7 = _mm256_setzero_si256();
+        uint8_t sc1, mn1, sc2, mn2;
+
+        for (int j = 0; j < 4; ++j) {
+            const int yb = i * 8 + 2 * j;
+            get_scale_min_k4(2 * j,     vx[i].scales, &sc1, &mn1);
+            get_scale_min_k4(2 * j + 1, vx[i].scales, &sc2, &mn2);
+            const __m256i qb  = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q));
+            const __m256i qlo = _mm256_and_si256(qb, mask_lo4);
+            const __m256i qhi = _mm256_and_si256(_mm256_srli_epi16(qb, 4), mask_lo4);
+
+            // Process one 32-byte weight half at a time to eliminate YMM spills across s0..s7
+            const __m256i vsc1 = _mm256_set1_epi16(static_cast<int16_t>(sc1));
+            const int8_t* y1p = tile.qs.data() + static_cast<size_t>(yb) * 256ULL;
+            #define Q4K_MAC1(T, SUMI) do { \
+                SUMI = _mm256_add_epi32(SUMI, _mm256_madd_epi16(_mm256_maddubs_epi16(qlo, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(y1p + (T) * 32))), vsc1)); \
+            } while (0)
+            Q4K_MAC1(0, s0); Q4K_MAC1(1, s1); Q4K_MAC1(2, s2); Q4K_MAC1(3, s3);
+            if constexpr (NTok > 4) {
+                Q4K_MAC1(4, s4); Q4K_MAC1(5, s5); Q4K_MAC1(6, s6); Q4K_MAC1(7, s7);
+            }
+            #undef Q4K_MAC1
+
+            const __m256i vsc2 = _mm256_set1_epi16(static_cast<int16_t>(sc2));
+            const int8_t* y2p = tile.qs.data() + static_cast<size_t>(yb + 1) * 256ULL;
+            #define Q4K_MAC2(T, SUMI) do { \
+                SUMI = _mm256_add_epi32(SUMI, _mm256_madd_epi16(_mm256_maddubs_epi16(qhi, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(y2p + (T) * 32))), vsc2)); \
+            } while (0)
+            Q4K_MAC2(0, s0); Q4K_MAC2(1, s1); Q4K_MAC2(2, s2); Q4K_MAC2(3, s3);
+            if constexpr (NTok > 4) {
+                Q4K_MAC2(4, s4); Q4K_MAC2(5, s5); Q4K_MAC2(6, s6); Q4K_MAC2(7, s7);
+            }
+            #undef Q4K_MAC2
+
+            min_v = _mm256_fmadd_ps(_mm256_set1_ps(min * static_cast<float>(mn1)), _mm256_loadu_ps(tile.sumf.data() + static_cast<size_t>(yb) * 8ULL), min_v);
+            min_v = _mm256_fmadd_ps(_mm256_set1_ps(min * static_cast<float>(mn2)), _mm256_loadu_ps(tile.sumf.data() + static_cast<size_t>(yb + 1) * 8ULL), min_v);
+            q += 32;
+        }
+        const float* dp = tile.d.data() + static_cast<size_t>(i) * 8ULL;
+        acc0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s0), _mm256_set1_ps(d * dp[0]), acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s1), _mm256_set1_ps(d * dp[1]), acc1);
+        acc2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s2), _mm256_set1_ps(d * dp[2]), acc2);
+        acc3 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s3), _mm256_set1_ps(d * dp[3]), acc3);
+        if constexpr (NTok > 4) {
+            acc4 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s4), _mm256_set1_ps(d * dp[4]), acc4);
+            acc5 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s5), _mm256_set1_ps(d * dp[5]), acc5);
+            acc6 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s6), _mm256_set1_ps(d * dp[6]), acc6);
+            acc7 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s7), _mm256_set1_ps(d * dp[7]), acc7);
+        }
+    }
+    alignas(32) float mins[8];
+    _mm256_store_ps(mins, min_v);
+    out[0] = hsum256_ps(acc0) - mins[0]; out[1] = hsum256_ps(acc1) - mins[1];
+    out[2] = hsum256_ps(acc2) - mins[2]; out[3] = hsum256_ps(acc3) - mins[3];
+    if constexpr (NTok > 4) {
+        out[4] = hsum256_ps(acc4) - mins[4]; out[5] = hsum256_ps(acc5) - mins[5];
+        out[6] = hsum256_ps(acc6) - mins[6]; out[7] = hsum256_ps(acc7) - mins[7];
+    }
+}
+
+template <int NTok>
+static inline void dot_q5_K_q8k_xN(const void* data, size_t row, const Q8KBatch::Tile& tile, int nb256, float* out) {
+    const auto* vx = reinterpret_cast<const block_q5_K*>(data) + row * static_cast<size_t>(nb256);
+    const __m256i mask_lo4 = _mm256_set1_epi8(0x0F);
+    const __m256i val_16   = _mm256_set1_epi8(0x10);
+
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+    __m256 acc4 = _mm256_setzero_ps(), acc5 = _mm256_setzero_ps();
+    __m256 acc6 = _mm256_setzero_ps(), acc7 = _mm256_setzero_ps();
+    __m256 min_v = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb256; ++i) {
+        const float d   = Avx2Math::fp16_to_fp32(vx[i].d);
+        const float min = Avx2Math::fp16_to_fp32(vx[i].dmin);
+        const uint8_t* ql = vx[i].qs;
+        const __m256i qhb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(vx[i].qh));
+        __m256i s0 = _mm256_setzero_si256(), s1 = _mm256_setzero_si256();
+        __m256i s2 = _mm256_setzero_si256(), s3 = _mm256_setzero_si256();
+        __m256i s4 = _mm256_setzero_si256(), s5 = _mm256_setzero_si256();
+        __m256i s6 = _mm256_setzero_si256(), s7 = _mm256_setzero_si256();
+        uint8_t sc1, mn1, sc2, mn2;
+        uint8_t u1 = 1, u2 = 2;
+
+        for (int j = 0; j < 4; ++j) {
+            const int yb = i * 8 + 2 * j;
+            get_scale_min_k4(2 * j,     vx[i].scales, &sc1, &mn1);
+            get_scale_min_k4(2 * j + 1, vx[i].scales, &sc2, &mn2);
+            const __m256i qb  = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ql));
+            const __m256i vu1 = _mm256_set1_epi8(static_cast<char>(u1));
+            const __m256i h1  = _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_and_si256(qhb, vu1), vu1), val_16);
+            const __m256i q1  = _mm256_or_si256(_mm256_and_si256(qb, mask_lo4), h1);
+            const __m256i vsc1 = _mm256_set1_epi16(static_cast<int16_t>(sc1));
+            const int8_t* y1p = tile.qs.data() + static_cast<size_t>(yb) * 256ULL;
+
+            #define Q5K_MAC1(T, SUMI) do { \
+                SUMI = _mm256_add_epi32(SUMI, _mm256_madd_epi16(_mm256_maddubs_epi16(q1, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(y1p + (T) * 32))), vsc1)); \
+            } while (0)
+            Q5K_MAC1(0, s0); Q5K_MAC1(1, s1); Q5K_MAC1(2, s2); Q5K_MAC1(3, s3);
+            if constexpr (NTok > 4) {
+                Q5K_MAC1(4, s4); Q5K_MAC1(5, s5); Q5K_MAC1(6, s6); Q5K_MAC1(7, s7);
+            }
+            #undef Q5K_MAC1
+
+            const __m256i vu2 = _mm256_set1_epi8(static_cast<char>(u2));
+            const __m256i h2  = _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_and_si256(qhb, vu2), vu2), val_16);
+            const __m256i q2  = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(qb, 4), mask_lo4), h2);
+            const __m256i vsc2 = _mm256_set1_epi16(static_cast<int16_t>(sc2));
+            const int8_t* y2p = tile.qs.data() + static_cast<size_t>(yb + 1) * 256ULL;
+
+            #define Q5K_MAC2(T, SUMI) do { \
+                SUMI = _mm256_add_epi32(SUMI, _mm256_madd_epi16(_mm256_maddubs_epi16(q2, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(y2p + (T) * 32))), vsc2)); \
+            } while (0)
+            Q5K_MAC2(0, s0); Q5K_MAC2(1, s1); Q5K_MAC2(2, s2); Q5K_MAC2(3, s3);
+            if constexpr (NTok > 4) {
+                Q5K_MAC2(4, s4); Q5K_MAC2(5, s5); Q5K_MAC2(6, s6); Q5K_MAC2(7, s7);
+            }
+            #undef Q5K_MAC2
+
+            min_v = _mm256_fmadd_ps(_mm256_set1_ps(min * static_cast<float>(mn1)), _mm256_loadu_ps(tile.sumf.data() + static_cast<size_t>(yb) * 8ULL), min_v);
+            min_v = _mm256_fmadd_ps(_mm256_set1_ps(min * static_cast<float>(mn2)), _mm256_loadu_ps(tile.sumf.data() + static_cast<size_t>(yb + 1) * 8ULL), min_v);
+            ql += 32;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+        const float* dp = tile.d.data() + static_cast<size_t>(i) * 8ULL;
+        acc0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s0), _mm256_set1_ps(d * dp[0]), acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s1), _mm256_set1_ps(d * dp[1]), acc1);
+        acc2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s2), _mm256_set1_ps(d * dp[2]), acc2);
+        acc3 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s3), _mm256_set1_ps(d * dp[3]), acc3);
+        if constexpr (NTok > 4) {
+            acc4 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s4), _mm256_set1_ps(d * dp[4]), acc4);
+            acc5 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s5), _mm256_set1_ps(d * dp[5]), acc5);
+            acc6 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s6), _mm256_set1_ps(d * dp[6]), acc6);
+            acc7 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s7), _mm256_set1_ps(d * dp[7]), acc7);
+        }
+    }
+    alignas(32) float mins[8];
+    _mm256_store_ps(mins, min_v);
+    out[0] = hsum256_ps(acc0) - mins[0]; out[1] = hsum256_ps(acc1) - mins[1];
+    out[2] = hsum256_ps(acc2) - mins[2]; out[3] = hsum256_ps(acc3) - mins[3];
+    if constexpr (NTok > 4) {
+        out[4] = hsum256_ps(acc4) - mins[4]; out[5] = hsum256_ps(acc5) - mins[5];
+        out[6] = hsum256_ps(acc6) - mins[6]; out[7] = hsum256_ps(acc7) - mins[7];
+    }
+}
+
+template <int NTok>
+static inline void dot_q6_K_q8k_xN(const void* data, size_t row, const Q8KBatch::Tile& tile, int nb256, float* out) {
+    const auto* vx = reinterpret_cast<const block_q6_K*>(data) + row * static_cast<size_t>(nb256);
+    const __m256i mask_lo4 = _mm256_set1_epi8(0x0F);
+    const __m256i mask_hi2 = _mm256_set1_epi8(0x30);
+
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+    __m256 acc4 = _mm256_setzero_ps(), acc5 = _mm256_setzero_ps();
+    __m256 acc6 = _mm256_setzero_ps(), acc7 = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb256; ++i) {
+        const float d_w = Avx2Math::fp16_to_fp32(vx[i].d);
+        const uint8_t* ql = vx[i].ql;
+        const uint8_t* qh = vx[i].qh;
+        const int8_t* sc = vx[i].scales;
+
+        // Exact int32 bias: -32 * sum_{j=0..15}(sc[j] * bsum16[j]) with zero int16 overflow!
+        const __m256i sc16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(sc)));
+        const int16_t* bsp = tile.bsum16.data() + static_cast<size_t>(i) * 8ULL * 16ULL;
+        const __m256i zero = _mm256_setzero_si256();
+        __m256i s0 = _mm256_sub_epi32(zero, _mm256_slli_epi32(_mm256_madd_epi16(sc16, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(bsp + 0 * 16))), 5));
+        __m256i s1 = _mm256_sub_epi32(zero, _mm256_slli_epi32(_mm256_madd_epi16(sc16, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(bsp + 1 * 16))), 5));
+        __m256i s2 = _mm256_sub_epi32(zero, _mm256_slli_epi32(_mm256_madd_epi16(sc16, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(bsp + 2 * 16))), 5));
+        __m256i s3 = _mm256_sub_epi32(zero, _mm256_slli_epi32(_mm256_madd_epi16(sc16, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(bsp + 3 * 16))), 5));
+        __m256i s4 = zero, s5 = zero, s6 = zero, s7 = zero;
+        if constexpr (NTok > 4) {
+            s4 = _mm256_sub_epi32(zero, _mm256_slli_epi32(_mm256_madd_epi16(sc16, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(bsp + 4 * 16))), 5));
+            s5 = _mm256_sub_epi32(zero, _mm256_slli_epi32(_mm256_madd_epi16(sc16, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(bsp + 5 * 16))), 5));
+            s6 = _mm256_sub_epi32(zero, _mm256_slli_epi32(_mm256_madd_epi16(sc16, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(bsp + 6 * 16))), 5));
+            s7 = _mm256_sub_epi32(zero, _mm256_slli_epi32(_mm256_madd_epi16(sc16, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(bsp + 7 * 16))), 5));
+        }
+
+        for (int n_chunk = 0; n_chunk < 2; ++n_chunk) {
+            const int yb = i * 8 + n_chunk * 4;
+            const __m256i ql0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ql));
+            const __m256i ql1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ql + 32));
+            const __m256i qhb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qh));
+
+            // Process 1 sub-block (32 weights) at a time: only 2 live weight/scale YMMs instead of 8 -> zero inner spills!
+            #define Q6K_SUB(QV, SCV, YP) do { \
+                s0 = _mm256_add_epi32(s0, _mm256_madd_epi16(_mm256_maddubs_epi16(QV, _mm256_loadu_si256(reinterpret_cast<const __m256i*>((YP) + 0 * 32))), SCV)); \
+                s1 = _mm256_add_epi32(s1, _mm256_madd_epi16(_mm256_maddubs_epi16(QV, _mm256_loadu_si256(reinterpret_cast<const __m256i*>((YP) + 1 * 32))), SCV)); \
+                s2 = _mm256_add_epi32(s2, _mm256_madd_epi16(_mm256_maddubs_epi16(QV, _mm256_loadu_si256(reinterpret_cast<const __m256i*>((YP) + 2 * 32))), SCV)); \
+                s3 = _mm256_add_epi32(s3, _mm256_madd_epi16(_mm256_maddubs_epi16(QV, _mm256_loadu_si256(reinterpret_cast<const __m256i*>((YP) + 3 * 32))), SCV)); \
+                if constexpr (NTok > 4) { \
+                    s4 = _mm256_add_epi32(s4, _mm256_madd_epi16(_mm256_maddubs_epi16(QV, _mm256_loadu_si256(reinterpret_cast<const __m256i*>((YP) + 4 * 32))), SCV)); \
+                    s5 = _mm256_add_epi32(s5, _mm256_madd_epi16(_mm256_maddubs_epi16(QV, _mm256_loadu_si256(reinterpret_cast<const __m256i*>((YP) + 5 * 32))), SCV)); \
+                    s6 = _mm256_add_epi32(s6, _mm256_madd_epi16(_mm256_maddubs_epi16(QV, _mm256_loadu_si256(reinterpret_cast<const __m256i*>((YP) + 6 * 32))), SCV)); \
+                    s7 = _mm256_add_epi32(s7, _mm256_madd_epi16(_mm256_maddubs_epi16(QV, _mm256_loadu_si256(reinterpret_cast<const __m256i*>((YP) + 7 * 32))), SCV)); \
+                } \
+            } while (0)
+
+            {
+                const __m256i q1   = _mm256_or_si256(_mm256_and_si256(ql0, mask_lo4), _mm256_and_si256(_mm256_slli_epi16(qhb, 4), mask_hi2));
+                const __m256i sc_1 = mm256_concat_si128(_mm_set1_epi16(sc[0]), _mm_set1_epi16(sc[1]));
+                Q6K_SUB(q1, sc_1, tile.qs.data() + static_cast<size_t>(yb + 0) * 256ULL);
+            }
+            {
+                const __m256i q2   = _mm256_or_si256(_mm256_and_si256(ql1, mask_lo4), _mm256_and_si256(_mm256_slli_epi16(qhb, 2), mask_hi2));
+                const __m256i sc_2 = mm256_concat_si128(_mm_set1_epi16(sc[2]), _mm_set1_epi16(sc[3]));
+                Q6K_SUB(q2, sc_2, tile.qs.data() + static_cast<size_t>(yb + 1) * 256ULL);
+            }
+            {
+                const __m256i q3   = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql0, 4), mask_lo4), _mm256_and_si256(qhb, mask_hi2));
+                const __m256i sc_3 = mm256_concat_si128(_mm_set1_epi16(sc[4]), _mm_set1_epi16(sc[5]));
+                Q6K_SUB(q3, sc_3, tile.qs.data() + static_cast<size_t>(yb + 2) * 256ULL);
+            }
+            {
+                const __m256i q4   = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql1, 4), mask_lo4), _mm256_and_si256(_mm256_srli_epi16(qhb, 2), mask_hi2));
+                const __m256i sc_4 = mm256_concat_si128(_mm_set1_epi16(sc[6]), _mm_set1_epi16(sc[7]));
+                Q6K_SUB(q4, sc_4, tile.qs.data() + static_cast<size_t>(yb + 3) * 256ULL);
+            }
+            #undef Q6K_SUB
+
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+        const float* dp = tile.d.data() + static_cast<size_t>(i) * 8ULL;
+        acc0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s0), _mm256_set1_ps(d_w * dp[0]), acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s1), _mm256_set1_ps(d_w * dp[1]), acc1);
+        acc2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s2), _mm256_set1_ps(d_w * dp[2]), acc2);
+        acc3 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s3), _mm256_set1_ps(d_w * dp[3]), acc3);
+        if constexpr (NTok > 4) {
+            acc4 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s4), _mm256_set1_ps(d_w * dp[4]), acc4);
+            acc5 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s5), _mm256_set1_ps(d_w * dp[5]), acc5);
+            acc6 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s6), _mm256_set1_ps(d_w * dp[6]), acc6);
+            acc7 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s7), _mm256_set1_ps(d_w * dp[7]), acc7);
+        }
+    }
+    out[0] = hsum256_ps(acc0); out[1] = hsum256_ps(acc1);
+    out[2] = hsum256_ps(acc2); out[3] = hsum256_ps(acc3);
+    if constexpr (NTok > 4) {
+        out[4] = hsum256_ps(acc4); out[5] = hsum256_ps(acc5);
+        out[6] = hsum256_ps(acc6); out[7] = hsum256_ps(acc7);
+    }
+}
+
+template <int NTok>
+static inline void dot_iq4_nl_q8_32_xN(const void* data, size_t row, const Q8_32Batch::Tile& tile, int nb32, float* out) {
+    const auto* vx = reinterpret_cast<const block_iq4_nl*>(data) + row * static_cast<size_t>(nb32);
+    const __m256i lut256  = _mm256_broadcastsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_iq4nl)));
+    const __m128i mask_lo = _mm_set1_epi8(0x0F);
+    const __m256i ones16  = _mm256_set1_epi16(1);
+
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+    __m256 acc4 = _mm256_setzero_ps(), acc5 = _mm256_setzero_ps();
+    __m256 acc6 = _mm256_setzero_ps(), acc7 = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb32; ++i) {
+        const float d_w = Avx2Math::fp16_to_fp32(vx[i].d);
+        const __m128i qb  = _mm_loadu_si128(reinterpret_cast<const __m128i*>(vx[i].qs));
+        const __m256i idx = mm256_concat_si128(_mm_and_si128(qb, mask_lo), _mm_and_si128(_mm_srli_epi16(qb, 4), mask_lo));
+        const __m256i w   = _mm256_shuffle_epi8(lut256, idx);
+        const __m256i aw  = _mm256_abs_epi8(w);
+
+        const int8_t* yp = tile.qs.data() + static_cast<size_t>(i) * 256ULL;
+        const float*  dp = tile.d.data()  + static_cast<size_t>(i) * 8ULL;
+
+        #define IQNL_MAC(T, ACC) do { \
+            const __m256i y = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(yp + (T) * 32)); \
+            const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(aw, _mm256_sign_epi8(y, w)), ones16); \
+            ACC = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(d_w * dp[T]), ACC); \
+        } while (0)
+        IQNL_MAC(0, acc0); IQNL_MAC(1, acc1); IQNL_MAC(2, acc2); IQNL_MAC(3, acc3);
+        if constexpr (NTok > 4) {
+            IQNL_MAC(4, acc4); IQNL_MAC(5, acc5); IQNL_MAC(6, acc6); IQNL_MAC(7, acc7);
+        }
+        #undef IQNL_MAC
+    }
+    out[0] = hsum256_ps(acc0); out[1] = hsum256_ps(acc1);
+    out[2] = hsum256_ps(acc2); out[3] = hsum256_ps(acc3);
+    if constexpr (NTok > 4) {
+        out[4] = hsum256_ps(acc4); out[5] = hsum256_ps(acc5);
+        out[6] = hsum256_ps(acc6); out[7] = hsum256_ps(acc7);
+    }
+}
+
+template <int NTok>
+static inline void dot_q5_1_q8_32_xN(const void* data, size_t row, const Q8_32Batch::Tile& tile, int nb32, float* out) {
+    const auto* vx = reinterpret_cast<const block_q5_1*>(data) + row * static_cast<size_t>(nb32);
+    const __m128i mask_lo  = _mm_set1_epi8(0x0F);
+    const __m256i ones16   = _mm256_set1_epi16(1);
+    const __m256i shuf_qh  = _mm256_setr_epi8(
+        0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1,
+        2,2,2,2,2,2,2,2, 3,3,3,3,3,3,3,3);
+    const __m256i bit_mask = _mm256_set1_epi64x(static_cast<long long>(0x8040201008040201ULL));
+    const __m256i val_16   = _mm256_set1_epi8(0x10);
+
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+    __m256 acc4 = _mm256_setzero_ps(), acc5 = _mm256_setzero_ps();
+    __m256 acc6 = _mm256_setzero_ps(), acc7 = _mm256_setzero_ps();
+    __m256 m_v  = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb32; ++i) {
+        const float d_w = Avx2Math::fp16_to_fp32(vx[i].d);
+        const float m_w = Avx2Math::fp16_to_fp32(vx[i].m);
+        uint32_t qh_u32 = 0;
+        std::memcpy(&qh_u32, vx[i].qh, sizeof(qh_u32));
+        const __m256i qh_b   = _mm256_shuffle_epi8(_mm256_set1_epi32(static_cast<int>(qh_u32)), shuf_qh);
+        const __m256i qh_bit = _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_and_si256(qh_b, bit_mask), bit_mask), val_16);
+
+        const __m128i qb = _mm_loadu_si128(reinterpret_cast<const __m128i*>(vx[i].qs));
+        const __m256i q5 = _mm256_or_si256(
+            mm256_concat_si128(_mm_and_si128(qb, mask_lo), _mm_and_si128(_mm_srli_epi16(qb, 4), mask_lo)), qh_bit);
+
+        const int8_t* yp = tile.qs.data() + static_cast<size_t>(i) * 256ULL;
+        const float*  dp = tile.d.data()  + static_cast<size_t>(i) * 8ULL;
+
+        #define Q51_MAC(T, ACC) do { \
+            const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(q5, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(yp + (T) * 32))), ones16); \
+            ACC = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(d_w * dp[T]), ACC); \
+        } while (0)
+        Q51_MAC(0, acc0); Q51_MAC(1, acc1); Q51_MAC(2, acc2); Q51_MAC(3, acc3);
+        if constexpr (NTok > 4) {
+            Q51_MAC(4, acc4); Q51_MAC(5, acc5); Q51_MAC(6, acc6); Q51_MAC(7, acc7);
+        }
+        #undef Q51_MAC
+        m_v = _mm256_fmadd_ps(_mm256_set1_ps(m_w), _mm256_loadu_ps(tile.sumf.data() + static_cast<size_t>(i) * 8ULL), m_v);
+    }
+    alignas(32) float ms[8];
+    _mm256_store_ps(ms, m_v);
+    out[0] = hsum256_ps(acc0) + ms[0]; out[1] = hsum256_ps(acc1) + ms[1];
+    out[2] = hsum256_ps(acc2) + ms[2]; out[3] = hsum256_ps(acc3) + ms[3];
+    if constexpr (NTok > 4) {
+        out[4] = hsum256_ps(acc4) + ms[4]; out[5] = hsum256_ps(acc5) + ms[5];
+        out[6] = hsum256_ps(acc6) + ms[6]; out[7] = hsum256_ps(acc7) + ms[7];
+    }
+}
+
+template <int NTok>
+static inline void dot_q5_0_q8_32_xN(const void* data, size_t row, const Q8_32Batch::Tile& tile, int nb32, float* out) {
+    const auto* vx = reinterpret_cast<const block_q5_0*>(data) + row * static_cast<size_t>(nb32);
+    const __m128i mask_lo  = _mm_set1_epi8(0x0F);
+    const __m256i ones16   = _mm256_set1_epi16(1);
+    const __m256i shuf_qh  = _mm256_setr_epi8(
+        0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1,
+        2,2,2,2,2,2,2,2, 3,3,3,3,3,3,3,3);
+    const __m256i bit_mask = _mm256_set1_epi64x(static_cast<long long>(0x8040201008040201ULL));
+    const __m256i val_16   = _mm256_set1_epi8(0x10);
+
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+    __m256 acc4 = _mm256_setzero_ps(), acc5 = _mm256_setzero_ps();
+    __m256 acc6 = _mm256_setzero_ps(), acc7 = _mm256_setzero_ps();
+    float bsum[8] = {0,0,0,0,0,0,0,0};
+
+    for (int i = 0; i < nb32; ++i) {
+        const float d_w = Avx2Math::fp16_to_fp32(vx[i].d);
+        uint32_t qh_u32 = 0;
+        std::memcpy(&qh_u32, vx[i].qh, sizeof(qh_u32));
+        const __m256i qh_b   = _mm256_shuffle_epi8(_mm256_set1_epi32(static_cast<int>(qh_u32)), shuf_qh);
+        const __m256i qh_bit = _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_and_si256(qh_b, bit_mask), bit_mask), val_16);
+        const __m128i qb = _mm_loadu_si128(reinterpret_cast<const __m128i*>(vx[i].qs));
+        const __m256i q5 = _mm256_or_si256(
+            mm256_concat_si128(_mm_and_si128(qb, mask_lo), _mm_and_si128(_mm_srli_epi16(qb, 4), mask_lo)), qh_bit);
+
+        const int8_t*  yp = tile.qs.data()     + static_cast<size_t>(i) * 256ULL;
+        const float*   dp = tile.d.data()      + static_cast<size_t>(i) * 8ULL;
+        const int16_t* bp = tile.bsum32.data() + static_cast<size_t>(i) * 8ULL;
+
+        #define Q50_MAC(T, ACC) do { \
+            const float dw_dy = d_w * dp[T]; \
+            const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(q5, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(yp + (T) * 32))), ones16); \
+            ACC = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(dw_dy), ACC); \
+            bsum[T] += dw_dy * static_cast<float>(bp[T]); \
+        } while (0)
+        Q50_MAC(0, acc0); Q50_MAC(1, acc1); Q50_MAC(2, acc2); Q50_MAC(3, acc3);
+        if constexpr (NTok > 4) {
+            Q50_MAC(4, acc4); Q50_MAC(5, acc5); Q50_MAC(6, acc6); Q50_MAC(7, acc7);
+        }
+        #undef Q50_MAC
+    }
+    out[0] = hsum256_ps(acc0) - 16.0f * bsum[0]; out[1] = hsum256_ps(acc1) - 16.0f * bsum[1];
+    out[2] = hsum256_ps(acc2) - 16.0f * bsum[2]; out[3] = hsum256_ps(acc3) - 16.0f * bsum[3];
+    if constexpr (NTok > 4) {
+        out[4] = hsum256_ps(acc4) - 16.0f * bsum[4]; out[5] = hsum256_ps(acc5) - 16.0f * bsum[5];
+        out[6] = hsum256_ps(acc6) - 16.0f * bsum[6]; out[7] = hsum256_ps(acc7) - 16.0f * bsum[7];
+    }
+}
+
+template <int NTok>
+static inline void dot_q8_0_q8_32_xN(const void* data, size_t row, const Q8_32Batch::Tile& tile, int nb32, float* out) {
+    const auto* vx = reinterpret_cast<const block_q8_0*>(data) + row * static_cast<size_t>(nb32);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+    __m256 acc4 = _mm256_setzero_ps(), acc5 = _mm256_setzero_ps();
+    __m256 acc6 = _mm256_setzero_ps(), acc7 = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb32; ++i) {
+        const float d_w = Avx2Math::fp16_to_fp32(vx[i].d);
+        const __m256i w  = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(vx[i].qs));
+        const __m256i aw = _mm256_abs_epi8(w);
+
+        const int8_t* yp = tile.qs.data() + static_cast<size_t>(i) * 256ULL;
+        const float*  dp = tile.d.data()  + static_cast<size_t>(i) * 8ULL;
+
+        #define Q80_MAC(T, ACC) do { \
+            const __m256i y = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(yp + (T) * 32)); \
+            const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(aw, _mm256_sign_epi8(y, w)), ones16); \
+            ACC = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(d_w * dp[T]), ACC); \
+        } while (0)
+        Q80_MAC(0, acc0); Q80_MAC(1, acc1); Q80_MAC(2, acc2); Q80_MAC(3, acc3);
+        if constexpr (NTok > 4) {
+            Q80_MAC(4, acc4); Q80_MAC(5, acc5); Q80_MAC(6, acc6); Q80_MAC(7, acc7);
+        }
+        #undef Q80_MAC
+    }
+    out[0] = hsum256_ps(acc0); out[1] = hsum256_ps(acc1);
+    out[2] = hsum256_ps(acc2); out[3] = hsum256_ps(acc3);
+    if constexpr (NTok > 4) {
+        out[4] = hsum256_ps(acc4); out[5] = hsum256_ps(acc5);
+        out[6] = hsum256_ps(acc6); out[7] = hsum256_ps(acc7);
+    }
+}
+
+template <int NTok>
+static inline void dot_q4_0_q8_32_xN(const void* data, size_t row, const Q8_32Batch::Tile& tile, int nb32, float* out) {
+    const auto* vx = reinterpret_cast<const block_q4_0*>(data) + row * static_cast<size_t>(nb32);
+    const __m128i mask_lo = _mm_set1_epi8(0x0F);
+    const __m256i ones16  = _mm256_set1_epi16(1);
+
+    __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+    __m256 acc4 = _mm256_setzero_ps(), acc5 = _mm256_setzero_ps();
+    __m256 acc6 = _mm256_setzero_ps(), acc7 = _mm256_setzero_ps();
+    float bsum[8] = {0,0,0,0,0,0,0,0};
+
+    for (int i = 0; i < nb32; ++i) {
+        const float d_w = Avx2Math::fp16_to_fp32(vx[i].d);
+        const __m128i qb  = _mm_loadu_si128(reinterpret_cast<const __m128i*>(vx[i].qs));
+        const __m128i qlo = _mm_and_si128(qb, mask_lo);
+        const __m128i qhi = _mm_and_si128(_mm_srli_epi16(qb, 4), mask_lo);
+        const __m256i q4  = mm256_concat_si128(_mm_unpacklo_epi8(qlo, qhi), _mm_unpackhi_epi8(qlo, qhi));
+
+        const int8_t*  yp = tile.qs.data()     + static_cast<size_t>(i) * 256ULL;
+        const float*   dp = tile.d.data()      + static_cast<size_t>(i) * 8ULL;
+        const int16_t* bp = tile.bsum32.data() + static_cast<size_t>(i) * 8ULL;
+
+        #define Q40_MAC(T, ACC) do { \
+            const float dw_dy = d_w * dp[T]; \
+            const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(q4, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(yp + (T) * 32))), ones16); \
+            ACC = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(dw_dy), ACC); \
+            bsum[T] += dw_dy * static_cast<float>(bp[T]); \
+        } while (0)
+        Q40_MAC(0, acc0); Q40_MAC(1, acc1); Q40_MAC(2, acc2); Q40_MAC(3, acc3);
+        if constexpr (NTok > 4) {
+            Q40_MAC(4, acc4); Q40_MAC(5, acc5); Q40_MAC(6, acc6); Q40_MAC(7, acc7);
+        }
+        #undef Q40_MAC
+    }
+    out[0] = hsum256_ps(acc0) - 8.0f * bsum[0]; out[1] = hsum256_ps(acc1) - 8.0f * bsum[1];
+    out[2] = hsum256_ps(acc2) - 8.0f * bsum[2]; out[3] = hsum256_ps(acc3) - 8.0f * bsum[3];
+    if constexpr (NTok > 4) {
+        out[4] = hsum256_ps(acc4) - 8.0f * bsum[4]; out[5] = hsum256_ps(acc5) - 8.0f * bsum[5];
+        out[6] = hsum256_ps(acc6) - 8.0f * bsum[6]; out[7] = hsum256_ps(acc7) - 8.0f * bsum[7];
+    }
+}
+
+static inline int l2_adaptive_row_tile(size_t rbytes) {
+    // Keep weight tile <= 128 KB so weights + Q8 activation tile stay 100% resident in private 256 KB L2 cache
+    if (rbytes == 0) return 64;
+    int rt = static_cast<int>(131072ULL / rbytes);
+    rt = std::clamp(rt, 8, 64);
+    rt = (rt / 8) * 8;
+    return (rt >= 8) ? rt : 8;
+}
+
+template <typename Dot4Fn, typename Dot8Fn>
+static void run_gemm_q8k_tiled(float* Y, int stride_y, const void* wdata, size_t row_offset,
+                               const Q8KBatch& batch, int rows, size_t rbytes, bool parallel,
+                               Dot4Fn dot4, Dot8Fn dot8) {
+    const int row_tile = l2_adaptive_row_tile(rbytes);
+    const int num_rtiles = (rows + row_tile - 1) / row_tile;
+    const int n_tiles = static_cast<int>(batch.tiles.size());
+    const int nb256 = batch.nb256;
+
+    #pragma omp parallel for if(parallel && rows >= 32) schedule(static)
+    for (int rt = 0; rt < num_rtiles; ++rt) {
+        const int r0 = rt * row_tile;
+        const int r1 = std::min(rows, r0 + row_tile);
+        for (int g = 0; g < n_tiles; ++g) {
+            const auto& tile = batch.tiles[static_cast<size_t>(g)];
+            const int t_base = g * 8;
+            const int n_tok = tile.n_tok;
+            if (n_tok <= 4) {
+                for (int r = r0; r < r1; ++r) {
+                    float tmp[4];
+                    dot4(wdata, row_offset + static_cast<size_t>(r), tile, nb256, tmp);
+                    for (int t = 0; t < n_tok; ++t) {
+                        Y[static_cast<size_t>(t_base + t) * static_cast<size_t>(stride_y) + static_cast<size_t>(r)] = tmp[t];
+                    }
+                }
+            } else {
+                for (int r = r0; r < r1; ++r) {
+                    float tmp[8];
+                    dot8(wdata, row_offset + static_cast<size_t>(r), tile, nb256, tmp);
+                    for (int t = 0; t < n_tok; ++t) {
+                        Y[static_cast<size_t>(t_base + t) * static_cast<size_t>(stride_y) + static_cast<size_t>(r)] = tmp[t];
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <typename Dot4Fn, typename Dot8Fn>
+static void run_gemm_q8_32_tiled(float* Y, int stride_y, const void* wdata, size_t row_offset,
+                                 const Q8_32Batch& batch, int rows, size_t rbytes, bool parallel,
+                                 Dot4Fn dot4, Dot8Fn dot8) {
+    const int row_tile = l2_adaptive_row_tile(rbytes);
+    const int num_rtiles = (rows + row_tile - 1) / row_tile;
+    const int n_tiles = static_cast<int>(batch.tiles.size());
+    const int nb32 = batch.nb32;
+
+    #pragma omp parallel for if(parallel && rows >= 32) schedule(static)
+    for (int rt = 0; rt < num_rtiles; ++rt) {
+        const int r0 = rt * row_tile;
+        const int r1 = std::min(rows, r0 + row_tile);
+        for (int g = 0; g < n_tiles; ++g) {
+            const auto& tile = batch.tiles[static_cast<size_t>(g)];
+            const int t_base = g * 8;
+            const int n_tok = tile.n_tok;
+            if (n_tok <= 4) {
+                for (int r = r0; r < r1; ++r) {
+                    float tmp[4];
+                    dot4(wdata, row_offset + static_cast<size_t>(r), tile, nb32, tmp);
+                    for (int t = 0; t < n_tok; ++t) {
+                        Y[static_cast<size_t>(t_base + t) * static_cast<size_t>(stride_y) + static_cast<size_t>(r)] = tmp[t];
+                    }
+                }
+            } else {
+                for (int r = r0; r < r1; ++r) {
+                    float tmp[8];
+                    dot8(wdata, row_offset + static_cast<size_t>(r), tile, nb32, tmp);
+                    for (int t = 0; t < n_tok; ++t) {
+                        Y[static_cast<size_t>(t_base + t) * static_cast<size_t>(stride_y) + static_cast<size_t>(r)] = tmp[t];
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Branchless 1x4 / 1x8 batched float GEMM for BF16, F16, and F32 weights (e.g. per_layer_model_proj, MoE router)
+template <QuantType QT, int NTok>
+static inline void dot_float_xN(const void* wdata, size_t wrow, const float* const* xp, int cols, float* res) {
+    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(), a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+    __m256 a4 = _mm256_setzero_ps(), a5 = _mm256_setzero_ps(), a6 = _mm256_setzero_ps(), a7 = _mm256_setzero_ps();
+    int c = 0;
+    for (; c <= cols - 8; c += 8) {
+        __m256 vw;
+        if constexpr (QT == QuantType::F32) {
+            vw = _mm256_loadu_ps(reinterpret_cast<const float*>(wdata) + wrow * static_cast<size_t>(cols) + c);
+        } else if constexpr (QT == QuantType::BF16) {
+            __m128i bf = _mm_loadu_si128(reinterpret_cast<const __m128i*>(reinterpret_cast<const uint16_t*>(wdata) + wrow * static_cast<size_t>(cols) + c));
+            vw = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(bf), 16));
+        } else {
+            __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(reinterpret_cast<const uint16_t*>(wdata) + wrow * static_cast<size_t>(cols) + c));
+            vw = _mm256_cvtph_ps(h);
+        }
+        a0 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(xp[0] + c), a0);
+        a1 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(xp[1] + c), a1);
+        a2 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(xp[2] + c), a2);
+        a3 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(xp[3] + c), a3);
+        if constexpr (NTok > 4) {
+            a4 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(xp[4] + c), a4);
+            a5 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(xp[5] + c), a5);
+            a6 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(xp[6] + c), a6);
+            a7 = _mm256_fmadd_ps(vw, _mm256_loadu_ps(xp[7] + c), a7);
+        }
+    }
+    res[0] = hsum256_ps(a0); res[1] = hsum256_ps(a1); res[2] = hsum256_ps(a2); res[3] = hsum256_ps(a3);
+    if constexpr (NTok > 4) {
+        res[4] = hsum256_ps(a4); res[5] = hsum256_ps(a5); res[6] = hsum256_ps(a6); res[7] = hsum256_ps(a7);
+    }
+    for (; c < cols; ++c) {
+        float wv = 0.0f;
+        if constexpr (QT == QuantType::F32) wv = reinterpret_cast<const float*>(wdata)[wrow * static_cast<size_t>(cols) + c];
+        else if constexpr (QT == QuantType::BF16) wv = Avx2Math::bf16_to_fp32(reinterpret_cast<const uint16_t*>(wdata)[wrow * static_cast<size_t>(cols) + c]);
+        else wv = Avx2Math::fp16_to_fp32(reinterpret_cast<const uint16_t*>(wdata)[wrow * static_cast<size_t>(cols) + c]);
+        for (int t = 0; t < NTok; ++t) res[t] += wv * xp[t][c];
+    }
+}
+
+template <QuantType QT>
+static void run_gemm_float_tiled(float* Y, int stride_y, const void* wdata, size_t row_offset,
+                                 const float* X, int stride_x, int n_tokens, int rows, int cols, bool parallel) {
+    const size_t rbytes = static_cast<size_t>(cols) * (QT == QuantType::F32 ? 4ULL : 2ULL);
+    const int row_tile = l2_adaptive_row_tile(rbytes);
+    const int num_rtiles = (rows + row_tile - 1) / row_tile;
+
+    #pragma omp parallel for if(parallel && rows >= 32) schedule(static)
+    for (int rt = 0; rt < num_rtiles; ++rt) {
+        const int r0 = rt * row_tile;
+        const int r1 = std::min(rows, r0 + row_tile);
+        for (int t0 = 0; t0 < n_tokens; t0 += 8) {
+            const int n_tok = std::min(8, n_tokens - t0);
+            const float* xp[8];
+            for (int t = 0; t < n_tok; ++t) xp[t] = X + static_cast<size_t>(t0 + t) * static_cast<size_t>(stride_x);
+            for (int t = n_tok; t < 8; ++t) xp[t] = xp[0];
+
+            if (n_tok <= 4) {
+                for (int r = r0; r < r1; ++r) {
+                    float res[4];
+                    dot_float_xN<QT, 4>(wdata, row_offset + static_cast<size_t>(r), xp, cols, res);
+                    for (int t = 0; t < n_tok; ++t) {
+                        Y[static_cast<size_t>(t0 + t) * static_cast<size_t>(stride_y) + static_cast<size_t>(r)] = res[t];
+                    }
+                }
+            } else {
+                for (int r = r0; r < r1; ++r) {
+                    float res[8];
+                    dot_float_xN<QT, 8>(wdata, row_offset + static_cast<size_t>(r), xp, cols, res);
+                    for (int t = 0; t < n_tok; ++t) {
+                        Y[static_cast<size_t>(t0 + t) * static_cast<size_t>(stride_y) + static_cast<size_t>(r)] = res[t];
+                    }
+                }
+            }
+        }
+    }
+}
+
+void Avx2Math::gemm_slice_q8k(float* Y, int stride_y, const TensorDesc& weight, size_t row_offset,
+                              const Q8KBatch& batch, int rows, int cols, bool parallel) {
+    if (!Y || !weight.data || rows <= 0 || cols < 256 || batch.n_tokens <= 0) return;
+    const size_t rb = row_bytes(weight.type, cols);
+    if (weight.size_bytes > 0) {
+        if (rb == 0 || row_offset + static_cast<size_t>(rows) > weight.size_bytes / rb) {
+            for (int t = 0; t < batch.n_tokens; ++t) {
+                std::memset(Y + static_cast<size_t>(t) * static_cast<size_t>(stride_y), 0, static_cast<size_t>(rows) * sizeof(float));
+            }
+            return;
+        }
+    }
+    switch (weight.type) {
+        case QuantType::IQ4_XS: run_gemm_q8k_tiled(Y, stride_y, weight.data, row_offset, batch, rows, rb, parallel, dot_iq4_xs_q8k_xN<4>, dot_iq4_xs_q8k_xN<8>); break;
+        case QuantType::Q4_K:   run_gemm_q8k_tiled(Y, stride_y, weight.data, row_offset, batch, rows, rb, parallel, dot_q4_K_q8k_xN<4>,   dot_q4_K_q8k_xN<8>);   break;
+        case QuantType::Q5_K:   run_gemm_q8k_tiled(Y, stride_y, weight.data, row_offset, batch, rows, rb, parallel, dot_q5_K_q8k_xN<4>,   dot_q5_K_q8k_xN<8>);   break;
+        case QuantType::Q6_K:   run_gemm_q8k_tiled(Y, stride_y, weight.data, row_offset, batch, rows, rb, parallel, dot_q6_K_q8k_xN<4>,   dot_q6_K_q8k_xN<8>);   break;
+        default: break;
+    }
+}
+
+void Avx2Math::gemm_slice_q8_32(float* Y, int stride_y, const TensorDesc& weight, size_t row_offset,
+                                const Q8_32Batch& batch, int rows, int cols, bool parallel) {
+    if (!Y || !weight.data || rows <= 0 || cols < 32 || batch.n_tokens <= 0) return;
+    const size_t rb = row_bytes(weight.type, cols);
+    if (weight.size_bytes > 0) {
+        if (rb == 0 || row_offset + static_cast<size_t>(rows) > weight.size_bytes / rb) {
+            for (int t = 0; t < batch.n_tokens; ++t) {
+                std::memset(Y + static_cast<size_t>(t) * static_cast<size_t>(stride_y), 0, static_cast<size_t>(rows) * sizeof(float));
+            }
+            return;
+        }
+    }
+    switch (weight.type) {
+        case QuantType::IQ4_NL: run_gemm_q8_32_tiled(Y, stride_y, weight.data, row_offset, batch, rows, rb, parallel, dot_iq4_nl_q8_32_xN<4>, dot_iq4_nl_q8_32_xN<8>); break;
+        case QuantType::Q5_1:   run_gemm_q8_32_tiled(Y, stride_y, weight.data, row_offset, batch, rows, rb, parallel, dot_q5_1_q8_32_xN<4>,   dot_q5_1_q8_32_xN<8>);   break;
+        case QuantType::Q5_0:   run_gemm_q8_32_tiled(Y, stride_y, weight.data, row_offset, batch, rows, rb, parallel, dot_q5_0_q8_32_xN<4>,   dot_q5_0_q8_32_xN<8>);   break;
+        case QuantType::Q8_0:   run_gemm_q8_32_tiled(Y, stride_y, weight.data, row_offset, batch, rows, rb, parallel, dot_q8_0_q8_32_xN<4>,   dot_q8_0_q8_32_xN<8>);   break;
+        case QuantType::Q4_0:   run_gemm_q8_32_tiled(Y, stride_y, weight.data, row_offset, batch, rows, rb, parallel, dot_q4_0_q8_32_xN<4>,   dot_q4_0_q8_32_xN<8>);   break;
+        default: break;
+    }
+}
+
+void Avx2Math::gemm_slice(float* Y, int stride_y, const TensorDesc& weight, size_t row_offset,
+                          const float* X, int stride_x, int n_tokens, int rows, int cols, bool parallel) {
+    if (!Y || !weight.data || !X || n_tokens <= 0 || rows <= 0 || cols <= 0) return;
+    if (weight.size_bytes > 0) {
+        const size_t rb = row_bytes(weight.type, cols);
+        if (rb == 0 || row_offset + static_cast<size_t>(rows) > weight.size_bytes / rb) {
+            for (int t = 0; t < n_tokens; ++t) {
+                std::memset(Y + static_cast<size_t>(t) * static_cast<size_t>(stride_y), 0, static_cast<size_t>(rows) * sizeof(float));
+            }
+            return;
+        }
+    }
+
+    if (n_tokens == 1) {
+        if (parallel) {
+            gemv_slice(Y, weight, row_offset, X, rows, cols);
+        } else {
+            if (DotRowQ8Fn q8_fn = get_dot_row_q8_fn(weight.type, cols)) {
+                Q8Act32 act;
+                quantize_q8_act(X, cols, act);
+                for (int r = 0; r < rows; ++r) Y[r] = q8_fn(weight.data, row_offset + static_cast<size_t>(r), act, cols);
+            } else {
+                for (int r = 0; r < rows; ++r) Y[r] = dot_row(weight, row_offset + static_cast<size_t>(r), X, cols);
+            }
+        }
+        return;
+    }
+
+    if (supports_q8k_gemm(weight.type, cols)) {
+        Q8KBatch batch;
+        pack_q8k_batch(X, stride_x, cols, n_tokens, batch);
+        gemm_slice_q8k(Y, stride_y, weight, row_offset, batch, rows, cols, parallel);
+        return;
+    }
+    if (supports_q8_32_gemm(weight.type, cols)) {
+        Q8_32Batch batch;
+        pack_q8_32_batch(X, stride_x, cols, n_tokens, batch);
+        gemm_slice_q8_32(Y, stride_y, weight, row_offset, batch, rows, cols, parallel);
+        return;
+    }
+    if (weight.type == QuantType::F32) {
+        run_gemm_float_tiled<QuantType::F32>(Y, stride_y, weight.data, row_offset, X, stride_x, n_tokens, rows, cols, parallel);
+        return;
+    }
+    if (weight.type == QuantType::BF16) {
+        run_gemm_float_tiled<QuantType::BF16>(Y, stride_y, weight.data, row_offset, X, stride_x, n_tokens, rows, cols, parallel);
+        return;
+    }
+    if (weight.type == QuantType::F16) {
+        run_gemm_float_tiled<QuantType::F16>(Y, stride_y, weight.data, row_offset, X, stride_x, n_tokens, rows, cols, parallel);
+        return;
+    }
+
+    // Fallback for remaining rare formats (e.g. Q3_K)
+    for (int t = 0; t < n_tokens; ++t) {
+        const float* xt = X + static_cast<size_t>(t) * static_cast<size_t>(stride_x);
+        float* yt = Y + static_cast<size_t>(t) * static_cast<size_t>(stride_y);
+        if (parallel) {
+            gemv_slice(yt, weight, row_offset, xt, rows, cols);
+        } else {
+            for (int r = 0; r < rows; ++r) yt[r] = dot_row(weight, row_offset + static_cast<size_t>(r), xt, cols);
+        }
+    }
+}
+
+void Avx2Math::gemm(float* Y, int stride_y, const TensorDesc& weight,
+                    const float* X, int stride_x, int n_tokens, int rows, int cols) {
+    gemm_slice(Y, stride_y, weight, 0, X, stride_x, n_tokens, rows, cols, true);
+}
+
 // Fast AVX2 In-Place Bias Addition: out[i] += bias[i] (supports F32 and F16)
 void Avx2Math::add_bias(float* out, const TensorDesc& bias_tensor, int size) {
     if (!out || !bias_tensor.data || size <= 0) return;

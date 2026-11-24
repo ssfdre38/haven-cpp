@@ -4,6 +4,7 @@
 #include <vector>
 #include <iomanip>
 #include <string>
+#include <cstdlib>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -195,7 +196,10 @@ void run_benchmark_suite(haven::HavenEngine& haven_engine, const std::string& mo
 }
 
 int main(int argc, char** argv) {
+    // Prevent OpenMP active-spin livelock under concurrent workstation load (user env vars still override)
 #ifdef _WIN32
+    if (!std::getenv("OMP_WAIT_POLICY")) _putenv_s("OMP_WAIT_POLICY", "PASSIVE");
+    if (!std::getenv("KMP_BLOCKTIME"))   _putenv_s("KMP_BLOCKTIME", "0");
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -203,6 +207,9 @@ int main(int argc, char** argv) {
     if (GetConsoleMode(hOut, &dwMode)) {
         SetConsoleMode(hOut, dwMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
     }
+#else
+    if (!std::getenv("OMP_WAIT_POLICY")) setenv("OMP_WAIT_POLICY", "PASSIVE", 0);
+    if (!std::getenv("KMP_BLOCKTIME"))   setenv("KMP_BLOCKTIME", "0", 0);
 #endif
     std::cout << std::unitbuf;
 
@@ -262,8 +269,9 @@ int main(int argc, char** argv) {
         auto sys_tokens = haven_engine.tokenize(system_prompt, true); // add <bos> on startup
         std::cout << "⏳ Warming cognitive mind & prefilling system prompt (" << sys_tokens.size() << " tokens)..." << std::flush;
         auto t0 = std::chrono::high_resolution_clock::now();
-        for (uint32_t st : sys_tokens) {
-            haven_engine.forward(st, active_kv_pos++, nullptr);
+        if (!sys_tokens.empty()) {
+            haven_engine.forward_batch(sys_tokens.data(), static_cast<int>(sys_tokens.size()), active_kv_pos, nullptr);
+            active_kv_pos += static_cast<int>(sys_tokens.size());
         }
         auto t1 = std::chrono::high_resolution_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -360,9 +368,9 @@ int main(int argc, char** argv) {
         haven_engine.get_plugin_manager().dispatch_prompt_prefill(turn_prompt, turn_tokens);
 
         std::vector<float> logits(haven_engine.get_config().vocab_size, 0.0f);
-        for (size_t i = 0; i < turn_tokens.size(); ++i) {
-            bool is_last = (i + 1 == turn_tokens.size());
-            haven_engine.forward(turn_tokens[i], active_kv_pos++, is_last ? logits.data() : nullptr);
+        if (!turn_tokens.empty()) {
+            haven_engine.forward_batch(turn_tokens.data(), static_cast<int>(turn_tokens.size()), active_kv_pos, logits.data());
+            active_kv_pos += static_cast<int>(turn_tokens.size());
         }
 
         std::cout << "                                  \r✨ Aura: " << std::flush;

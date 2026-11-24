@@ -29,6 +29,36 @@ struct Q8Act32 {
     int nb = 0;
 };
 
+// Block-major packed 256-elem Q8_K activation batch for register-tiled 1x8 / 1x4 AVX2 GEMM
+// Supports IQ4_XS, Q4_K, Q5_K, Q6_K with pure-integer inner loops (1 float FMA / 256 weights).
+struct Q8KBatch {
+    struct Tile {
+        int n_tok = 0;                 // 1..8 active tokens in this tile
+        std::vector<int8_t>  qs;       // [nb256 * 8 * 8 * 32] contiguous per 32-elem sub-block
+        std::vector<float>   d;        // [nb256 * 8]
+        std::vector<float>   sumf;     // [nb256 * 8 * 8] exact FP32 32-elem sums (for Q4_K/Q5_K)
+        std::vector<int16_t> bsum16;   // [nb256 * 16 * 8] exact 16-elem int8 sums (for Q6_K)
+    };
+    int nb256 = 0;
+    int n_tokens = 0;
+    std::vector<Tile> tiles;           // ceil(n_tokens / 8) tiles
+};
+
+// Block-major packed 32-elem Q8 activation batch for register-tiled 1x8 / 1x4 AVX2 GEMM
+// Supports IQ4_NL, Q5_1, Q5_0, Q8_0, Q4_0.
+struct Q8_32Batch {
+    struct Tile {
+        int n_tok = 0;                 // 1..8 active tokens in this tile
+        std::vector<int8_t>  qs;       // [nb32 * 8 * 32]
+        std::vector<float>   d;        // [nb32 * 8]
+        std::vector<float>   sumf;     // [nb32 * 8]
+        std::vector<int16_t> bsum32;   // [nb32 * 8] exact 32-elem int8 sums (for Q4_0/Q5_0)
+    };
+    int nb32 = 0;
+    int n_tokens = 0;
+    std::vector<Tile> tiles;
+};
+
 class Avx2Math {
 public:
     // Convert FP16 uint16_t to float using hardware native F16C SIMD instruction (MSVC/GCC/Clang portable)
@@ -133,6 +163,21 @@ public:
 
     // Single-row integer AVX2 dot product against pre-quantized Q8Act32 (falls back to 0 if unsupported)
     static float dot_row_q8(const TensorDesc& weight, size_t row, const Q8Act32& act, int cols);
+
+    // Pack multi-token activation matrix X [n_tokens, stride_x] for batched register-tiled AVX2 GEMM
+    static void pack_q8k_batch(const float* X, int stride_x, int cols, int n_tokens, Q8KBatch& out);
+    static void pack_q8_32_batch(const float* X, int stride_x, int cols, int n_tokens, Q8_32Batch& out);
+    static bool supports_q8k_gemm(QuantType type, int cols);
+    static bool supports_q8_32_gemm(QuantType type, int cols);
+
+    // Multi-token Matrix-Matrix Multiplication: Y[t, r] = sum_c W[row_offset + r, c] * X[t, c]
+    // L2-cache row-tiled + 1x8 / 1x4 register-blocked AVX2 integer GEMM (~217-247 GMAC/s on 6-core Xeon)
+    static void gemm(float* Y, int stride_y, const TensorDesc& weight, const float* X, int stride_x, int n_tokens, int rows, int cols);
+    static void gemm_slice(float* Y, int stride_y, const TensorDesc& weight, size_t row_offset, const float* X, int stride_x, int n_tokens, int rows, int cols, bool parallel = true);
+
+    // Pre-packed GEMM entry points (pack X once, reuse across Q/K/V or Gate/Up projections)
+    static void gemm_slice_q8k(float* Y, int stride_y, const TensorDesc& weight, size_t row_offset, const Q8KBatch& batch, int rows, int cols, bool parallel = true);
+    static void gemm_slice_q8_32(float* Y, int stride_y, const TensorDesc& weight, size_t row_offset, const Q8_32Batch& batch, int rows, int cols, bool parallel = true);
 
     // Exact byte stride for one row of `cols` elements (0 if unsupported)
     static size_t row_bytes(QuantType type, int cols);

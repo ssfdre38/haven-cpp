@@ -270,6 +270,66 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
+
+            // 6. Batched 1x8 / 1x4 GEMM parity vs single-token GEMV (n_tokens = 13 exercises both x8 and x4 paths!)
+            constexpr int S_TEST = 13;
+            std::vector<float> X_batch(static_cast<size_t>(S_TEST) * 2560ULL);
+            for (int t = 0; t < S_TEST; ++t) {
+                for (int c = 0; c < 2560; ++c) {
+                    X_batch[static_cast<size_t>(t) * 2560ULL + static_cast<size_t>(c)] =
+                        std::sin(static_cast<float>(c) * 0.05f + static_cast<float>(t) * 0.37f);
+                }
+            }
+            auto check_gemm_tensor = [&](const char* label, const haven::TensorDesc& td) -> bool {
+                std::vector<float> Y_gemm(static_cast<size_t>(S_TEST) * 64ULL, 0.0f);
+                std::vector<float> Y_gemv(static_cast<size_t>(S_TEST) * 64ULL, 0.0f);
+                haven::Avx2Math::gemm(Y_gemm.data(), 64, td, X_batch.data(), 2560, S_TEST, 64, 2560);
+                for (int t = 0; t < S_TEST; ++t) {
+                    haven::Avx2Math::gemv(Y_gemv.data() + static_cast<size_t>(t) * 64ULL, td,
+                                          X_batch.data() + static_cast<size_t>(t) * 2560ULL, 64, 2560);
+                }
+                const float cos_b = haven::Avx2Math::cosine_similarity(Y_gemm.data(), Y_gemv.data(), S_TEST * 64);
+                std::cout << "• Batched GEMM (S=" << S_TEST << ") " << label << " vs GEMV: cosine=" << cos_b << "\n";
+                if (cos_b < 0.999f) {
+                    std::cerr << "✗ Batched GEMM " << label << " cosine below 0.999!\n";
+                    return false;
+                }
+                return true;
+            };
+            if (!check_gemm_tensor("Q6_K", *embd)) return 1;
+            if (engine.get_config().num_layers > 0 && engine.get_layer_tensors(0).attn_q) {
+                if (!check_gemm_tensor("Layer0 attn_q", *engine.get_layer_tensors(0).attn_q)) return 1;
+            }
+            // Synthetic Batched GEMM (S=13) parity across IQ4_XS, IQ4_NL, Q5_1, Q5_0, Q8_0, Q4_0, Q5_K
+            std::vector<float> X512_b(static_cast<size_t>(S_TEST) * 512ULL);
+            for (int t = 0; t < S_TEST; ++t) {
+                for (int c = 0; c < 512; ++c) {
+                    X512_b[static_cast<size_t>(t) * 512ULL + static_cast<size_t>(c)] =
+                        std::sin(static_cast<float>(c) * 0.13f + 0.4f + static_cast<float>(t) * 0.51f);
+                }
+            }
+            auto check_syn_gemm = [&](const char* label, const haven::TensorDesc& td) -> bool {
+                std::vector<float> Y_gemm(static_cast<size_t>(S_TEST), 0.0f);
+                std::vector<float> Y_ref(static_cast<size_t>(S_TEST), 0.0f);
+                haven::Avx2Math::gemm(Y_gemm.data(), 1, td, X512_b.data(), 512, S_TEST, 1, 512);
+                for (int t = 0; t < S_TEST; ++t) {
+                    Y_ref[static_cast<size_t>(t)] = haven::Avx2Math::dot_row(td, 0, X512_b.data() + static_cast<size_t>(t) * 512ULL, 512);
+                }
+                const float cos_s = haven::Avx2Math::cosine_similarity(Y_gemm.data(), Y_ref.data(), S_TEST);
+                std::cout << "• Batched GEMM (S=" << S_TEST << ") Synthetic " << label << " vs FP32: cosine=" << cos_s << "\n";
+                if (cos_s < 0.998f) {
+                    std::cerr << "✗ Batched GEMM Synthetic " << label << " cosine below 0.998!\n";
+                    return false;
+                }
+                return true;
+            };
+            if (!check_syn_gemm("IQ4_XS", td_xs))  return 1;
+            if (!check_syn_gemm("IQ4_NL", td_nl))  return 1;
+            if (!check_syn_gemm("Q5_1",   td_q51)) return 1;
+            if (!check_syn_gemm("Q5_0",   td_q50)) return 1;
+            if (!check_syn_gemm("Q8_0",   td_q80)) return 1;
+            if (!check_syn_gemm("Q4_0",   td_q40)) return 1;
+            if (!check_syn_gemm("Q5_K",   td_q5k)) return 1;
         }
     }
 

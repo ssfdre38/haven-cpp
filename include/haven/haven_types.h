@@ -169,6 +169,7 @@ struct ModelConfig {
     uint32_t expert_count = 0;
     uint32_t expert_used_count = 0;
     uint32_t expert_ffn_dim = 0;
+    std::vector<uint32_t> hidden_dim_per_layer;
     std::vector<uint32_t> head_count_kv_per_layer;
     std::vector<bool> sliding_window_pattern;
     float final_logit_softcapping = 0.0f;

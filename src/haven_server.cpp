@@ -1560,14 +1560,21 @@ private:
                 prefilled_count = common_prefix + count;
             }
         } else {
-            for (size_t i = common_prefix; i < tokens.size() && active_pos < max_ctx; ++i) {
+            // Chunked batched GEMM CPU prefill (256-320 token chunks stream MoE/Dense weights ONCE while keeping client-abort checks responsive!)
+            const size_t CPU_PREFILL_CHUNK = (cfg.expert_count > 0) ? 320ULL : 256ULL;
+            size_t i = common_prefix;
+            while (i < tokens.size() && active_pos < max_ctx) {
                 if (is_client_disconnected(client_sock)) {
                     aborted_during_prefill = true;
                     break;
                 }
-                bool is_last = (i + 1 == tokens.size());
-                haven_engine_.forward(tokens[i], active_pos++, is_last ? logits.data() : nullptr);
-                prefilled_count = i + 1;
+                const size_t avail = static_cast<size_t>(max_ctx - active_pos);
+                const size_t chunk_len = std::min({CPU_PREFILL_CHUNK, tokens.size() - i, avail});
+                const bool is_last_chunk = (i + chunk_len == tokens.size()) || (active_pos + static_cast<int>(chunk_len) == max_ctx);
+                haven_engine_.forward_batch(tokens.data() + i, static_cast<int>(chunk_len), active_pos, is_last_chunk ? logits.data() : nullptr);
+                active_pos += static_cast<int>(chunk_len);
+                i += chunk_len;
+                prefilled_count = i;
             }
         }
 
@@ -1780,11 +1787,15 @@ private:
                                 }
                             }
                         } else {
-                            for (size_t ti = 0; ti < tool_tokens.size() && active_pos < max_ctx; ++ti) {
-                                bool is_last = (ti + 1 == tool_tokens.size()) || (active_pos + 1 == max_ctx);
-                                haven_engine_.forward(tool_tokens[ti], active_pos++, is_last ? logits.data() : nullptr);
-                                cached_tokens_.push_back(tool_tokens[ti]);
-                                context_history.push_back(tool_tokens[ti]);
+                            size_t avail = static_cast<size_t>(std::max(0, max_ctx - active_pos));
+                            size_t cnt = std::min(tool_tokens.size(), avail);
+                            if (cnt > 0) {
+                                haven_engine_.forward_batch(tool_tokens.data(), static_cast<int>(cnt), active_pos, logits.data());
+                                active_pos += static_cast<int>(cnt);
+                                for (size_t ti = 0; ti < cnt; ++ti) {
+                                    cached_tokens_.push_back(tool_tokens[ti]);
+                                    context_history.push_back(tool_tokens[ti]);
+                                }
                             }
                         }
 
@@ -1931,11 +1942,15 @@ private:
                                 }
                             }
                         } else {
-                            for (size_t ti = 0; ti < tool_tokens.size() && active_pos < max_ctx; ++ti) {
-                                bool is_last = (ti + 1 == tool_tokens.size()) || (active_pos + 1 == max_ctx);
-                                haven_engine_.forward(tool_tokens[ti], active_pos++, is_last ? logits.data() : nullptr);
-                                cached_tokens_.push_back(tool_tokens[ti]);
-                                context_history.push_back(tool_tokens[ti]);
+                            size_t avail = static_cast<size_t>(std::max(0, max_ctx - active_pos));
+                            size_t cnt = std::min(tool_tokens.size(), avail);
+                            if (cnt > 0) {
+                                haven_engine_.forward_batch(tool_tokens.data(), static_cast<int>(cnt), active_pos, logits.data());
+                                active_pos += static_cast<int>(cnt);
+                                for (size_t ti = 0; ti < cnt; ++ti) {
+                                    cached_tokens_.push_back(tool_tokens[ti]);
+                                    context_history.push_back(tool_tokens[ti]);
+                                }
                             }
                         }
 
@@ -2954,9 +2969,15 @@ bool parse_u32_range(const char* s, uint32_t min_v, uint32_t max_v, uint32_t& ou
 } // namespace
 
 int main(int argc, char** argv) {
+    // Prevent OpenMP active-spin livelock under concurrent workstation load (user env vars still override)
 #ifdef _WIN32
+    if (!std::getenv("OMP_WAIT_POLICY")) _putenv_s("OMP_WAIT_POLICY", "PASSIVE");
+    if (!std::getenv("KMP_BLOCKTIME"))   _putenv_s("KMP_BLOCKTIME", "0");
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
+#else
+    if (!std::getenv("OMP_WAIT_POLICY")) setenv("OMP_WAIT_POLICY", "PASSIVE", 0);
+    if (!std::getenv("KMP_BLOCKTIME"))   setenv("KMP_BLOCKTIME", "0", 0);
 #endif
     int port = 11436;
     std::string bind_host = "127.0.0.1";

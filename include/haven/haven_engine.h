@@ -102,6 +102,11 @@ public:
     // Executes forward pass for a single token with dynamic KV cache, knowledge injection, and telemetry
     void forward(uint32_t token, int pos, float* out_logits, uint32_t active_cluster = 0);
 
+    // Executes batched multi-token prompt prefill via L2-tiled 1x8/1x4 AVX2 GEMM and expert-grouped MoE.
+    // Populates KV cache for positions [start_pos .. start_pos + n_tokens - 1] and optionally writes
+    // the final token's logits into out_last_logits.
+    void forward_batch(const uint32_t* tokens, int n_tokens, int start_pos, float* out_last_logits = nullptr, uint32_t active_cluster = 0);
+
     // Prunes stale cache entries across all layers and returns total pruned tokens
     size_t prune_kv_cache();
 

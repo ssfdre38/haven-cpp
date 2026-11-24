@@ -307,6 +307,25 @@ bool GgufLoader::parse_header() {
         else if (ends_with(key, ".feed_forward_length") && (val_type == 4 || val_type == 10)) {
             if (!read_uint_val(val_type, config_.hidden_dim)) return false;
         }
+        else if (ends_with(key, ".feed_forward_length") && val_type == 9) {
+            if (!has_bytes(ptr, end, 12)) return false;
+            uint32_t arr_type = 0;
+            uint64_t arr_len = 0;
+            std::memcpy(&arr_type, ptr, sizeof(arr_type));
+            std::memcpy(&arr_len, ptr + 4, sizeof(arr_len));
+            ptr += 12;
+            if ((arr_type != 4 && arr_type != 5 && arr_type != 10 && arr_type != 11) || arr_len > 4096) return false;
+            config_.hidden_dim_per_layer.clear();
+            config_.hidden_dim_per_layer.reserve(static_cast<size_t>(arr_len));
+            uint32_t max_ff = 0;
+            for (uint64_t j = 0; j < arr_len; ++j) {
+                uint32_t v = 0;
+                if (!read_uint_val(arr_type, v)) return false;
+                config_.hidden_dim_per_layer.push_back(v);
+                if (v > max_ff) max_ff = v;
+            }
+            if (max_ff > 0) config_.hidden_dim = max_ff;
+        }
         else if (ends_with(key, ".block_count") && (val_type == 4 || val_type == 10)) {
             if (!read_uint_val(val_type, config_.num_layers)) return false;
         }
