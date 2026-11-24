@@ -284,7 +284,11 @@ bool GgufLoader::parse_header() {
         std::memcpy(&val_type, ptr, sizeof(val_type));
         ptr += 4;
 
-        if (key == "general.architecture" && val_type == 8) {
+        // Ignore multimodal tower sub-configs (.vision.*, .audio.*) so they never overwrite LLM geometry
+        if (key.find(".vision.") != std::string::npos || key.find(".audio.") != std::string::npos) {
+            if (!skip_gguf_value(val_type, ptr, end)) return false;
+        }
+        else if (key == "general.architecture" && val_type == 8) {
             config_.architecture = read_gguf_string(ptr, end, str_ok);
             if (!str_ok) return false;
         }

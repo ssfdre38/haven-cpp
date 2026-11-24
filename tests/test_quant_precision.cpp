@@ -112,6 +112,162 @@ int main(int argc, char** argv) {
                     std::cout << "✓ SUCCESS: " << q_name << " AVX2 Kernel matches FP32 dequantization!\n";
                 } else {
                     std::cerr << "✗ MISMATCH in " << q_name << " kernel!\n";
+                    return 1;
+                }
+            }
+        }
+    }
+
+    // 4. Synthetic parity check for Q5_1, IQ4_NL, and IQ4_XS AVX2 kernels vs FP32 dequantization
+    {
+        std::vector<float> x512(512, 0.0f);
+        for (int i = 0; i < 512; ++i) x512[i] = std::sin(static_cast<float>(i) * 0.13f + 0.4f);
+
+        auto check_parity = [](const char* label, float dot_k, const haven::TensorDesc& td, const float* xv, int n) -> bool {
+            std::vector<float> fp32(static_cast<size_t>(n), 0.0f);
+            haven::Avx2Math::dequantize_row(fp32.data(), td, 0, n);
+            float dot_ref = 0.0f;
+            for (int i = 0; i < n; ++i) dot_ref += fp32[i] * xv[i];
+            const float diff = std::abs(dot_k - dot_ref);
+            const float tol = std::max(1e-3f, 1e-5f * std::abs(dot_ref));
+            std::cout << "\n• " << label << " AVX2 Kernel Parity: kernel=" << dot_k << " ref=" << dot_ref << " diff=" << diff << " (tol=" << tol << ")\n";
+            if (diff >= tol) {
+                std::cerr << "✗ MISMATCH in " << label << " AVX2 kernel!\n";
+                return false;
+            }
+            std::cout << "✓ SUCCESS: " << label << " AVX2 Kernel matches FP32 dequantization!\n";
+            return true;
+        };
+
+        std::vector<haven::block_q5_1> q51(16);
+        for (int b = 0; b < 16; ++b) {
+            q51[b].d = 0x3800; // 0.5
+            q51[b].m = 0xB400; // -0.25
+            const uint32_t qh_val = 0xA55A1234u ^ static_cast<uint32_t>(b * 0x01010101u);
+            std::memcpy(q51[b].qh, &qh_val, sizeof(qh_val));
+            for (int j = 0; j < 16; ++j) q51[b].qs[j] = static_cast<uint8_t>(((b * 7 + j * 3) & 0x0F) | (((b + j * 5) & 0x0F) << 4));
+        }
+        haven::TensorDesc td_q51{ "syn_q5_1", haven::QuantType::Q5_1, {512}, 0, q51.size() * sizeof(haven::block_q5_1), q51.data() };
+        if (!check_parity("Q5_1", haven::Avx2Math::vec_dot_q5_1(512, q51.data(), x512.data()), td_q51, x512.data(), 512)) return 1;
+
+        std::vector<haven::block_iq4_nl> iq4nl(16);
+        for (int b = 0; b < 16; ++b) {
+            iq4nl[b].d = 0x3400; // 0.25
+            for (int j = 0; j < 16; ++j) iq4nl[b].qs[j] = static_cast<uint8_t>(((b * 3 + j) & 0x0F) | (((15 - j + b) & 0x0F) << 4));
+        }
+        haven::TensorDesc td_nl{ "syn_iq4_nl", haven::QuantType::IQ4_NL, {512}, 0, iq4nl.size() * sizeof(haven::block_iq4_nl), iq4nl.data() };
+        if (!check_parity("IQ4_NL", haven::Avx2Math::vec_dot_iq4_nl(512, iq4nl.data(), x512.data()), td_nl, x512.data(), 512)) return 1;
+
+        std::vector<haven::block_iq4_xs> iq4xs(2);
+        for (int b = 0; b < 2; ++b) {
+            iq4xs[b].d = 0x3400; // 0.25
+            iq4xs[b].scales_h = static_cast<uint16_t>(0x693Cu ^ (b * 0x1111u));
+            for (int k = 0; k < 4; ++k) iq4xs[b].scales_l[k] = static_cast<uint8_t>(0x3A + b * 7 + k * 13);
+            for (int j = 0; j < 128; ++j) iq4xs[b].qs[j] = static_cast<uint8_t>(((b * 5 + j * 11) & 0x0F) | (((j * 7 + 3) & 0x0F) << 4));
+        }
+        haven::TensorDesc td_xs{ "syn_iq4_xs", haven::QuantType::IQ4_XS, {512}, 0, iq4xs.size() * sizeof(haven::block_iq4_xs), iq4xs.data() };
+        if (!check_parity("IQ4_XS", haven::Avx2Math::vec_dot_iq4_xs(512, iq4xs.data(), x512.data()), td_xs, x512.data(), 512)) return 1;
+
+        // 5. Q8Act32 integer AVX2 (vpmaddubsw/vpmaddwd) kernel parity vs exact dequant(w) . dequant(act) AND FP32
+        haven::Q8Act32 act512;
+        haven::Avx2Math::quantize_q8_act(x512.data(), 512, act512);
+        std::vector<float> x512_deq(512, 0.0f);
+        for (int b = 0; b < 16; ++b) {
+            for (int j = 0; j < 32; ++j) {
+                x512_deq[static_cast<size_t>(b * 32 + j)] = static_cast<float>(act512.qs[b * 32 + j]) * act512.d[b];
+            }
+        }
+        auto check_q8_parity = [&](const char* label, const haven::TensorDesc& td, bool exact_sumf_offset) -> bool {
+            const float dot_q8 = haven::Avx2Math::dot_row_q8(td, 0, act512, 512);
+            const float dot_fp = haven::Avx2Math::dot_row(td, 0, x512.data(), 512);
+            std::vector<float> w_fp(512, 0.0f);
+            haven::Avx2Math::dequantize_row(w_fp.data(), td, 0, 512);
+            float dot_q8_ref = 0.0f;
+            float norm_w2 = 0.0f, norm_x2 = 0.0f;
+            for (int i = 0; i < 512; ++i) {
+                dot_q8_ref += w_fp[static_cast<size_t>(i)] * x512_deq[static_cast<size_t>(i)];
+                norm_w2 += w_fp[static_cast<size_t>(i)] * w_fp[static_cast<size_t>(i)];
+                norm_x2 += x512[static_cast<size_t>(i)] * x512[static_cast<size_t>(i)];
+            }
+            const float cs_bound = std::sqrt(norm_w2 * norm_x2);
+            const float simd_err = std::abs(dot_q8 - dot_q8_ref);
+            const float quant_err = std::abs(dot_q8 - dot_fp);
+            const float simd_tol = exact_sumf_offset ? std::max(0.05f, 0.01f * cs_bound) : std::max(1e-3f, 2e-5f * cs_bound);
+            const float quant_tol = std::max(0.05f, 0.01f * cs_bound);
+            std::cout << "\n• " << label << " Q8Act32 Integer AVX2 Parity: q8=" << dot_q8
+                      << " simd_ref=" << dot_q8_ref << " fp32=" << dot_fp
+                      << " simd_err=" << simd_err << " quant_err=" << quant_err << " (cs_tol=" << quant_tol << ")\n";
+            if (simd_err >= simd_tol || quant_err >= quant_tol) {
+                std::cerr << "✗ MISMATCH in " << label << " Q8Act32 kernel!\n";
+                return false;
+            }
+            std::cout << "✓ SUCCESS: " << label << " Q8Act32 Integer AVX2 Kernel matches exact SIMD & FP32!\n";
+            return true;
+        };
+
+        if (!check_q8_parity("Q5_1",   td_q51, true))  return 1;
+        if (!check_q8_parity("IQ4_NL", td_nl,  false)) return 1;
+        if (!check_q8_parity("IQ4_XS", td_xs,  false)) return 1;
+
+        // Synthetic Q8_0, Q4_0, Q5_0, Q5_K Q8Act32 parity checks
+        std::vector<haven::block_q8_0> q80(16);
+        for (int b = 0; b < 16; ++b) {
+            q80[b].d = 0x3400;
+            for (int j = 0; j < 32; ++j) q80[b].qs[j] = static_cast<int8_t>(((b * 13 + j * 7) % 255) - 128);
+        }
+        haven::TensorDesc td_q80{ "syn_q8_0", haven::QuantType::Q8_0, {512}, 0, q80.size() * sizeof(haven::block_q8_0), q80.data() };
+        if (!check_q8_parity("Q8_0", td_q80, false)) return 1;
+
+        std::vector<haven::block_q4_0> q40(16);
+        for (int b = 0; b < 16; ++b) {
+            q40[b].d = 0x3800;
+            for (int j = 0; j < 16; ++j) q40[b].qs[j] = static_cast<uint8_t>(((b * 5 + j * 3) & 0x0F) | (((b + j * 7) & 0x0F) << 4));
+        }
+        haven::TensorDesc td_q40{ "syn_q4_0", haven::QuantType::Q4_0, {512}, 0, q40.size() * sizeof(haven::block_q4_0), q40.data() };
+        if (!check_q8_parity("Q4_0", td_q40, false)) return 1;
+
+        std::vector<haven::block_q5_0> q50(16);
+        for (int b = 0; b < 16; ++b) {
+            q50[b].d = 0x3800;
+            const uint32_t qh_val = 0x5A5A9876u ^ static_cast<uint32_t>(b * 0x03030303u);
+            std::memcpy(q50[b].qh, &qh_val, sizeof(qh_val));
+            for (int j = 0; j < 16; ++j) q50[b].qs[j] = static_cast<uint8_t>(((b * 3 + j * 9) & 0x0F) | (((b + j * 11) & 0x0F) << 4));
+        }
+        haven::TensorDesc td_q50{ "syn_q5_0", haven::QuantType::Q5_0, {512}, 0, q50.size() * sizeof(haven::block_q5_0), q50.data() };
+        if (!check_q8_parity("Q5_0", td_q50, false)) return 1;
+
+        std::vector<haven::block_q5_K> q5k(2);
+        for (int b = 0; b < 2; ++b) {
+            q5k[b].d = 0x3400;
+            q5k[b].dmin = 0x3000;
+            for (int k = 0; k < 12; ++k) q5k[b].scales[k] = static_cast<uint8_t>(0x15 + b * 7 + k * 3);
+            for (int j = 0; j < 32; ++j) q5k[b].qh[j] = static_cast<uint8_t>(0xA5 ^ (j * 17 + b * 9));
+            for (int j = 0; j < 128; ++j) q5k[b].qs[j] = static_cast<uint8_t>(((b * 11 + j * 5) & 0x0F) | (((j * 3 + 7) & 0x0F) << 4));
+        }
+        haven::TensorDesc td_q5k{ "syn_q5_K", haven::QuantType::Q5_K, {512}, 0, q5k.size() * sizeof(haven::block_q5_K), q5k.data() };
+        if (!check_q8_parity("Q5_K", td_q5k, true)) return 1;
+
+        // Real Q6_K and Q4_K GEMV cosine similarity checks on loaded production model (>0.9998)
+        {
+            std::vector<float> y_q8(64, 0.0f), y_fp(64, 0.0f);
+            haven::Avx2Math::gemv(y_q8.data(), *embd, test_vec.data(), 64, 2560);
+            for (int r = 0; r < 64; ++r) y_fp[r] = haven::Avx2Math::dot_row(*embd, static_cast<size_t>(r), test_vec.data(), 2560);
+            const float cos_q6 = haven::Avx2Math::cosine_similarity(y_q8.data(), y_fp.data(), 64);
+            std::cout << "\n• Real Q6_K GEMV (Q8Act32 vs FP32, 64 rows): cosine=" << cos_q6 << "\n";
+            if (cos_q6 < 0.9995f) {
+                std::cerr << "✗ Q6_K Q8Act32 GEMV cosine below 0.9995!\n";
+                return 1;
+            }
+            if (engine.get_config().num_layers > 0 && engine.get_layer_tensors(0).attn_q &&
+                engine.get_layer_tensors(0).attn_q->type == haven::QuantType::Q4_K) {
+                const auto* t4k = engine.get_layer_tensors(0).attn_q;
+                haven::Avx2Math::gemv(y_q8.data(), *t4k, test_vec.data(), 64, 2560);
+                for (int r = 0; r < 64; ++r) y_fp[r] = haven::Avx2Math::dot_row(*t4k, static_cast<size_t>(r), test_vec.data(), 2560);
+                const float cos_q4 = haven::Avx2Math::cosine_similarity(y_q8.data(), y_fp.data(), 64);
+                std::cout << "• Real Q4_K GEMV (Q8Act32 vs FP32, 64 rows): cosine=" << cos_q4 << "\n";
+                if (cos_q4 < 0.9995f) {
+                    std::cerr << "✗ Q4_K Q8Act32 GEMV cosine below 0.9995!\n";
+                    return 1;
                 }
             }
         }

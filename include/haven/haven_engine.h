@@ -243,6 +243,7 @@ private:
     std::vector<float> moe_gate_up_scratch_;
     std::vector<float> moe_exp_down_scratch_;
     std::vector<float> moe_accum_scratch_;
+    std::vector<Q8Act32> moe_exp_acts_;
     std::vector<float> logits_scratch_;
     std::vector<float> inv_freqs_;
     std::vector<float> attn_scores_scratch_;

@@ -8,6 +8,27 @@
 
 namespace haven {
 
+// Cache-aligned 32-element INT8 activation buffer for high-throughput AVX2 vpmaddubsw/vpmaddwd GEMV
+// Stack-backed up to 16,384 elements (512 blocks) for zero heap allocations on the hot inference path.
+struct Q8Act32 {
+    static constexpr int MAX_STACK_BLOCKS = 512;
+    alignas(32) int8_t  qs_stack[MAX_STACK_BLOCKS * 32];
+    alignas(32) float   d_stack[MAX_STACK_BLOCKS];
+    alignas(32) float   sumf_stack[MAX_STACK_BLOCKS];
+    alignas(32) int16_t bsum_stack[MAX_STACK_BLOCKS * 2];
+
+    std::vector<int8_t>  qs_heap;
+    std::vector<float>   d_heap;
+    std::vector<float>   sumf_heap;
+    std::vector<int16_t> bsum_heap;
+
+    int8_t*  qs   = qs_stack;
+    float*   d    = d_stack;
+    float*   sumf = sumf_stack;
+    int16_t* bsum = bsum_stack;
+    int nb = 0;
+};
+
 class Avx2Math {
 public:
     // Convert FP16 uint16_t to float using hardware native F16C SIMD instruction (MSVC/GCC/Clang portable)
@@ -97,6 +118,24 @@ public:
 
     // Matrix-Vector Multiplication on a contiguous row slice (e.g. expert e inside 3D [cols, rows, E] tensor)
     static void gemv_slice(float* y, const TensorDesc& weight, size_t row_offset, const float* x, int rows, int cols);
+
+    // Single-row quantized/float dot product for fused parallel callers (no internal OpenMP fork)
+    static float dot_row(const TensorDesc& weight, size_t row, const float* x, int cols);
+
+    // Pre-quantize FP32 activation vector into 32-element dynamic-scale Q8Act32 blocks for integer AVX2 GEMV
+    static void quantize_q8_act(const float* x, int cols, Q8Act32& out);
+
+    // Function pointer type for branch-free per-row integer AVX2 dot product against pre-quantized Q8Act32
+    using DotRowQ8Fn = float (*)(const void* data, size_t row, const Q8Act32& act, int cols);
+
+    // Returns integer AVX2 Q8Act32 row-dot kernel if supported & `cols` is block-aligned, else nullptr
+    static DotRowQ8Fn get_dot_row_q8_fn(QuantType type, int cols);
+
+    // Single-row integer AVX2 dot product against pre-quantized Q8Act32 (falls back to 0 if unsupported)
+    static float dot_row_q8(const TensorDesc& weight, size_t row, const Q8Act32& act, int cols);
+
+    // Exact byte stride for one row of `cols` elements (0 if unsupported)
+    static size_t row_bytes(QuantType type, int cols);
 
     // Bare-metal AVX2 Vector Norm: sqrt(sum(x^2))
     static float vector_norm(const float* x, int size);

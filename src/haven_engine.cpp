@@ -136,9 +136,10 @@ bool HavenEngine::load_model(const std::string& gguf_filepath) {
     ffn_down_scratch_.resize(cfg.embedding_dim, 0.0f);
     if (cfg.expert_count > 0) {
         const uint32_t exp_ff = (cfg.expert_ffn_dim > 0) ? cfg.expert_ffn_dim : cfg.hidden_dim;
+        const uint32_t k_exp = (cfg.expert_used_count > 0) ? cfg.expert_used_count : 8u;
         moe_router_scratch_.resize(cfg.expert_count, 0.0f);
         moe_norm_scratch_.resize(cfg.embedding_dim, 0.0f);
-        moe_gate_up_scratch_.resize(static_cast<size_t>(exp_ff) * 2ULL, 0.0f);
+        moe_gate_up_scratch_.resize(static_cast<size_t>(k_exp) * static_cast<size_t>(exp_ff) * 2ULL, 0.0f);
         moe_exp_down_scratch_.resize(cfg.embedding_dim, 0.0f);
         moe_accum_scratch_.resize(cfg.embedding_dim, 0.0f);
     }
@@ -227,9 +228,10 @@ bool HavenEngine::load_model(const std::string& gguf_filepath) {
     ffn_down_scratch_.resize(cfg.embedding_dim, 0.0f);
     if (cfg.expert_count > 0) {
         const uint32_t exp_ff = (cfg.expert_ffn_dim > 0) ? cfg.expert_ffn_dim : cfg.hidden_dim;
+        const uint32_t k_exp = (cfg.expert_used_count > 0) ? cfg.expert_used_count : 8u;
         moe_router_scratch_.resize(cfg.expert_count, 0.0f);
         moe_norm_scratch_.resize(cfg.embedding_dim, 0.0f);
-        moe_gate_up_scratch_.resize(static_cast<size_t>(exp_ff) * 2ULL, 0.0f);
+        moe_gate_up_scratch_.resize(static_cast<size_t>(k_exp) * static_cast<size_t>(exp_ff) * 2ULL, 0.0f);
         moe_exp_down_scratch_.resize(cfg.embedding_dim, 0.0f);
         moe_accum_scratch_.resize(cfg.embedding_dim, 0.0f);
     }
@@ -406,11 +408,23 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         }
     }
 
-    // 1b. Mix in Multimodal Sensory Token Vectors (Vision + Audio Mel-Spectrum)
-    auto sensory_vec = sensory_bridge_.project_sensory_tokens(cfg.embedding_dim);
-    for (size_t i = 0; i < cfg.embedding_dim; ++i) {
-        embedding_scratch_[i] += sensory_vec[i];
+    // 1b. Mix in Multimodal Sensory Token Vectors (Vision + Audio Mel-Spectrum) — zero alloc when empty
+    if (sensory_bridge_.get_visual_frame_count() > 0 || sensory_bridge_.get_audio_frame_count() > 0) {
+        auto sensory_vec = sensory_bridge_.project_sensory_tokens(cfg.embedding_dim);
+        for (size_t i = 0; i < cfg.embedding_dim; ++i) {
+            embedding_scratch_[i] += sensory_vec[i];
+        }
     }
+
+    auto tensor_fits_rows = [](const TensorDesc* t, size_t total_rows, int cols) -> bool {
+        if (!t || !t->data || cols <= 0) return false;
+        if (t->size_bytes == 0) return true;
+        const size_t rb = Avx2Math::row_bytes(t->type, cols);
+        return rb > 0 && total_rows <= (t->size_bytes / rb);
+    };
+
+    const int D_emb = static_cast<int>(cfg.embedding_dim);
+    const int F_hid = static_cast<int>(cfg.hidden_dim);
 
     // 2. Transformer Layer Loop
     for (uint32_t l = 0; l < cfg.num_layers; ++l) {
@@ -433,31 +447,83 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
 
         // 2a. Pre-Attention RMSNorm
         const float* attn_norm_w = safe_f32_weights(lt.attn_norm, cfg.embedding_dim);
-        Avx2Math::rms_norm(norm_scratch_.data(), embedding_scratch_.data(), attn_norm_w, cfg.embedding_dim, cfg.rms_norm_eps);
+        Avx2Math::rms_norm(norm_scratch_.data(), embedding_scratch_.data(), attn_norm_w, D_emb, cfg.rms_norm_eps);
 
-        // 2b. Q, K, V Projections (with Gemma 4 k_eq_v fallback when attn_v is omitted on global layers)
-        if (lt.attn_q) {
-            Avx2Math::gemv(q_scratch_.data(), *lt.attn_q, norm_scratch_.data(), q_dim, cfg.embedding_dim);
+        // Determine SWA & Shared-KV status BEFORE projecting K/V so shared-KV layers
+        // (e.g. Gemma 4 E4B blk.24..41 with shared_kv_layers=18) NEVER overwrite/use
+        // unused placeholder attn_k/v weights and skip wasted K/V GEMVs entirely!
+        const bool has_swa = (cfg.sliding_window > 0) && (cfg.is_gemma || cfg.architecture == "mistral");
+        const bool is_swa = (l < cfg.sliding_window_pattern.size())
+            ? cfg.sliding_window_pattern[l]
+            : (has_swa && (cfg.architecture == "mistral" || (l % 6 != 5)));
+        const bool is_shared_kv = (cfg.shared_kv_layers > 0 && cfg.shared_kv_layers < cfg.num_layers &&
+            l >= (cfg.num_layers - cfg.shared_kv_layers));
+        const bool has_kv = !is_shared_kv && (lt.attn_k != nullptr);
+        const TensorDesc* eff_k = has_kv ? lt.attn_k : nullptr;
+        const TensorDesc* eff_v = has_kv ? lt.attn_v : nullptr;
+
+        // 2b. Fused Q, K, V Projections (single Q8 quantization + single OpenMP region!)
+        const bool q_ok = tensor_fits_rows(lt.attn_q, static_cast<size_t>(q_dim), D_emb);
+        const bool k_ok = tensor_fits_rows(eff_k, static_cast<size_t>(kv_dim), D_emb);
+        const bool v_ok = tensor_fits_rows(eff_v, static_cast<size_t>(kv_dim), D_emb);
+        const Avx2Math::DotRowQ8Fn q_fn = q_ok ? Avx2Math::get_dot_row_q8_fn(lt.attn_q->type, D_emb) : nullptr;
+        const Avx2Math::DotRowQ8Fn k_fn = k_ok ? Avx2Math::get_dot_row_q8_fn(eff_k->type, D_emb) : nullptr;
+        const Avx2Math::DotRowQ8Fn v_fn = v_ok ? Avx2Math::get_dot_row_q8_fn(eff_v->type, D_emb) : nullptr;
+
+        if (q_ok && q_fn && (!eff_k || (k_ok && k_fn)) && (!eff_v || (v_ok && v_fn))) {
+            Q8Act32 qkv_act;
+            Avx2Math::quantize_q8_act(norm_scratch_.data(), D_emb, qkv_act);
+            const int n_k = eff_k ? kv_dim : 0;
+            const int n_v = eff_v ? kv_dim : 0;
+            const int total_qkv = q_dim + n_k + n_v;
+            const void* q_data = lt.attn_q->data;
+            const void* k_data = eff_k ? eff_k->data : nullptr;
+            const void* v_data = eff_v ? eff_v->data : nullptr;
+            #pragma omp parallel for schedule(static)
+            for (int idx = 0; idx < total_qkv; ++idx) {
+                if (idx < q_dim) {
+                    q_scratch_[static_cast<size_t>(idx)] = q_fn(q_data, static_cast<size_t>(idx), qkv_act, D_emb);
+                } else if (idx < q_dim + n_k) {
+                    const int r = idx - q_dim;
+                    k_scratch_[static_cast<size_t>(r)] = k_fn(k_data, static_cast<size_t>(r), qkv_act, D_emb);
+                } else {
+                    const int r = idx - q_dim - n_k;
+                    v_scratch_[static_cast<size_t>(r)] = v_fn(v_data, static_cast<size_t>(r), qkv_act, D_emb);
+                }
+            }
             if (lt.attn_q_bias) Avx2Math::add_bias(q_scratch_.data(), *lt.attn_q_bias, q_dim);
+            if (eff_k) {
+                if (lt.attn_k_bias) Avx2Math::add_bias(k_scratch_.data(), *lt.attn_k_bias, kv_dim);
+            }
+            if (eff_v) {
+                if (lt.attn_v_bias) Avx2Math::add_bias(v_scratch_.data(), *lt.attn_v_bias, kv_dim);
+            } else if (eff_k) {
+                std::memcpy(v_scratch_.data(), k_scratch_.data(), static_cast<size_t>(kv_dim) * sizeof(float));
+            }
         } else {
-            for (int i = 0; i < q_dim; ++i) q_scratch_[i] = norm_scratch_[i % cfg.embedding_dim];
-        }
+            if (lt.attn_q) {
+                Avx2Math::gemv(q_scratch_.data(), *lt.attn_q, norm_scratch_.data(), q_dim, D_emb);
+                if (lt.attn_q_bias) Avx2Math::add_bias(q_scratch_.data(), *lt.attn_q_bias, q_dim);
+            } else {
+                for (int i = 0; i < q_dim; ++i) q_scratch_[i] = norm_scratch_[i % cfg.embedding_dim];
+            }
 
-        if (lt.attn_k) {
-            Avx2Math::gemv(k_scratch_.data(), *lt.attn_k, norm_scratch_.data(), kv_dim, cfg.embedding_dim);
-            if (lt.attn_k_bias) Avx2Math::add_bias(k_scratch_.data(), *lt.attn_k_bias, kv_dim);
-        } else {
-            for (int i = 0; i < kv_dim; ++i) k_scratch_[i] = norm_scratch_[i % cfg.embedding_dim];
-        }
+            if (eff_k) {
+                Avx2Math::gemv(k_scratch_.data(), *eff_k, norm_scratch_.data(), kv_dim, D_emb);
+                if (lt.attn_k_bias) Avx2Math::add_bias(k_scratch_.data(), *lt.attn_k_bias, kv_dim);
+            } else if (!is_shared_kv) {
+                for (int i = 0; i < kv_dim; ++i) k_scratch_[i] = norm_scratch_[i % cfg.embedding_dim];
+            }
 
-        if (lt.attn_v) {
-            Avx2Math::gemv(v_scratch_.data(), *lt.attn_v, norm_scratch_.data(), kv_dim, cfg.embedding_dim);
-            if (lt.attn_v_bias) Avx2Math::add_bias(v_scratch_.data(), *lt.attn_v_bias, kv_dim);
-        } else if (lt.attn_k) {
-            // Gemma 4 k_eq_v: V shares raw K projection prior to K-norm and RoPE
-            std::memcpy(v_scratch_.data(), k_scratch_.data(), static_cast<size_t>(kv_dim) * sizeof(float));
-        } else {
-            for (int i = 0; i < kv_dim; ++i) v_scratch_[i] = norm_scratch_[i % cfg.embedding_dim];
+            if (eff_v) {
+                Avx2Math::gemv(v_scratch_.data(), *eff_v, norm_scratch_.data(), kv_dim, D_emb);
+                if (lt.attn_v_bias) Avx2Math::add_bias(v_scratch_.data(), *lt.attn_v_bias, kv_dim);
+            } else if (eff_k) {
+                // Gemma 4 k_eq_v: V shares raw K projection prior to K-norm and RoPE
+                std::memcpy(v_scratch_.data(), k_scratch_.data(), static_cast<size_t>(kv_dim) * sizeof(float));
+            } else if (!is_shared_kv) {
+                for (int i = 0; i < kv_dim; ++i) v_scratch_[i] = norm_scratch_[i % cfg.embedding_dim];
+            }
         }
 
         // 2b-2. Gemma 2 / 4 Per-Head Q-Norm, K-Norm, and V-Norm
@@ -468,14 +534,14 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
                 Avx2Math::rms_norm(q_h, q_h, q_norm_w, actual_head_dim, cfg.rms_norm_eps);
             }
         }
-        if (lt.attn_k_norm) {
+        if (has_kv && lt.attn_k_norm) {
             const float* k_norm_w = safe_f32_weights(lt.attn_k_norm, static_cast<size_t>(actual_head_dim));
             for (uint32_t h = 0; h < layer_n_kv_heads; ++h) {
                 float* k_h = k_scratch_.data() + h * actual_head_dim;
                 Avx2Math::rms_norm(k_h, k_h, k_norm_w, actual_head_dim, cfg.rms_norm_eps);
             }
         }
-        if (cfg.is_gemma && lt.attn_q_norm && lt.attn_k_norm) {
+        if (has_kv && cfg.is_gemma && lt.attn_q_norm && lt.attn_k_norm) {
             for (uint32_t h = 0; h < layer_n_kv_heads; ++h) {
                 float* v_h = v_scratch_.data() + h * actual_head_dim;
                 Avx2Math::rms_norm(v_h, v_h, default_norm_weights_.data(), actual_head_dim, cfg.rms_norm_eps);
@@ -483,10 +549,6 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         }
 
         // 2c. RoPE Rotary Embeddings
-        bool has_swa = (cfg.sliding_window > 0) && (cfg.is_gemma || cfg.architecture == "mistral");
-        bool is_swa = (l < cfg.sliding_window_pattern.size())
-            ? cfg.sliding_window_pattern[l]
-            : (has_swa && (cfg.architecture == "mistral" || (l % 6 != 5)));
         float layer_freq_base = is_swa ? cfg.rope_freq_base_swa : cfg.rope_freq_base;
         int rope_dim = actual_head_dim;
         const float* freq_factors_w = (!is_swa && rope_freqs_tensor_ && rope_freqs_tensor_->type == QuantType::F32 &&
@@ -494,7 +556,6 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
             ? reinterpret_cast<const float*>(rope_freqs_tensor_->data) : nullptr;
 
         uint32_t kv_source_layer = l;
-        bool has_kv = (lt.attn_k != nullptr);
         if (!has_kv) {
             if (cfg.num_layers > 20 && cfg.shared_kv_layers > 0 && cfg.shared_kv_layers < cfg.num_layers) {
                 uint32_t n_kv_start = cfg.num_layers - cfg.shared_kv_layers;
@@ -534,7 +595,7 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         const float* layer_v = kv_lay.values.data();
 
         const int num_heads_i = static_cast<int>(cfg.num_heads);
-        #pragma omp parallel for schedule(static)
+        #pragma omp parallel for if(active_attn_len >= 64) schedule(static)
         for (int h = 0; h < num_heads_i; ++h) {
             const float* q_h = q_scratch_.data() + static_cast<size_t>(h) * static_cast<size_t>(actual_head_dim);
             const uint32_t kv_head_idx = std::min(static_cast<uint32_t>(h / gqa_ratio), std::max(1u, layer_n_kv_heads) - 1);
@@ -582,33 +643,74 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         const float* ffn_norm_w = safe_f32_weights(lt.ffn_norm, cfg.embedding_dim);
         Avx2Math::rms_norm(norm_scratch_.data(), embedding_scratch_.data(), ffn_norm_w, cfg.embedding_dim, cfg.rms_norm_eps);
 
-        // 2h + 2i. FFN Gate/Up/Activation/Down (Fused TPU MXU GeGLU when offload active, else AVX2 CPU)
+        // 2h + 2i. FFN Gate/Up/Activation/Down (Fused TPU MXU GeGLU when offload active, else Fused Integer AVX2 CPU)
         if (tpu_offload_active_ && tpu_backend_ && l < tpu_layers_.size() && tpu_layers_[l].has_ffn &&
             tpu_backend_->fused_geglu_ffn(norm_scratch_.data(), 1,
                                           tpu_layers_[l].ffn_gate, tpu_layers_[l].ffn_up, tpu_layers_[l].ffn_down,
                                           ffn_down_scratch_.data())) {
             // Computed directly on TPU HBM3 + MXU systolic array
         } else {
-            if (lt.ffn_gate && lt.ffn_up) {
-                Avx2Math::gemv(ffn_gate_scratch_.data(), *lt.ffn_gate, norm_scratch_.data(), cfg.hidden_dim, cfg.embedding_dim);
-                Avx2Math::gemv(ffn_up_scratch_.data(), *lt.ffn_up, norm_scratch_.data(), cfg.hidden_dim, cfg.embedding_dim);
-                if (cfg.ffn_activation == FfnActivation::GELU) {
-                    Avx2Math::gelu(ffn_gate_scratch_.data(), cfg.hidden_dim);
-                } else {
-                    Avx2Math::silu(ffn_gate_scratch_.data(), cfg.hidden_dim);
-                }
-                for (size_t i = 0; i < cfg.hidden_dim; ++i) {
-                    ffn_gate_scratch_[i] *= ffn_up_scratch_[i];
-                }
-            } else {
-                for (size_t i = 0; i < cfg.hidden_dim; ++i) ffn_gate_scratch_[i] = norm_scratch_[i % cfg.embedding_dim] * 0.1f;
-            }
+            const bool ffn_g_ok = tensor_fits_rows(lt.ffn_gate, static_cast<size_t>(F_hid), D_emb);
+            const bool ffn_u_ok = tensor_fits_rows(lt.ffn_up,   static_cast<size_t>(F_hid), D_emb);
+            const bool ffn_d_ok = tensor_fits_rows(lt.ffn_down, static_cast<size_t>(D_emb), F_hid);
+            const Avx2Math::DotRowQ8Fn ffn_g_fn = ffn_g_ok ? Avx2Math::get_dot_row_q8_fn(lt.ffn_gate->type, D_emb) : nullptr;
+            const Avx2Math::DotRowQ8Fn ffn_u_fn = ffn_u_ok ? Avx2Math::get_dot_row_q8_fn(lt.ffn_up->type,   D_emb) : nullptr;
+            const Avx2Math::DotRowQ8Fn ffn_d_fn = ffn_d_ok ? Avx2Math::get_dot_row_q8_fn(lt.ffn_down->type, F_hid) : nullptr;
 
-            // 2i. FFN Down Projection
-            if (lt.ffn_down) {
-                Avx2Math::gemv(ffn_down_scratch_.data(), *lt.ffn_down, ffn_gate_scratch_.data(), cfg.embedding_dim, cfg.hidden_dim);
+            if (ffn_g_fn && ffn_u_fn && ffn_d_fn) {
+                Q8Act32 ffn_in_act;
+                Q8Act32 ffn_mid_act;
+                Avx2Math::quantize_q8_act(norm_scratch_.data(), D_emb, ffn_in_act);
+                const bool use_gelu = (cfg.ffn_activation == FfnActivation::GELU);
+                const void* g_data = lt.ffn_gate->data;
+                const void* u_data = lt.ffn_up->data;
+                const void* d_data = lt.ffn_down->data;
+
+                // Single fused OpenMP region for Gate + Up + GeGLU/SiLU + Down!
+                #pragma omp parallel
+                {
+                    #pragma omp for schedule(static)
+                    for (int r = 0; r < F_hid; ++r) {
+                        const float g = ffn_g_fn(g_data, static_cast<size_t>(r), ffn_in_act, D_emb);
+                        const float u = ffn_u_fn(u_data, static_cast<size_t>(r), ffn_in_act, D_emb);
+                        const float act = use_gelu
+                            ? (0.5f * g * (1.0f + std::tanh(0.7978845608f * (g + 0.044715f * g * g * g))))
+                            : (g / (1.0f + std::exp(-g)));
+                        ffn_gate_scratch_[static_cast<size_t>(r)] = act * u;
+                    }
+
+                    #pragma omp single
+                    {
+                        Avx2Math::quantize_q8_act(ffn_gate_scratch_.data(), F_hid, ffn_mid_act);
+                    }
+
+                    #pragma omp for schedule(static)
+                    for (int r = 0; r < D_emb; ++r) {
+                        ffn_down_scratch_[static_cast<size_t>(r)] = ffn_d_fn(d_data, static_cast<size_t>(r), ffn_mid_act, F_hid);
+                    }
+                }
             } else {
-                for (size_t i = 0; i < cfg.embedding_dim; ++i) ffn_down_scratch_[i] = ffn_gate_scratch_[i % cfg.hidden_dim] * 0.05f;
+                if (lt.ffn_gate && lt.ffn_up) {
+                    Avx2Math::gemv(ffn_gate_scratch_.data(), *lt.ffn_gate, norm_scratch_.data(), F_hid, D_emb);
+                    Avx2Math::gemv(ffn_up_scratch_.data(), *lt.ffn_up, norm_scratch_.data(), F_hid, D_emb);
+                    if (cfg.ffn_activation == FfnActivation::GELU) {
+                        Avx2Math::gelu(ffn_gate_scratch_.data(), F_hid);
+                    } else {
+                        Avx2Math::silu(ffn_gate_scratch_.data(), F_hid);
+                    }
+                    for (size_t i = 0; i < cfg.hidden_dim; ++i) {
+                        ffn_gate_scratch_[i] *= ffn_up_scratch_[i];
+                    }
+                } else {
+                    for (size_t i = 0; i < cfg.hidden_dim; ++i) ffn_gate_scratch_[i] = norm_scratch_[i % cfg.embedding_dim] * 0.1f;
+                }
+
+                // 2i. FFN Down Projection
+                if (lt.ffn_down) {
+                    Avx2Math::gemv(ffn_down_scratch_.data(), *lt.ffn_down, ffn_gate_scratch_.data(), D_emb, F_hid);
+                } else {
+                    for (size_t i = 0; i < cfg.embedding_dim; ++i) ffn_down_scratch_[i] = ffn_gate_scratch_[i % cfg.hidden_dim] * 0.05f;
+                }
             }
         }
 
@@ -617,7 +719,7 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
             // Post-norm 1 on shared dense MLP branch before combining with MoE branch
             if (lt.post_ffw_norm_1) {
                 const float* p1_w = safe_f32_weights(lt.post_ffw_norm_1, cfg.embedding_dim);
-                Avx2Math::rms_norm(ffn_down_scratch_.data(), ffn_down_scratch_.data(), p1_w, cfg.embedding_dim, cfg.rms_norm_eps);
+                Avx2Math::rms_norm(ffn_down_scratch_.data(), ffn_down_scratch_.data(), p1_w, D_emb, cfg.rms_norm_eps);
             }
 
             const int E = static_cast<int>(cfg.expert_count);
@@ -625,69 +727,222 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
             const int F_exp = static_cast<int>(cfg.expert_ffn_dim > 0 ? cfg.expert_ffn_dim : cfg.hidden_dim);
 
             // Router input: parameter-free RMSNorm(attn_out) * (1 / sqrt(D)) * ffn_gate_inp.scale
-            Avx2Math::rms_norm(moe_norm_scratch_.data(), embedding_scratch_.data(), default_norm_weights_.data(), cfg.embedding_dim, cfg.rms_norm_eps);
+            Avx2Math::rms_norm(moe_norm_scratch_.data(), embedding_scratch_.data(), default_norm_weights_.data(), D_emb, cfg.rms_norm_eps);
             const float inv_sqrt_d = 1.0f / std::sqrt(static_cast<float>(cfg.embedding_dim));
             const float* rscale = lt.ffn_gate_inp_scale ? safe_f32_weights(lt.ffn_gate_inp_scale, cfg.embedding_dim) : nullptr;
             for (size_t i = 0; i < cfg.embedding_dim; ++i) {
                 moe_norm_scratch_[i] *= inv_sqrt_d * (rscale ? rscale[i] : 1.0f);
             }
-            Avx2Math::gemv(moe_router_scratch_.data(), *lt.ffn_gate_inp, moe_norm_scratch_.data(), E, cfg.embedding_dim);
+            Avx2Math::gemv(moe_router_scratch_.data(), *lt.ffn_gate_inp, moe_norm_scratch_.data(), E, D_emb);
             Avx2Math::softmax(moe_router_scratch_.data(), E);
 
-            // Top-K expert selection & renormalization
-            std::vector<int> exp_idx(static_cast<size_t>(E));
-            for (int e = 0; e < E; ++e) exp_idx[static_cast<size_t>(e)] = e;
-            std::partial_sort(exp_idx.begin(), exp_idx.begin() + K_used, exp_idx.end(),
+            // Stack-backed Top-K expert selection & renormalization (zero heap alloc for E <= 256, K_used <= 64)
+            int exp_idx_stack[256];
+            std::vector<int> exp_idx_heap;
+            int* exp_idx = exp_idx_stack;
+            if (E > 256) {
+                exp_idx_heap.resize(static_cast<size_t>(E));
+                exp_idx = exp_idx_heap.data();
+            }
+            for (int e = 0; e < E; ++e) exp_idx[e] = e;
+            std::partial_sort(exp_idx, exp_idx + K_used, exp_idx + E,
                 [&](int a, int b) { return moe_router_scratch_[static_cast<size_t>(a)] > moe_router_scratch_[static_cast<size_t>(b)]; });
 
             float w_sum = 0.0f;
-            for (int k = 0; k < K_used; ++k) w_sum += moe_router_scratch_[static_cast<size_t>(exp_idx[static_cast<size_t>(k)])];
+            for (int k = 0; k < K_used; ++k) w_sum += moe_router_scratch_[static_cast<size_t>(exp_idx[k])];
             if (w_sum < 6.103515625e-5f) w_sum = 6.103515625e-5f;
 
             // Pre-FFN norm 2 on attn_out for sparse experts
             const float* pre2_w = safe_f32_weights(lt.pre_ffw_norm_2, cfg.embedding_dim);
-            Avx2Math::rms_norm(moe_norm_scratch_.data(), embedding_scratch_.data(), pre2_w, cfg.embedding_dim, cfg.rms_norm_eps);
+            Avx2Math::rms_norm(moe_norm_scratch_.data(), embedding_scratch_.data(), pre2_w, D_emb, cfg.rms_norm_eps);
 
             const float* down_s = lt.ffn_down_exps_scale ? safe_f32_weights(lt.ffn_down_exps_scale, static_cast<size_t>(E)) : nullptr;
-            std::fill(moe_accum_scratch_.begin(), moe_accum_scratch_.end(), 0.0f);
-
+            float w_exp_stack[64];
+            std::vector<float> w_exp_heap;
+            float* w_exp = w_exp_stack;
+            if (K_used > 64) {
+                w_exp_heap.resize(static_cast<size_t>(K_used), 0.0f);
+                w_exp = w_exp_heap.data();
+            }
             for (int k = 0; k < K_used; ++k) {
-                const int e = exp_idx[static_cast<size_t>(k)];
-                const float w_k = (moe_router_scratch_[static_cast<size_t>(e)] / w_sum) * (down_s ? down_s[e] : 1.0f);
+                const int e = exp_idx[k];
+                w_exp[k] = (moe_router_scratch_[static_cast<size_t>(e)] / w_sum) * (down_s ? down_s[e] : 1.0f);
+            }
 
+            const size_t gu_stride = static_cast<size_t>(K_used) * static_cast<size_t>(2 * F_exp);
+            if (moe_gate_up_scratch_.size() < gu_stride) {
+                moe_gate_up_scratch_.resize(gu_stride, 0.0f);
+            }
+
+            const int D_int = D_emb;
+            auto tensor_fits_expert = [](const TensorDesc* t, int e_idx, size_t exp_rows, int cols) -> bool {
+                if (!t || !t->data) return false;
+                if (t->size_bytes == 0) return true;
+                const size_t rb = Avx2Math::row_bytes(t->type, cols);
+                return rb > 0 && (static_cast<size_t>(e_idx) + 1ULL) * exp_rows <= (t->size_bytes / rb);
+            };
+
+            bool all_gu_valid = true;
+            bool all_dn_valid = true;
+            for (int k = 0; k < K_used; ++k) {
+                const int e = exp_idx[k];
                 if (lt.ffn_gate_up_exps) {
-                    Avx2Math::gemv_slice(moe_gate_up_scratch_.data(), *lt.ffn_gate_up_exps,
-                        static_cast<size_t>(e) * static_cast<size_t>(2 * F_exp),
-                        moe_norm_scratch_.data(), 2 * F_exp, cfg.embedding_dim);
+                    all_gu_valid &= tensor_fits_expert(lt.ffn_gate_up_exps, e, static_cast<size_t>(2 * F_exp), D_int);
                 } else {
-                    Avx2Math::gemv_slice(moe_gate_up_scratch_.data(), *lt.ffn_gate_exps,
-                        static_cast<size_t>(e) * static_cast<size_t>(F_exp),
-                        moe_norm_scratch_.data(), F_exp, cfg.embedding_dim);
-                    Avx2Math::gemv_slice(moe_gate_up_scratch_.data() + F_exp, *lt.ffn_up_exps,
-                        static_cast<size_t>(e) * static_cast<size_t>(F_exp),
-                        moe_norm_scratch_.data(), F_exp, cfg.embedding_dim);
+                    all_gu_valid &= tensor_fits_expert(lt.ffn_gate_exps, e, static_cast<size_t>(F_exp), D_int)
+                                 && tensor_fits_expert(lt.ffn_up_exps, e, static_cast<size_t>(F_exp), D_int);
+                }
+                all_dn_valid &= tensor_fits_expert(lt.ffn_down_exps, e, static_cast<size_t>(D_int), F_exp);
+            }
+
+            if (!all_gu_valid || !all_dn_valid) {
+                std::fill(moe_accum_scratch_.begin(), moe_accum_scratch_.end(), 0.0f);
+            } else {
+                const bool use_gelu = (cfg.ffn_activation == FfnActivation::GELU);
+                const int total_act = K_used * F_exp;
+                const int total_gu = K_used * 2 * F_exp;
+                const int two_F = 2 * F_exp;
+
+                const Avx2Math::DotRowQ8Fn gu_fn = lt.ffn_gate_up_exps
+                    ? Avx2Math::get_dot_row_q8_fn(lt.ffn_gate_up_exps->type, D_int) : nullptr;
+                const Avx2Math::DotRowQ8Fn g_exp_fn = (!lt.ffn_gate_up_exps && lt.ffn_gate_exps)
+                    ? Avx2Math::get_dot_row_q8_fn(lt.ffn_gate_exps->type, D_int) : nullptr;
+                const Avx2Math::DotRowQ8Fn u_exp_fn = (!lt.ffn_gate_up_exps && lt.ffn_up_exps)
+                    ? Avx2Math::get_dot_row_q8_fn(lt.ffn_up_exps->type, D_int) : nullptr;
+                const Avx2Math::DotRowQ8Fn dn_fn = Avx2Math::get_dot_row_q8_fn(lt.ffn_down_exps->type, F_exp);
+
+                const bool use_q8_gu = lt.ffn_gate_up_exps ? (gu_fn != nullptr) : (g_exp_fn != nullptr && u_exp_fn != nullptr);
+                const bool use_q8_dn = (dn_fn != nullptr);
+
+                Q8Act32 moe_in_act;
+                if (use_q8_gu) {
+                    Avx2Math::quantize_q8_act(moe_norm_scratch_.data(), D_int, moe_in_act);
                 }
 
-                if (cfg.ffn_activation == FfnActivation::GELU) {
-                    Avx2Math::gelu(moe_gate_up_scratch_.data(), F_exp);
-                } else {
-                    Avx2Math::silu(moe_gate_up_scratch_.data(), F_exp);
+                // Per-expert Q8 activations (pre-allocated scratch for zero per-layer heap allocs)
+                if (use_q8_dn && moe_exp_acts_.size() < static_cast<size_t>(K_used)) {
+                    moe_exp_acts_.resize(static_cast<size_t>(K_used));
                 }
-                for (int j = 0; j < F_exp; ++j) {
-                    moe_gate_up_scratch_[static_cast<size_t>(j)] *= moe_gate_up_scratch_[static_cast<size_t>(F_exp + j)];
-                }
+                Q8Act32* exp_acts = use_q8_dn ? moe_exp_acts_.data() : nullptr;
 
-                Avx2Math::gemv_slice(moe_exp_down_scratch_.data(), *lt.ffn_down_exps,
-                    static_cast<size_t>(e) * static_cast<size_t>(cfg.embedding_dim),
-                    moe_gate_up_scratch_.data(), cfg.embedding_dim, F_exp);
-                for (size_t i = 0; i < cfg.embedding_dim; ++i) {
-                    moe_accum_scratch_[i] += w_k * moe_exp_down_scratch_[i];
+                const void* gu_data = lt.ffn_gate_up_exps ? lt.ffn_gate_up_exps->data : nullptr;
+                const void* g_exp_data = lt.ffn_gate_exps ? lt.ffn_gate_exps->data : nullptr;
+                const void* u_exp_data = lt.ffn_up_exps ? lt.ffn_up_exps->data : nullptr;
+                const void* dn_data = lt.ffn_down_exps->data;
+
+                constexpr int DN_TILE = 64;
+                const int num_dn_tiles = (D_int + DN_TILE - 1) / DN_TILE;
+
+                // Fuse all K_used experts (Gate+Up, activation + Q8 quant, k-tiled Down + weighted sum) in one OpenMP region
+                #pragma omp parallel
+                {
+                    if (lt.ffn_gate_up_exps) {
+                        if (use_q8_gu) {
+                            #pragma omp for schedule(static)
+                            for (int idx = 0; idx < total_gu; ++idx) {
+                                const int k = idx / two_F;
+                                const int r = idx % two_F;
+                                const size_t row = static_cast<size_t>(exp_idx[k]) * static_cast<size_t>(two_F) + static_cast<size_t>(r);
+                                moe_gate_up_scratch_[static_cast<size_t>(idx)] = gu_fn(gu_data, row, moe_in_act, D_int);
+                            }
+                        } else {
+                            #pragma omp for schedule(static)
+                            for (int idx = 0; idx < total_gu; ++idx) {
+                                const int k = idx / two_F;
+                                const int r = idx % two_F;
+                                const size_t row = static_cast<size_t>(exp_idx[k]) * static_cast<size_t>(two_F) + static_cast<size_t>(r);
+                                moe_gate_up_scratch_[static_cast<size_t>(idx)] =
+                                    Avx2Math::dot_row(*lt.ffn_gate_up_exps, row, moe_norm_scratch_.data(), D_int);
+                            }
+                        }
+                    } else {
+                        if (use_q8_gu) {
+                            #pragma omp for schedule(static)
+                            for (int idx = 0; idx < total_act; ++idx) {
+                                const int k = idx / F_exp;
+                                const int r = idx % F_exp;
+                                const size_t row = static_cast<size_t>(exp_idx[k]) * static_cast<size_t>(F_exp) + static_cast<size_t>(r);
+                                float* base = moe_gate_up_scratch_.data() + static_cast<size_t>(k) * static_cast<size_t>(two_F);
+                                base[r]         = g_exp_fn(g_exp_data, row, moe_in_act, D_int);
+                                base[F_exp + r] = u_exp_fn(u_exp_data, row, moe_in_act, D_int);
+                            }
+                        } else {
+                            #pragma omp for schedule(static)
+                            for (int idx = 0; idx < total_act; ++idx) {
+                                const int k = idx / F_exp;
+                                const int r = idx % F_exp;
+                                const size_t row = static_cast<size_t>(exp_idx[k]) * static_cast<size_t>(F_exp) + static_cast<size_t>(r);
+                                float* base = moe_gate_up_scratch_.data() + static_cast<size_t>(k) * static_cast<size_t>(two_F);
+                                base[r]         = Avx2Math::dot_row(*lt.ffn_gate_exps, row, moe_norm_scratch_.data(), D_int);
+                                base[F_exp + r] = Avx2Math::dot_row(*lt.ffn_up_exps,   row, moe_norm_scratch_.data(), D_int);
+                            }
+                        }
+                    }
+
+                    // Fused per-expert activation + parallel per-expert Q8 quantization (all K_used experts in parallel!)
+                    #pragma omp for schedule(static)
+                    for (int k = 0; k < K_used; ++k) {
+                        float* base = moe_gate_up_scratch_.data() + static_cast<size_t>(k) * static_cast<size_t>(two_F);
+                        for (int j = 0; j < F_exp; ++j) {
+                            const float g = base[j];
+                            const float act = use_gelu
+                                ? (0.5f * g * (1.0f + std::tanh(0.7978845608f * (g + 0.044715f * g * g * g))))
+                                : (g / (1.0f + std::exp(-g)));
+                            base[j] = act * base[F_exp + j];
+                        }
+                        if (use_q8_dn) {
+                            Avx2Math::quantize_q8_act(base, F_exp, exp_acts[k]);
+                        }
+                    }
+
+                    // Cache-friendly k-tiled MoE Down: stream 64 contiguous rows per expert to lock L2 prefetchers
+                    if (use_q8_dn) {
+                        #pragma omp for schedule(static)
+                        for (int t = 0; t < num_dn_tiles; ++t) {
+                            const int rb = t * DN_TILE;
+                            const int r_end = std::min(D_int, rb + DN_TILE);
+                            float acc[DN_TILE];
+                            const int count = r_end - rb;
+                            for (int i = 0; i < count; ++i) acc[i] = 0.0f;
+                            for (int k = 0; k < K_used; ++k) {
+                                const float wk = w_exp[k];
+                                const Q8Act32& ak = exp_acts[k];
+                                const size_t base_r = static_cast<size_t>(exp_idx[k]) * static_cast<size_t>(D_int);
+                                for (int i = 0; i < count; ++i) {
+                                    acc[i] += wk * dn_fn(dn_data, base_r + static_cast<size_t>(rb + i), ak, F_exp);
+                                }
+                            }
+                            for (int i = 0; i < count; ++i) {
+                                moe_accum_scratch_[static_cast<size_t>(rb + i)] = acc[i];
+                            }
+                        }
+                    } else {
+                        #pragma omp for schedule(static)
+                        for (int t = 0; t < num_dn_tiles; ++t) {
+                            const int rb = t * DN_TILE;
+                            const int r_end = std::min(D_int, rb + DN_TILE);
+                            float acc[DN_TILE];
+                            const int count = r_end - rb;
+                            for (int i = 0; i < count; ++i) acc[i] = 0.0f;
+                            for (int k = 0; k < K_used; ++k) {
+                                const float wk = w_exp[k];
+                                const float* act_k = moe_gate_up_scratch_.data() + static_cast<size_t>(k) * static_cast<size_t>(two_F);
+                                const size_t base_r = static_cast<size_t>(exp_idx[k]) * static_cast<size_t>(D_int);
+                                for (int i = 0; i < count; ++i) {
+                                    acc[i] += wk * Avx2Math::dot_row(*lt.ffn_down_exps, base_r + static_cast<size_t>(rb + i), act_k, F_exp);
+                                }
+                            }
+                            for (int i = 0; i < count; ++i) {
+                                moe_accum_scratch_[static_cast<size_t>(rb + i)] = acc[i];
+                            }
+                        }
+                    }
                 }
             }
 
             if (lt.post_ffw_norm_2) {
                 const float* p2_w = safe_f32_weights(lt.post_ffw_norm_2, cfg.embedding_dim);
-                Avx2Math::rms_norm(moe_accum_scratch_.data(), moe_accum_scratch_.data(), p2_w, cfg.embedding_dim, cfg.rms_norm_eps);
+                Avx2Math::rms_norm(moe_accum_scratch_.data(), moe_accum_scratch_.data(), p2_w, D_emb, cfg.rms_norm_eps);
             }
             for (size_t i = 0; i < cfg.embedding_dim; ++i) {
                 ffn_down_scratch_[i] += moe_accum_scratch_[i];
@@ -705,19 +960,48 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
             embedding_scratch_[i] += ffn_down_scratch_[i];
         }
 
-        // 2-pleias. Per-Layer Token Injection (Google Pleias Branch)
+        // 2-pleias. Per-Layer Token Injection (Google Pleias Branch — fused single OpenMP region)
         if (lt.inp_gate && lt.proj && !per_layer_emb_scratch_.empty() && (static_cast<size_t>(l) + 1) * 256 <= per_layer_emb_scratch_.size()) {
             float pleias_gate[256] = {0};
-            Avx2Math::gemv(pleias_gate, *lt.inp_gate, embedding_scratch_.data(), 256, cfg.embedding_dim);
-            Avx2Math::gelu(pleias_gate, 256);
-
-            const float* layer_emb_slice = per_layer_emb_scratch_.data() + l * 256;
-            for (int i = 0; i < 256; ++i) {
-                pleias_gate[i] *= layer_emb_slice[i];
-            }
-
             float* pleias_proj = pleias_proj_scratch_.data();
-            Avx2Math::gemv(pleias_proj, *lt.proj, pleias_gate, cfg.embedding_dim, 256);
+            const float* layer_emb_slice = per_layer_emb_scratch_.data() + l * 256;
+
+            const bool ig_ok = tensor_fits_rows(lt.inp_gate, 256, D_emb);
+            const bool pr_ok = tensor_fits_rows(lt.proj, static_cast<size_t>(D_emb), 256);
+            const Avx2Math::DotRowQ8Fn ig_fn = ig_ok ? Avx2Math::get_dot_row_q8_fn(lt.inp_gate->type, D_emb) : nullptr;
+            const Avx2Math::DotRowQ8Fn pr_fn = pr_ok ? Avx2Math::get_dot_row_q8_fn(lt.proj->type, 256) : nullptr;
+
+            if (ig_fn && pr_fn) {
+                Q8Act32 pl_in_act;
+                Q8Act32 pl_mid_act;
+                Avx2Math::quantize_q8_act(embedding_scratch_.data(), D_emb, pl_in_act);
+                const void* ig_data = lt.inp_gate->data;
+                const void* pr_data = lt.proj->data;
+                #pragma omp parallel
+                {
+                    #pragma omp for schedule(static)
+                    for (int i = 0; i < 256; ++i) {
+                        const float g = ig_fn(ig_data, static_cast<size_t>(i), pl_in_act, D_emb);
+                        const float cdf = 0.5f * (1.0f + std::tanh(0.7978845608f * (g + 0.044715f * g * g * g)));
+                        pleias_gate[i] = (g * cdf) * layer_emb_slice[i];
+                    }
+                    #pragma omp single
+                    {
+                        Avx2Math::quantize_q8_act(pleias_gate, 256, pl_mid_act);
+                    }
+                    #pragma omp for schedule(static)
+                    for (int r = 0; r < D_emb; ++r) {
+                        pleias_proj[r] = pr_fn(pr_data, static_cast<size_t>(r), pl_mid_act, 256);
+                    }
+                }
+            } else {
+                Avx2Math::gemv(pleias_gate, *lt.inp_gate, embedding_scratch_.data(), 256, D_emb);
+                Avx2Math::gelu(pleias_gate, 256);
+                for (int i = 0; i < 256; ++i) {
+                    pleias_gate[i] *= layer_emb_slice[i];
+                }
+                Avx2Math::gemv(pleias_proj, *lt.proj, pleias_gate, D_emb, 256);
+            }
 
             if (lt.post_norm) {
                 const float* post_w = safe_f32_weights(lt.post_norm, cfg.embedding_dim);

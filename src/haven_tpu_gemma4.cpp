@@ -545,7 +545,9 @@ TpuModelSpec TpuModelSpec::from_model_config(const ModelConfig& mc, const HavenE
             bool is_swa = (static_cast<size_t>(l) < mc.sliding_window_pattern.size())
                 ? mc.sliding_window_pattern[static_cast<size_t>(l)]
                 : (has_swa_arch && (mc.architecture == "mistral" || (l % 6 != 5)));
-            bool has_kv = (lt.attn_k != nullptr);
+            bool is_shared_kv = (mc.shared_kv_layers > 0 && mc.shared_kv_layers < mc.num_layers &&
+                static_cast<uint32_t>(l) >= (mc.num_layers - mc.shared_kv_layers));
+            bool has_kv = !is_shared_kv && (lt.attn_k != nullptr);
             s.layer_is_swa[static_cast<size_t>(l)] = is_swa;
             s.layer_has_kv[static_cast<size_t>(l)] = has_kv;
 
