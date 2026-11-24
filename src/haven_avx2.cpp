@@ -2599,6 +2599,66 @@ void Avx2Math::gemm(float* Y, int stride_y, const TensorDesc& weight,
     gemm_slice(Y, stride_y, weight, 0, X, stride_x, n_tokens, rows, cols, true);
 }
 
+// AVX2 In-Place Orthonormal Block Fast Walsh-Hadamard Transform (self-inverse: H_B^2 = I_B)
+void Avx2Math::fwht_block_inplace(float* x, int n, int block_size) {
+    if (!x || n <= 0 || block_size < 8 || (block_size & (block_size - 1)) != 0 || (n % block_size) != 0) {
+        return;
+    }
+    const __m256 inv_sqrt_b = _mm256_set1_ps(1.0f / std::sqrt(static_cast<float>(block_size)));
+    const int n_blocks = n / block_size;
+
+    for (int blk = 0; blk < n_blocks; ++blk) {
+        float* base = x + static_cast<size_t>(blk) * static_cast<size_t>(block_size);
+
+        // Intra-register AVX2 butterfly stages: h = 1, 2, 4 (all 8 lanes in registers)
+        for (int i = 0; i < block_size; i += 8) {
+            __m256 v = _mm256_loadu_ps(base + i);
+            // h = 1: pairs (0,1), (2,3), (4,5), (6,7)
+            __m256 sw1 = _mm256_permute_ps(v, 0xB1);
+            v = _mm256_blend_ps(_mm256_add_ps(v, sw1), _mm256_sub_ps(sw1, v), 0xAA);
+            // h = 2: pairs (0,2), (1,3), (4,6), (5,7)
+            __m256 sw2 = _mm256_permute_ps(v, 0x4E);
+            v = _mm256_blend_ps(_mm256_add_ps(v, sw2), _mm256_sub_ps(sw2, v), 0xCC);
+            // h = 4: pairs (0..3, 4..7)
+            __m256 sw4 = _mm256_permute2f128_ps(v, v, 0x01);
+            v = _mm256_blend_ps(_mm256_add_ps(v, sw4), _mm256_sub_ps(sw4, v), 0xF0);
+            if (block_size == 8) {
+                v = _mm256_mul_ps(v, inv_sqrt_b);
+            }
+            _mm256_storeu_ps(base + i, v);
+        }
+
+        // Inter-vector AVX2 butterfly stages: h = 8, 16, ..., block_size / 2 (fusing final 1/sqrt(B) scale!)
+        for (int h = 8; h < block_size; h <<= 1) {
+            const int step = h << 1;
+            const bool is_last = (step == block_size);
+            if (is_last) {
+                for (int i = 0; i < block_size; i += step) {
+                    float* p0 = base + i;
+                    float* p1 = base + i + h;
+                    for (int j = 0; j < h; j += 8) {
+                        const __m256 a = _mm256_loadu_ps(p0 + j);
+                        const __m256 b = _mm256_loadu_ps(p1 + j);
+                        _mm256_storeu_ps(p0 + j, _mm256_mul_ps(_mm256_add_ps(a, b), inv_sqrt_b));
+                        _mm256_storeu_ps(p1 + j, _mm256_mul_ps(_mm256_sub_ps(a, b), inv_sqrt_b));
+                    }
+                }
+            } else {
+                for (int i = 0; i < block_size; i += step) {
+                    float* p0 = base + i;
+                    float* p1 = base + i + h;
+                    for (int j = 0; j < h; j += 8) {
+                        const __m256 a = _mm256_loadu_ps(p0 + j);
+                        const __m256 b = _mm256_loadu_ps(p1 + j);
+                        _mm256_storeu_ps(p0 + j, _mm256_add_ps(a, b));
+                        _mm256_storeu_ps(p1 + j, _mm256_sub_ps(a, b));
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Fast AVX2 In-Place Bias Addition: out[i] += bias[i] (supports F32 and F16)
 void Avx2Math::add_bias(float* out, const TensorDesc& bias_tensor, int size) {
     if (!out || !bias_tensor.data || size <= 0) return;

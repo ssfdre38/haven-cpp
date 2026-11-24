@@ -176,6 +176,16 @@ struct ModelConfig {
     float attn_logit_softcapping = 0.0f;
     bool is_gemma = false;
     FfnActivation ffn_activation = FfnActivation::SILU;
+
+    // Gemma 4.5 Turbo Baked Architecture Metadata (0 / false for standard unmodified GGUFs)
+    uint32_t turbo_version = 0;
+    uint32_t turbo_hadamard_qkv = 0;
+    uint32_t turbo_hadamard_ffn = 0;
+    uint32_t turbo_hadamard_ffn_down = 0;
+    uint32_t turbo_hadamard_moe_in = 0;
+    uint32_t turbo_hadamard_moe_down = 0;
+    bool     turbo_folded_norms = false;
+    bool     turbo_folded_scales = false;
 };
 
 } // namespace haven

@@ -116,6 +116,10 @@ public:
     // In-place RMS Normalization: y = x / sqrt(mean(x^2) + eps) * weight
     static void rms_norm(float* out, const float* x, const float* weight, int size, float eps);
 
+    // AVX2 In-Place Orthonormal Block Fast Walsh-Hadamard Transform: x_blk <- (1/sqrt(B)) * H_B * x_blk
+    // Self-inverse (H_B^2 = I_B) for any power-of-2 block_size >= 8 (e.g. 64, 256, 512).
+    static void fwht_block_inplace(float* x, int n, int block_size);
+
     // RoPE Rotary Position Embedding Kernel with partial dimension support
     static void apply_rope(
         float* q, float* k,

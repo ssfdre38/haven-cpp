@@ -109,6 +109,14 @@ target_link_libraries(haven-cli PRIVATE haven_core)
 add_executable(haven-server src/haven_server.cpp)
 target_link_libraries(haven-server PRIVATE haven_core)
 
+# Native Gemma 4.5 GGUF Architecture Optimizer (Scale/Norm Folding + QuaRot R2 + Block-FWHT)
+add_executable(haven-bake src/haven_bake.cpp)
+target_link_libraries(haven-bake PRIVATE haven_core)
+
+# Gemma 4.5 Turbo Bake & AVX2 FWHT Verification Test Suite
+add_executable(test-turbo-bake tests/test_turbo_bake.cpp)
+target_link_libraries(test-turbo-bake PRIVATE haven_core)
+
 # Test Standalone Forward Logits Executable
 add_executable(test-standalone tests/test_forward_logits.cpp)
 target_link_libraries(test-standalone PRIVATE haven_core)

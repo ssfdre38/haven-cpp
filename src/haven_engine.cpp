@@ -455,9 +455,12 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         const float attn_scale = cfg.is_gemma ? 1.0f : (1.0f / std::sqrt((float)actual_head_dim));
         const int gqa_ratio = std::max(1u, cfg.num_heads / std::max(1u, layer_n_kv_heads));
 
-        // 2a. Pre-Attention RMSNorm
-        const float* attn_norm_w = safe_f32_weights(lt.attn_norm, cfg.embedding_dim);
+        // 2a. Pre-Attention RMSNorm (+ optional Gemma 4.5 Turbo Block-FWHT)
+        const float* attn_norm_w = cfg.turbo_folded_norms ? default_norm_weights_.data() : safe_f32_weights(lt.attn_norm, cfg.embedding_dim);
         Avx2Math::rms_norm(norm_scratch_.data(), embedding_scratch_.data(), attn_norm_w, D_emb, cfg.rms_norm_eps);
+        if (cfg.turbo_hadamard_qkv > 0 && (D_emb % static_cast<int>(cfg.turbo_hadamard_qkv)) == 0) {
+            Avx2Math::fwht_block_inplace(norm_scratch_.data(), D_emb, static_cast<int>(cfg.turbo_hadamard_qkv));
+        }
 
         // Determine SWA & Shared-KV status BEFORE projecting K/V so shared-KV layers
         // (e.g. Gemma 4 E4B blk.24..41 with shared_kv_layers=18) NEVER overwrite/use
@@ -649,9 +652,12 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
             embedding_scratch_[i] += attn_out_scratch_[i];
         }
 
-        // 2g. Pre-FFN RMSNorm
-        const float* ffn_norm_w = safe_f32_weights(lt.ffn_norm, cfg.embedding_dim);
+        // 2g. Pre-FFN RMSNorm (+ optional Gemma 4.5 Turbo Block-FWHT)
+        const float* ffn_norm_w = cfg.turbo_folded_norms ? default_norm_weights_.data() : safe_f32_weights(lt.ffn_norm, cfg.embedding_dim);
         Avx2Math::rms_norm(norm_scratch_.data(), embedding_scratch_.data(), ffn_norm_w, cfg.embedding_dim, cfg.rms_norm_eps);
+        if (cfg.turbo_hadamard_ffn > 0 && (D_emb % static_cast<int>(cfg.turbo_hadamard_ffn)) == 0) {
+            Avx2Math::fwht_block_inplace(norm_scratch_.data(), D_emb, static_cast<int>(cfg.turbo_hadamard_ffn));
+        }
 
         // 2h + 2i. FFN Gate/Up/Activation/Down (Fused TPU MXU GeGLU when offload active, else Fused Integer AVX2 CPU)
         if (tpu_offload_active_ && tpu_backend_ && l < tpu_layers_.size() && tpu_layers_[l].has_ffn &&
@@ -691,6 +697,9 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
 
                     #pragma omp single
                     {
+                        if (cfg.turbo_hadamard_ffn_down > 0 && (F_hid % static_cast<int>(cfg.turbo_hadamard_ffn_down)) == 0) {
+                            Avx2Math::fwht_block_inplace(ffn_gate_scratch_.data(), F_hid, static_cast<int>(cfg.turbo_hadamard_ffn_down));
+                        }
                         Avx2Math::quantize_q8_act(ffn_gate_scratch_.data(), F_hid, ffn_mid_act);
                     }
 
@@ -717,6 +726,9 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
 
                 // 2i. FFN Down Projection
                 if (lt.ffn_down) {
+                    if (cfg.turbo_hadamard_ffn_down > 0 && (F_hid % static_cast<int>(cfg.turbo_hadamard_ffn_down)) == 0) {
+                        Avx2Math::fwht_block_inplace(ffn_gate_scratch_.data(), F_hid, static_cast<int>(cfg.turbo_hadamard_ffn_down));
+                    }
                     Avx2Math::gemv(ffn_down_scratch_.data(), *lt.ffn_down, ffn_gate_scratch_.data(), D_emb, F_hid);
                 } else {
                     for (int i = 0; i < D_emb; ++i) ffn_down_scratch_[static_cast<size_t>(i)] = ffn_gate_scratch_[static_cast<size_t>(i % F_hid)] * 0.05f;
@@ -739,7 +751,7 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
             // Router input: parameter-free RMSNorm(attn_out) * (1 / sqrt(D)) * ffn_gate_inp.scale
             Avx2Math::rms_norm(moe_norm_scratch_.data(), embedding_scratch_.data(), default_norm_weights_.data(), D_emb, cfg.rms_norm_eps);
             const float inv_sqrt_d = 1.0f / std::sqrt(static_cast<float>(cfg.embedding_dim));
-            const float* rscale = lt.ffn_gate_inp_scale ? safe_f32_weights(lt.ffn_gate_inp_scale, cfg.embedding_dim) : nullptr;
+            const float* rscale = (!cfg.turbo_folded_scales && lt.ffn_gate_inp_scale) ? safe_f32_weights(lt.ffn_gate_inp_scale, cfg.embedding_dim) : nullptr;
             for (size_t i = 0; i < cfg.embedding_dim; ++i) {
                 moe_norm_scratch_[i] *= inv_sqrt_d * (rscale ? rscale[i] : 1.0f);
             }
@@ -762,11 +774,14 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
             for (int k = 0; k < K_used; ++k) w_sum += moe_router_scratch_[static_cast<size_t>(exp_idx[k])];
             if (w_sum < 6.103515625e-5f) w_sum = 6.103515625e-5f;
 
-            // Pre-FFN norm 2 on attn_out for sparse experts
-            const float* pre2_w = safe_f32_weights(lt.pre_ffw_norm_2, cfg.embedding_dim);
+            // Pre-FFN norm 2 on attn_out for sparse experts (+ optional Gemma 4.5 Turbo Block-FWHT)
+            const float* pre2_w = cfg.turbo_folded_norms ? default_norm_weights_.data() : safe_f32_weights(lt.pre_ffw_norm_2, cfg.embedding_dim);
             Avx2Math::rms_norm(moe_norm_scratch_.data(), embedding_scratch_.data(), pre2_w, D_emb, cfg.rms_norm_eps);
+            if (cfg.turbo_hadamard_moe_in > 0 && (D_emb % static_cast<int>(cfg.turbo_hadamard_moe_in)) == 0) {
+                Avx2Math::fwht_block_inplace(moe_norm_scratch_.data(), D_emb, static_cast<int>(cfg.turbo_hadamard_moe_in));
+            }
 
-            const float* down_s = lt.ffn_down_exps_scale ? safe_f32_weights(lt.ffn_down_exps_scale, static_cast<size_t>(E)) : nullptr;
+            const float* down_s = (!cfg.turbo_folded_scales && lt.ffn_down_exps_scale) ? safe_f32_weights(lt.ffn_down_exps_scale, static_cast<size_t>(E)) : nullptr;
             float w_exp_stack[64];
             std::vector<float> w_exp_heap;
             float* w_exp = w_exp_stack;
@@ -899,6 +914,9 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
                                 ? (0.5f * g * (1.0f + std::tanh(0.7978845608f * (g + 0.044715f * g * g * g))))
                                 : (g / (1.0f + std::exp(-g)));
                             base[j] = act * base[F_exp + j];
+                        }
+                        if (cfg.turbo_hadamard_moe_down > 0 && (F_exp % static_cast<int>(cfg.turbo_hadamard_moe_down)) == 0) {
+                            Avx2Math::fwht_block_inplace(base, F_exp, static_cast<int>(cfg.turbo_hadamard_moe_down));
                         }
                         if (use_q8_dn) {
                             Avx2Math::quantize_q8_act(base, F_exp, exp_acts[k]);
@@ -1277,13 +1295,15 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
             const float attn_scale = cfg.is_gemma ? 1.0f : (1.0f / std::sqrt(static_cast<float>(actual_head_dim)));
             const int gqa_ratio = std::max(1u, cfg.num_heads / std::max(1u, layer_n_kv_heads));
 
-            // 2a. Batched Pre-Attention RMSNorm
-            const float* attn_norm_w = safe_f32_weights(lt.attn_norm, cfg.embedding_dim);
+            // 2a. Batched Pre-Attention RMSNorm (+ optional Gemma 4.5 Turbo Block-FWHT)
+            const float* attn_norm_w = cfg.turbo_folded_norms ? default_norm_weights_.data() : safe_f32_weights(lt.attn_norm, cfg.embedding_dim);
+            const int h_qkv = (cfg.turbo_hadamard_qkv > 0 && (D % static_cast<int>(cfg.turbo_hadamard_qkv)) == 0) ? static_cast<int>(cfg.turbo_hadamard_qkv) : 0;
             #pragma omp parallel for if(S >= 8) schedule(static)
             for (int t = 0; t < S; ++t) {
-                Avx2Math::rms_norm(norm_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(D),
-                                   X.data() + static_cast<size_t>(t) * static_cast<size_t>(D),
+                float* nb = norm_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(D);
+                Avx2Math::rms_norm(nb, X.data() + static_cast<size_t>(t) * static_cast<size_t>(D),
                                    attn_norm_w, D, cfg.rms_norm_eps);
+                if (h_qkv > 0) Avx2Math::fwht_block_inplace(nb, D, h_qkv);
             }
 
             // Shared-KV check BEFORE projecting K/V (honors Gemma 4 E4B shared_kv_layers=18)
@@ -1489,16 +1509,18 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
             }
 
             const float* post_attn_w = lt.post_attention_norm ? safe_f32_weights(lt.post_attention_norm, cfg.embedding_dim) : nullptr;
-            const float* ffn_norm_w  = safe_f32_weights(lt.ffn_norm, cfg.embedding_dim);
+            const float* ffn_norm_w  = cfg.turbo_folded_norms ? default_norm_weights_.data() : safe_f32_weights(lt.ffn_norm, cfg.embedding_dim);
+            const int h_ffn = (cfg.turbo_hadamard_ffn > 0 && (D % static_cast<int>(cfg.turbo_hadamard_ffn)) == 0) ? static_cast<int>(cfg.turbo_hadamard_ffn) : 0;
             #pragma omp parallel for if(S >= 8) schedule(static)
             for (int t = 0; t < S; ++t) {
                 float* ao = attn_out_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(D);
                 float* xt = X.data()            + static_cast<size_t>(t) * static_cast<size_t>(D);
                 if (post_attn_w) Avx2Math::rms_norm(ao, ao, post_attn_w, D, cfg.rms_norm_eps);
                 for (int i = 0; i < D; ++i) xt[i] += ao[i];
-                // 2g. Pre-FFN RMSNorm fused directly in cache!
-                Avx2Math::rms_norm(norm_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(D),
-                                   xt, ffn_norm_w, D, cfg.rms_norm_eps);
+                // 2g. Pre-FFN RMSNorm + optional Gemma 4.5 Turbo Block-FWHT fused directly in cache!
+                float* nb = norm_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(D);
+                Avx2Math::rms_norm(nb, xt, ffn_norm_w, D, cfg.rms_norm_eps);
+                if (h_ffn > 0) Avx2Math::fwht_block_inplace(nb, D, h_ffn);
             }
 
             // 2h + 2i. Batched Shared FFN (per-layer F supports Gemma 4 E2B double-wide MLP; pack norm_buf ONCE for Gate + Up!)
@@ -1524,18 +1546,26 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
                     Avx2Math::gemm(ffn_gate_buf.data(), layer_F, *lt.ffn_gate, norm_buf.data(), D, S, layer_F, D);
                     Avx2Math::gemm(ffn_up_buf.data(),   layer_F, *lt.ffn_up,   norm_buf.data(), D, S, layer_F, D);
                 }
+                const int h_ffn_dn = (cfg.turbo_hadamard_ffn_down > 0 && (layer_F % static_cast<int>(cfg.turbo_hadamard_ffn_down)) == 0)
+                    ? static_cast<int>(cfg.turbo_hadamard_ffn_down) : 0;
                 if (use_gelu) {
                     #pragma omp parallel for schedule(static)
                     for (int t = 0; t < S; ++t) {
                         const size_t off = static_cast<size_t>(t) * static_cast<size_t>(layer_F);
                         geglu_avx2_range(ffn_gate_buf.data() + off, ffn_gate_buf.data() + off, ffn_up_buf.data() + off, layer_F);
+                        if (h_ffn_dn > 0) Avx2Math::fwht_block_inplace(ffn_gate_buf.data() + off, layer_F, h_ffn_dn);
                     }
                 } else {
-                    const int total_ff = S * layer_F;
                     #pragma omp parallel for schedule(static)
-                    for (int idx = 0; idx < total_ff; ++idx) {
-                        const float g = ffn_gate_buf[static_cast<size_t>(idx)];
-                        ffn_gate_buf[static_cast<size_t>(idx)] = (g / (1.0f + std::exp(-g))) * ffn_up_buf[static_cast<size_t>(idx)];
+                    for (int t = 0; t < S; ++t) {
+                        const size_t off = static_cast<size_t>(t) * static_cast<size_t>(layer_F);
+                        float* gb = ffn_gate_buf.data() + off;
+                        const float* ub = ffn_up_buf.data() + off;
+                        for (int idx = 0; idx < layer_F; ++idx) {
+                            const float g = gb[idx];
+                            gb[idx] = (g / (1.0f + std::exp(-g))) * ub[idx];
+                        }
+                        if (h_ffn_dn > 0) Avx2Math::fwht_block_inplace(gb, layer_F, h_ffn_dn);
                     }
                 }
             } else {
@@ -1572,7 +1602,7 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
 
                 // Router input norm + scale for all S tokens
                 const float inv_sqrt_d = 1.0f / std::sqrt(static_cast<float>(D));
-                const float* rscale = lt.ffn_gate_inp_scale ? safe_f32_weights(lt.ffn_gate_inp_scale, cfg.embedding_dim) : nullptr;
+                const float* rscale = (!cfg.turbo_folded_scales && lt.ffn_gate_inp_scale) ? safe_f32_weights(lt.ffn_gate_inp_scale, cfg.embedding_dim) : nullptr;
                 #pragma omp parallel for if(S >= 8) schedule(static)
                 for (int t = 0; t < S; ++t) {
                     float* mn = moe_norm_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(D);
@@ -1587,7 +1617,7 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
                 // Group routed (token, weight) pairs into per-expert buckets so each expert is read ONCE!
                 struct ExpertHit { int tok; float weight; };
                 std::vector<std::vector<ExpertHit>> buckets(static_cast<size_t>(E));
-                const float* down_s = lt.ffn_down_exps_scale ? safe_f32_weights(lt.ffn_down_exps_scale, static_cast<size_t>(E)) : nullptr;
+                const float* down_s = (!cfg.turbo_folded_scales && lt.ffn_down_exps_scale) ? safe_f32_weights(lt.ffn_down_exps_scale, static_cast<size_t>(E)) : nullptr;
                 std::vector<int> idx_tmp(static_cast<size_t>(E));
 
                 for (int t = 0; t < S; ++t) {
@@ -1606,13 +1636,18 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
                     }
                 }
 
-                // Pre-FFN norm 2 on X for all S tokens
-                const float* pre2_w = safe_f32_weights(lt.pre_ffw_norm_2, cfg.embedding_dim);
+                // Pre-FFN norm 2 on X for all S tokens (+ optional Gemma 4.5 Turbo Block-FWHT)
+                const float* pre2_w = cfg.turbo_folded_norms ? default_norm_weights_.data() : safe_f32_weights(lt.pre_ffw_norm_2, cfg.embedding_dim);
+                const int h_moe_in = (cfg.turbo_hadamard_moe_in > 0 && (D % static_cast<int>(cfg.turbo_hadamard_moe_in)) == 0)
+                    ? static_cast<int>(cfg.turbo_hadamard_moe_in) : 0;
+                const int h_moe_dn = (cfg.turbo_hadamard_moe_down > 0 && (F_exp % static_cast<int>(cfg.turbo_hadamard_moe_down)) == 0)
+                    ? static_cast<int>(cfg.turbo_hadamard_moe_down) : 0;
                 #pragma omp parallel for if(S >= 8) schedule(static)
                 for (int t = 0; t < S; ++t) {
-                    Avx2Math::rms_norm(moe_norm_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(D),
-                                       X.data() + static_cast<size_t>(t) * static_cast<size_t>(D),
+                    float* mn = moe_norm_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(D);
+                    Avx2Math::rms_norm(mn, X.data() + static_cast<size_t>(t) * static_cast<size_t>(D),
                                        pre2_w, D, cfg.rms_norm_eps);
+                    if (h_moe_in > 0) Avx2Math::fwht_block_inplace(mn, D, h_moe_in);
                 }
 
                 std::vector<int> active_exps;
@@ -1714,6 +1749,7 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
                                 const float* gu = exp_gu.data() + static_cast<size_t>(j) * static_cast<size_t>(two_F);
                                 float* ac = exp_act.data() + static_cast<size_t>(j) * static_cast<size_t>(F_exp);
                                 geglu_avx2_range(ac, gu, gu + F_exp, F_exp);
+                                if (h_moe_dn > 0) Avx2Math::fwht_block_inplace(ac, F_exp, h_moe_dn);
                             }
                         } else {
                             for (int j = 0; j < cnt; ++j) {
@@ -1723,6 +1759,7 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
                                     const float g = gu[f];
                                     ac[f] = (g / (1.0f + std::exp(-g))) * gu[F_exp + f];
                                 }
+                                if (h_moe_dn > 0) Avx2Math::fwht_block_inplace(ac, F_exp, h_moe_dn);
                             }
                         }
 

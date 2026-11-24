@@ -411,6 +411,42 @@ bool GgufLoader::parse_header() {
         else if (ends_with(key, ".attn_logit_softcapping")) {
             if (!read_float_val(val_type, config_.attn_logit_softcapping)) return false;
         }
+        else if (ends_with(key, ".turbo.version") && (val_type == 4 || val_type == 10)) {
+            if (!read_uint_val(val_type, config_.turbo_version)) return false;
+        }
+        else if (ends_with(key, ".turbo.hadamard_qkv") && (val_type == 4 || val_type == 10)) {
+            uint32_t b = 0;
+            if (!read_uint_val(val_type, b)) return false;
+            if (b >= 8 && b <= 1024 && (b & (b - 1)) == 0) config_.turbo_hadamard_qkv = b;
+        }
+        else if (ends_with(key, ".turbo.hadamard_ffn") && (val_type == 4 || val_type == 10)) {
+            uint32_t b = 0;
+            if (!read_uint_val(val_type, b)) return false;
+            if (b >= 8 && b <= 1024 && (b & (b - 1)) == 0) config_.turbo_hadamard_ffn = b;
+        }
+        else if (ends_with(key, ".turbo.hadamard_ffn_down") && (val_type == 4 || val_type == 10)) {
+            uint32_t b = 0;
+            if (!read_uint_val(val_type, b)) return false;
+            if (b >= 8 && b <= 1024 && (b & (b - 1)) == 0) config_.turbo_hadamard_ffn_down = b;
+        }
+        else if (ends_with(key, ".turbo.hadamard_moe_in") && (val_type == 4 || val_type == 10)) {
+            uint32_t b = 0;
+            if (!read_uint_val(val_type, b)) return false;
+            if (b >= 8 && b <= 1024 && (b & (b - 1)) == 0) config_.turbo_hadamard_moe_in = b;
+        }
+        else if (ends_with(key, ".turbo.hadamard_moe_down") && (val_type == 4 || val_type == 10)) {
+            uint32_t b = 0;
+            if (!read_uint_val(val_type, b)) return false;
+            if (b >= 8 && b <= 1024 && (b & (b - 1)) == 0) config_.turbo_hadamard_moe_down = b;
+        }
+        else if (ends_with(key, ".turbo.folded_norms") && val_type == 7) {
+            if (!has_bytes(ptr, end, 1)) return false;
+            config_.turbo_folded_norms = (*ptr++ != 0);
+        }
+        else if (ends_with(key, ".turbo.folded_scales") && val_type == 7) {
+            if (!has_bytes(ptr, end, 1)) return false;
+            config_.turbo_folded_scales = (*ptr++ != 0);
+        }
         else if (key == "tokenizer.ggml.tokens" && val_type == 9) {
             if (!has_bytes(ptr, end, 12)) return false;
             uint32_t arr_type = 0;
