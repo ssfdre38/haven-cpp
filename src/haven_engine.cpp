@@ -216,7 +216,7 @@ bool HavenEngine::load_model(const std::string& gguf_filepath) {
     uint32_t kv_cache_head_dim = std::max(max_head_dim, (cfg.num_kv_heads > 0 ? (max_kv_dim + cfg.num_kv_heads - 1) / cfg.num_kv_heads : cfg.head_dim));
     kv_cache_ = DynamicKVCacheManager(cfg.num_layers, cfg.max_context_length, cfg.num_kv_heads, kv_cache_head_dim, 0.0f, 1.0f);
     telemetry_engine_ = AttentionTelemetryEngine(cfg.num_layers, cfg.num_heads);
-    tokenizer_.initialize(loader_.get_vocabulary());
+    tokenizer_.initialize(loader_.get_vocabulary(), &cfg);
     speculative_engine_.initialize_draft_heads(cfg.embedding_dim);
 
     // Dynamically resize all scratch buffers to exact worst-case model dimensions

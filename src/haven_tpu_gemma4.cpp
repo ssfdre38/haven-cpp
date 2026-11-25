@@ -532,7 +532,7 @@ TpuModelSpec TpuModelSpec::from_model_config(const ModelConfig& mc, const HavenE
             s.expert_ffn_dim = (mc.expert_ffn_dim > 0)
                 ? static_cast<int>(mc.expert_ffn_dim)
                 : ((lt0.ffn_down_exps->shape.size() > 0) ? static_cast<int>(lt0.ffn_down_exps->shape[0]) : s.hidden_dim);
-            s.has_moe_router_scale = (lt0.ffn_gate_inp_scale != nullptr);
+            s.has_moe_router_scale = (lt0.ffn_gate_inp_scale != nullptr && !mc.turbo_folded_scales);
             s.has_post_ffn_norm_1  = (lt0.post_ffw_norm_1 != nullptr);
             s.has_pre_ffn_norm_2   = (lt0.pre_ffw_norm_2 != nullptr);
             s.has_post_ffn_norm_2  = (lt0.post_ffw_norm_2 != nullptr);
@@ -2391,12 +2391,29 @@ bool HavenTpuGemma4Engine::build_and_upload_weights(const HavenEngine& host_engi
 
     std::vector<std::vector<PJRT_Buffer*>> replica_scale_bufs(static_cast<size_t>(R));
 
+    const int h_qkv    = (model_cfg_.turbo_hadamard_qkv > 0 && (D % static_cast<int>(model_cfg_.turbo_hadamard_qkv)) == 0) ? static_cast<int>(model_cfg_.turbo_hadamard_qkv) : 0;
+    const int h_ffn    = (model_cfg_.turbo_hadamard_ffn > 0 && (D % static_cast<int>(model_cfg_.turbo_hadamard_ffn)) == 0) ? static_cast<int>(model_cfg_.turbo_hadamard_ffn) : 0;
+    const int h_ffn_dn = (model_cfg_.turbo_hadamard_ffn_down > 0 && (F % static_cast<int>(model_cfg_.turbo_hadamard_ffn_down)) == 0) ? static_cast<int>(model_cfg_.turbo_hadamard_ffn_down) : 0;
+    const int h_moe_in = static_cast<int>(model_cfg_.turbo_hadamard_moe_in);
+    const int h_moe_dn = static_cast<int>(model_cfg_.turbo_hadamard_moe_down);
+    const bool t_folded_norms  = model_cfg_.turbo_folded_norms;
+    const bool t_folded_scales = model_cfg_.turbo_folded_scales;
+
+    auto unrotate_matrix_rows = [](std::vector<float>& mat, int rows, int cols, int blk) {
+        if (blk <= 0 || cols <= 0 || (cols % blk) != 0) return;
+        #pragma omp parallel for schedule(static)
+        for (int r = 0; r < rows; ++r) {
+            Avx2Math::fwht_block_inplace(mat.data() + static_cast<size_t>(r) * static_cast<size_t>(cols), cols, blk);
+        }
+    };
+
     auto upload_sharded_stack = [&](const std::vector<int>& layer_list,
                                     const std::function<const TensorDesc*(int)>& getter,
                                     int full_rows, int full_cols,
                                     bool shard_rows, bool shard_cols,
                                     bool is_kv_head_shard,
-                                    int layer_hkv = 0) -> bool {
+                                    int layer_hkv = 0,
+                                    int unrot_fwht_blk = 0) -> bool {
         const int cnt = static_cast<int>(layer_list.size());
         if (cnt <= 0) return true;
         const int eff_hkv = (layer_hkv > 0) ? layer_hkv : Hkv;
@@ -2422,6 +2439,7 @@ bool HavenTpuGemma4Engine::build_and_upload_weights(const HavenEngine& host_engi
         for (int idx = 0; idx < cnt; ++idx) {
             const TensorDesc* td = getter(layer_list[static_cast<size_t>(idx)]);
             dequantize_full_matrix_f32(td, full_rows, full_cols, full_f32);
+            if (unrot_fwht_blk > 0) unrotate_matrix_rows(full_f32, full_rows, full_cols, unrot_fwht_blk);
 
             for (int rep = 0; rep < R; ++rep) {
                 int r_off = 0;
@@ -2552,6 +2570,10 @@ bool HavenTpuGemma4Engine::build_and_upload_weights(const HavenEngine& host_engi
         for (int l = 0; l < L; ++l) {
             dequantize_full_matrix_f32(host_engine.get_layer_tensors(l).ffn_gate, F, D, gate_f32);
             dequantize_full_matrix_f32(host_engine.get_layer_tensors(l).ffn_up,   F, D, up_f32);
+            if (h_ffn > 0) {
+                unrotate_matrix_rows(gate_f32, F, D, h_ffn);
+                unrotate_matrix_rows(up_f32,   F, D, h_ffn);
+            }
             for (int rep = 0; rep < R; ++rep) {
                 const size_t base_el = static_cast<size_t>(l) * static_cast<size_t>(GU_sh) * static_cast<size_t>(D);
                 const size_t base_sc = static_cast<size_t>(l) * static_cast<size_t>(GU_sh);
@@ -2587,7 +2609,7 @@ bool HavenTpuGemma4Engine::build_and_upload_weights(const HavenEngine& host_engi
             replica_weight_bufs_[static_cast<size_t>(rep)].push_back(wb);
         }
     }
-    if (!upload_sharded_stack(all_layers, [&](int l){ return host_engine.get_layer_tensors(l).ffn_down; }, D, F, false, true, false)) return false;
+    if (!upload_sharded_stack(all_layers, [&](int l){ return host_engine.get_layer_tensors(l).ffn_down; }, D, F, false, true, false, 0, h_ffn_dn)) return false;
 
     // 1b. Sparse Mixture-of-Experts 4D weight stacks (streamed replica-by-replica to keep peak host RAM minimal!)
     if (spec_.is_moe) {
@@ -2651,7 +2673,12 @@ bool HavenTpuGemma4Engine::build_and_upload_weights(const HavenEngine& host_engi
                                     }
                                     // Offline Block-256 Orthogonal Walsh-Hadamard pre-rotation (W' = W H)
                                     // Pairs with runtime x' = x H to crush 662x blk.29 spikes -> 5.8x Gaussian!
-                                    if (use_moe_hadamard) {
+                                    // If GGUF is already Gemma 4.5 Turbo rotated (h_moe_in == 256), skip double-rotation!
+                                    if (h_moe_in > 0 && h_moe_in != 256 && (D % h_moe_in) == 0) {
+                                        Avx2Math::fwht_block_inplace(row_f32.data(), D, h_moe_in);
+                                    }
+                                    const bool already_rot_256 = (h_moe_in == 256);
+                                    if (use_moe_hadamard != already_rot_256) {
                                         for (int blk = 0; blk < D; blk += 256) {
                                             fwht_inplace(row_f32.data() + blk, 256);
                                         }
@@ -2708,7 +2735,9 @@ bool HavenTpuGemma4Engine::build_and_upload_weights(const HavenEngine& host_engi
 
             for (int l = 0; l < L; ++l) {
                 const auto& lt = host_engine.get_layer_tensors(static_cast<uint32_t>(l));
-                const auto down_s = extract_f32_1d(lt.ffn_down_exps_scale, E, 1.0f);
+                const auto down_s = !t_folded_scales
+                    ? extract_f32_1d(lt.ffn_down_exps_scale, E, 1.0f)
+                    : std::vector<float>(static_cast<size_t>(E), 1.0f);
                 for (int rep = 0; rep < R; ++rep) {
                     const int dev = replica_dev_indices_[static_cast<size_t>(rep)];
                     const int col_off = rep * F_exp_sh;
@@ -2723,6 +2752,9 @@ bool HavenTpuGemma4Engine::build_and_upload_weights(const HavenEngine& host_engi
                             for (int d = 0; d < D; ++d) {
                                 if (lt.ffn_down_exps && lt.ffn_down_exps->data) {
                                     Avx2Math::dequantize_row(full_row.data(), *lt.ffn_down_exps, e * D + d, F_exp);
+                                    if (h_moe_dn > 0 && (F_exp % h_moe_dn) == 0) {
+                                        Avx2Math::fwht_block_inplace(full_row.data(), F_exp, h_moe_dn);
+                                    }
                                     for (int f = 0; f < F_exp_sh; ++f) {
                                         exp_tr[static_cast<size_t>(f) * static_cast<size_t>(D) + static_cast<size_t>(d)] =
                                             full_row[static_cast<size_t>(col_off + f)] * es;
@@ -2800,22 +2832,22 @@ bool HavenTpuGemma4Engine::build_and_upload_weights(const HavenEngine& host_engi
     }
 
     if (N_swa > 0) {
-        if (!upload_sharded_stack(swa_layers,    [&](int l){ return host_engine.get_layer_tensors(l).attn_q; },      H * HD_swa, D, true, false, false)) return false;
+        if (!upload_sharded_stack(swa_layers,    [&](int l){ return host_engine.get_layer_tensors(l).attn_q; },      H * HD_swa, D, true, false, false, 0, h_qkv)) return false;
         if (!upload_sharded_stack(swa_layers,    [&](int l){ return host_engine.get_layer_tensors(l).attn_output; }, D, H * HD_swa, false, true, false)) return false;
         if (N_swa_kv > 0) {
-            if (!upload_sharded_stack(swa_kv_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_k; }, Hkv_swa * HD_swa, D, (R > 1), false, true, Hkv_swa)) return false;
+            if (!upload_sharded_stack(swa_kv_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_k; }, Hkv_swa * HD_swa, D, (R > 1), false, true, Hkv_swa, h_qkv)) return false;
             if (spec_.has_swa_v) {
-                if (!upload_sharded_stack(swa_kv_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_v; }, Hkv_swa * HD_swa, D, (R > 1), false, true, Hkv_swa)) return false;
+                if (!upload_sharded_stack(swa_kv_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_v; }, Hkv_swa * HD_swa, D, (R > 1), false, true, Hkv_swa, h_qkv)) return false;
             }
         }
     }
     if (N_glob > 0) {
-        if (!upload_sharded_stack(glob_layers,    [&](int l){ return host_engine.get_layer_tensors(l).attn_q; },      H * HD_glob, D, true, false, false)) return false;
+        if (!upload_sharded_stack(glob_layers,    [&](int l){ return host_engine.get_layer_tensors(l).attn_q; },      H * HD_glob, D, true, false, false, 0, h_qkv)) return false;
         if (!upload_sharded_stack(glob_layers,    [&](int l){ return host_engine.get_layer_tensors(l).attn_output; }, D, H * HD_glob, false, true, false)) return false;
         if (N_glob_kv > 0) {
-            if (!upload_sharded_stack(glob_kv_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_k; }, Hkv_glob * HD_glob, D, (R > 1), false, true, Hkv_glob)) return false;
+            if (!upload_sharded_stack(glob_kv_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_k; }, Hkv_glob * HD_glob, D, (R > 1), false, true, Hkv_glob, h_qkv)) return false;
             if (spec_.has_glob_v) {
-                if (!upload_sharded_stack(glob_kv_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_v; }, Hkv_glob * HD_glob, D, (R > 1), false, true, Hkv_glob)) return false;
+                if (!upload_sharded_stack(glob_kv_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_v; }, Hkv_glob * HD_glob, D, (R > 1), false, true, Hkv_glob, h_qkv)) return false;
             }
         }
     }
@@ -2952,11 +2984,12 @@ bool HavenTpuGemma4Engine::build_and_upload_weights(const HavenEngine& host_engi
         return out;
     };
 
-    if (!upload_rep_f32(stack_norms(all_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_norm; }, D), {L, D})) return false;
+    const std::vector<float> ones_ld(static_cast<size_t>(L) * static_cast<size_t>(D), 1.0f);
+    if (!upload_rep_f32(t_folded_norms ? ones_ld : stack_norms(all_layers, [&](int l){ return host_engine.get_layer_tensors(l).attn_norm; }, D), {L, D})) return false;
     if (spec_.has_post_attn_norm) {
         if (!upload_rep_f32(stack_norms(all_layers, [&](int l){ return host_engine.get_layer_tensors(l).post_attention_norm; }, D), {L, D})) return false;
     }
-    if (!upload_rep_f32(stack_norms(all_layers, [&](int l){ return host_engine.get_layer_tensors(l).ffn_norm; }, D), {L, D})) return false;
+    if (!upload_rep_f32(t_folded_norms ? ones_ld : stack_norms(all_layers, [&](int l){ return host_engine.get_layer_tensors(l).ffn_norm; }, D), {L, D})) return false;
     if (spec_.is_moe && spec_.has_moe_router_scale) {
         if (!upload_rep_f32(stack_norms(all_layers, [&](int l){ return host_engine.get_layer_tensors(l).ffn_gate_inp_scale; }, D), {L, D})) return false;
     }
@@ -2964,7 +2997,7 @@ bool HavenTpuGemma4Engine::build_and_upload_weights(const HavenEngine& host_engi
         if (!upload_rep_f32(stack_norms(all_layers, [&](int l){ return host_engine.get_layer_tensors(l).post_ffw_norm_1; }, D), {L, D})) return false;
     }
     if (spec_.is_moe && spec_.has_pre_ffn_norm_2) {
-        if (!upload_rep_f32(stack_norms(all_layers, [&](int l){ return host_engine.get_layer_tensors(l).pre_ffw_norm_2; }, D), {L, D})) return false;
+        if (!upload_rep_f32(t_folded_norms ? ones_ld : stack_norms(all_layers, [&](int l){ return host_engine.get_layer_tensors(l).pre_ffw_norm_2; }, D), {L, D})) return false;
     }
     if (spec_.is_moe && spec_.has_post_ffn_norm_2) {
         if (!upload_rep_f32(stack_norms(all_layers, [&](int l){ return host_engine.get_layer_tensors(l).post_ffw_norm_2; }, D), {L, D})) return false;

@@ -186,6 +186,18 @@ struct ModelConfig {
     uint32_t turbo_hadamard_moe_down = 0;
     bool     turbo_folded_norms = false;
     bool     turbo_folded_scales = false;
+
+    // GGUF Tokenizer Metadata (overrides heuristic vocab scans when present)
+    bool     has_bos_token_id = false;
+    uint32_t bos_token_id = 2;
+    bool     has_eos_token_id = false;
+    uint32_t eos_token_id = 1;
+    bool     has_pad_token_id = false;
+    uint32_t pad_token_id = 0;
+    bool     has_unk_token_id = false;
+    uint32_t unk_token_id = 3;
+    bool     has_add_space_prefix = false;
+    bool     add_space_prefix = true;
 };
 
 } // namespace haven

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "haven_types.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -13,8 +14,8 @@ public:
     HavenTokenizer();
     ~HavenTokenizer();
 
-    // Initializes tokenizer vocabulary and fast reverse-lookup map
-    void initialize(const std::vector<std::string>& vocab);
+    // Initializes tokenizer vocabulary and fast reverse-lookup map (honors exact GGUF metadata when cfg provided)
+    void initialize(const std::vector<std::string>& vocab, const ModelConfig* cfg = nullptr);
 
     // Encodes UTF-8 text into token IDs
     std::vector<uint32_t> encode(const std::string& text, bool add_bos = false) const;
@@ -46,6 +47,7 @@ private:
     uint32_t eos_token_ = 1;
     uint32_t pad_token_ = 0;
     uint32_t unk_token_ = 3;
+    bool     add_space_prefix_ = true;
 };
 
 } // namespace haven

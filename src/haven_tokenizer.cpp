@@ -8,7 +8,7 @@ namespace haven {
 HavenTokenizer::HavenTokenizer() = default;
 HavenTokenizer::~HavenTokenizer() = default;
 
-void HavenTokenizer::initialize(const std::vector<std::string>& vocab) {
+void HavenTokenizer::initialize(const std::vector<std::string>& vocab, const ModelConfig* cfg) {
     vocab_ = vocab;
     token_to_id_.clear();
     token_to_id_.reserve(vocab.size());
@@ -18,24 +18,56 @@ void HavenTokenizer::initialize(const std::vector<std::string>& vocab) {
     eos_token_ = 1;
     pad_token_ = 0;
     unk_token_ = 3;
+    add_space_prefix_ = true;
+
+    // Priority flags prevent literal vocab tokens like Gemma 4's "<s>" (203) / "</s>" (212)
+    // from overwriting canonical "<bos>" (2) / "<eos>" (1)!
+    bool found_primary_bos = false;
+    bool found_any_bos     = false;
+    bool found_primary_eos = false;
+    bool found_any_eos     = false;
 
     for (uint32_t i = 0; i < (uint32_t)vocab.size(); ++i) {
         if (token_to_id_.find(vocab[i]) == token_to_id_.end()) {
             token_to_id_[vocab[i]] = i;
         }
-        if (vocab[i] == "<bos>" || vocab[i] == "<s>" || vocab[i] == "<|begin_of_text|>") bos_token_ = i;
-        else if (vocab[i] == "<eos>" || vocab[i] == "</s>" || vocab[i] == "<|end_of_text|>" || vocab[i] == "<|endoftext|>") eos_token_ = i;
-        else if (vocab[i] == "<pad>") pad_token_ = i;
-        else if (vocab[i] == "<unk>") unk_token_ = i;
+        if (vocab[i] == "<bos>" || vocab[i] == "<|begin_of_text|>") {
+            if (!found_primary_bos) { bos_token_ = i; found_primary_bos = true; found_any_bos = true; }
+        } else if (vocab[i] == "<s>") {
+            if (!found_any_bos) { bos_token_ = i; found_any_bos = true; }
+        } else if (vocab[i] == "<eos>" || vocab[i] == "<|end_of_text|>" || vocab[i] == "<|endoftext|>") {
+            if (!found_primary_eos) { eos_token_ = i; found_primary_eos = true; found_any_eos = true; }
+        } else if (vocab[i] == "</s>") {
+            if (!found_any_eos) { eos_token_ = i; found_any_eos = true; }
+        } else if (vocab[i] == "<pad>") {
+            pad_token_ = i;
+        } else if (vocab[i] == "<unk>") {
+            unk_token_ = i;
+        }
 
         // Register universal stop tokens
-        if (vocab[i] == "<eos>" || vocab[i] == "</s>" || vocab[i] == "<turn|>" || vocab[i] == "<|turn|>" ||
+        if (vocab[i] == "<eos>" || vocab[i] == "<turn|>" || vocab[i] == "<|turn|>" ||
             vocab[i] == "<end_of_turn>" || vocab[i] == "</end_of_turn>" ||
             vocab[i] == "<|eot_id|>" || vocab[i] == "<|end_of_text|>" ||
-            vocab[i] == "<|im_end|>" || vocab[i] == "<|endoftext|>") {
+            vocab[i] == "<|im_end|>" || vocab[i] == "<|endoftext|>" ||
+            (vocab[i] == "</s>" && (!cfg || !cfg->is_gemma))) {
             stop_tokens_.insert(i);
         }
     }
+
+    // Honor authoritative GGUF header tokenizer metadata whenever present
+    if (cfg) {
+        if (cfg->has_bos_token_id && cfg->bos_token_id < vocab.size()) bos_token_ = cfg->bos_token_id;
+        if (cfg->has_eos_token_id && cfg->eos_token_id < vocab.size()) eos_token_ = cfg->eos_token_id;
+        if (cfg->has_pad_token_id && cfg->pad_token_id < vocab.size()) pad_token_ = cfg->pad_token_id;
+        if (cfg->has_unk_token_id && cfg->unk_token_id < vocab.size()) unk_token_ = cfg->unk_token_id;
+        if (cfg->has_add_space_prefix) {
+            add_space_prefix_ = cfg->add_space_prefix;
+        } else if (cfg->is_gemma) {
+            add_space_prefix_ = false; // Gemma 2/3/4 BPE/SentencePiece does not prepend dummy space
+        }
+    }
+
     stop_tokens_.insert(eos_token_);
 }
 
@@ -95,15 +127,15 @@ std::vector<uint32_t> HavenTokenizer::encode(const std::string& text, bool add_b
         std::string segment = text.substr(pos, next_ctrl - pos);
         pos = next_ctrl;
 
-        // Replace regular spaces with SentencePiece space indicator (\xe2\x96\x81 =  )
-        // and prepend dummy prefix (\xe2\x96\x81) at the start of segments or right after newlines
+        // Replace regular spaces with SentencePiece space indicator (\xe2\x96\x81 = ▁)
+        // Only prepend dummy prefix (\xe2\x96\x81) when add_space_prefix_ is enabled (never before '\n' or on Gemma 4!)
         std::string normalized;
         normalized.reserve(segment.length() * 2);
         for (size_t i = 0; i < segment.length(); ++i) {
             if (segment[i] == ' ') {
                 normalized += "\xe2\x96\x81";
             } else {
-                if (normalized.empty() || normalized.back() == '\n') {
+                if (add_space_prefix_ && segment[i] != '\n' && (normalized.empty() || normalized.back() == '\n')) {
                     normalized += "\xe2\x96\x81";
                 }
                 normalized += segment[i];

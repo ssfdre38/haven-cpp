@@ -447,6 +447,27 @@ bool GgufLoader::parse_header() {
             if (!has_bytes(ptr, end, 1)) return false;
             config_.turbo_folded_scales = (*ptr++ != 0);
         }
+        else if (key == "tokenizer.ggml.bos_token_id" && (val_type == 4 || val_type == 5 || val_type == 10)) {
+            if (!read_uint_val(val_type, config_.bos_token_id)) return false;
+            config_.has_bos_token_id = true;
+        }
+        else if (key == "tokenizer.ggml.eos_token_id" && (val_type == 4 || val_type == 5 || val_type == 10)) {
+            if (!read_uint_val(val_type, config_.eos_token_id)) return false;
+            config_.has_eos_token_id = true;
+        }
+        else if (key == "tokenizer.ggml.padding_token_id" && (val_type == 4 || val_type == 5 || val_type == 10)) {
+            if (!read_uint_val(val_type, config_.pad_token_id)) return false;
+            config_.has_pad_token_id = true;
+        }
+        else if (key == "tokenizer.ggml.unknown_token_id" && (val_type == 4 || val_type == 5 || val_type == 10)) {
+            if (!read_uint_val(val_type, config_.unk_token_id)) return false;
+            config_.has_unk_token_id = true;
+        }
+        else if (key == "tokenizer.ggml.add_space_prefix" && val_type == 7) {
+            if (!has_bytes(ptr, end, 1)) return false;
+            config_.add_space_prefix = (*ptr++ != 0);
+            config_.has_add_space_prefix = true;
+        }
         else if (key == "tokenizer.ggml.tokens" && val_type == 9) {
             if (!has_bytes(ptr, end, 12)) return false;
             uint32_t arr_type = 0;

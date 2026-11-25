@@ -370,6 +370,63 @@ static void test_engine_e2e_turbo_parity() {
     std::cout << "  ✓ PASS: HavenEngine forward() & forward_batch() match bit-identically on both Turbo modes!\n";
 }
 
+static void test_gemma4_tokenizer_bos_eos_and_space_prefix() {
+    std::cout << "[4/4] Testing HavenTokenizer Gemma 4 BOS/EOS priority & add_space_prefix=false...\n";
+    // Build minimal synthetic vocab mimicking Gemma 4's exact ID layout where "<s>" (203) and "</s>" (212)
+    // appear AFTER "<bos>" (2) and "<eos>" (1) and must NEVER overwrite them!
+    std::vector<std::string> vocab(256, "<unused>");
+    vocab[0]   = "<pad>";
+    vocab[1]   = "<eos>";
+    vocab[2]   = "<bos>";
+    vocab[3]   = "<unk>";
+    vocab[105] = "<|turn>";
+    vocab[106] = "<turn|>";
+    vocab[107] = "\n";
+    vocab[203] = "<s>";
+    vocab[212] = "</s>";
+    vocab[220] = "user";
+    vocab[221] = "\xe2\x96\x81user";
+    vocab[222] = "model";
+    vocab[223] = "\xe2\x96\x81model";
+    vocab[224] = "Hello";
+    vocab[225] = "\xe2\x96\x81Hello";
+    vocab[226] = "\xe2\x96\x81world";
+
+    ModelConfig g4_cfg;
+    g4_cfg.architecture = "gemma4";
+    g4_cfg.is_gemma = true;
+    g4_cfg.has_bos_token_id = true; g4_cfg.bos_token_id = 2;
+    g4_cfg.has_eos_token_id = true; g4_cfg.eos_token_id = 1;
+    g4_cfg.has_pad_token_id = true; g4_cfg.pad_token_id = 0;
+    g4_cfg.has_unk_token_id = true; g4_cfg.unk_token_id = 3;
+    g4_cfg.has_add_space_prefix = true; g4_cfg.add_space_prefix = false;
+
+    HavenTokenizer tok;
+    tok.initialize(vocab, &g4_cfg);
+    if (tok.bos_token() != 2 || tok.eos_token() != 1 || tok.is_stop_token(212)) {
+        std::cerr << "FAIL: Gemma 4 BOS/EOS mismatch (bos=" << tok.bos_token() << ", eos=" << tok.eos_token() << ")\n";
+        std::exit(1);
+    }
+
+    auto ids = tok.encode("<|turn>user\nHello world<turn|>\n<|turn>model\n", true);
+    const std::vector<uint32_t> expected = {2, 105, 220, 107, 224, 226, 106, 107, 105, 222, 107};
+    if (ids != expected) {
+        std::cerr << "FAIL: Gemma 4 encode mismatch! Got:";
+        for (auto id : ids) std::cerr << " " << id;
+        std::cerr << "\n";
+        std::exit(1);
+    }
+
+    // Also verify heuristic fallback without ModelConfig still preserves <bos>=2 over <s>=203
+    HavenTokenizer tok_heur;
+    tok_heur.initialize(vocab);
+    if (tok_heur.bos_token() != 2 || tok_heur.eos_token() != 1) {
+        std::cerr << "FAIL: Heuristic BOS/EOS overwritten by <s>/</s>!\n";
+        std::exit(1);
+    }
+    std::cout << "  ✓ PASS: Gemma 4 BOS=2, EOS=1, stop_tokens, and exact add_space_prefix=false tokenization!\n";
+}
+
 int main() {
     std::cout << "==================================================================\n";
     std::cout << "  HAVEN-CPP GEMMA 4.5 TURBO BAKE & FWHT VERIFICATION SUITE\n";
@@ -377,6 +434,7 @@ int main() {
     test_fwht_exactness();
     test_norm_fold_hadamard_and_r2_math();
     test_engine_e2e_turbo_parity();
+    test_gemma4_tokenizer_bos_eos_and_space_prefix();
     std::cout << "==================================================================\n";
     std::cout << "  ALL GEMMA 4.5 TURBO BAKE TESTS PASSED 100%!\n";
     std::cout << "==================================================================\n";
