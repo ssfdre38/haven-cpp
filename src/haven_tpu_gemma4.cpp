@@ -2551,65 +2551,118 @@ bool HavenTpuGemma4Engine::build_and_upload_weights(const HavenEngine& host_engi
         return true;
     };
 
-    // 1. Stacked layer projection matrices (exact MLIR parameter order: fused FFN Gate+Up [L, 2*F_sh, D] + Down)
+    // 1. Stacked layer projection matrices (fused FFN Gate+Up [L, 2*F_sh, D] + Down [L, D, F_sh])
+    // Supports per-layer variable FFN width (e.g. Gemma 4/4.5 E2B double-wide shared-KV MLP: 6144 -> 12288)
+    // by zero-padding shorter layers per-replica so GeGLU(0, 0) * 0 == 0 with exact mathematical parity!
     {
         const int F_sh = F / R;
         const int GU_sh = 2 * F_sh;
-        const size_t shard_elems = static_cast<size_t>(L) * static_cast<size_t>(GU_sh) * static_cast<size_t>(D);
-        std::vector<std::vector<uint16_t>> bf16_shards(static_cast<size_t>(R));
-        std::vector<std::vector<int8_t>>   s8_shards(static_cast<size_t>(R));
-        std::vector<std::vector<float>>    sc_shards(static_cast<size_t>(R));
+        const size_t gu_shard_elems = static_cast<size_t>(L) * static_cast<size_t>(GU_sh) * static_cast<size_t>(D);
+        const size_t dn_shard_elems = static_cast<size_t>(L) * static_cast<size_t>(D) * static_cast<size_t>(F_sh);
+        std::vector<std::vector<uint16_t>> gu_bf16(static_cast<size_t>(R)), dn_bf16(static_cast<size_t>(R));
+        std::vector<std::vector<int8_t>>   gu_s8(static_cast<size_t>(R)),   dn_s8(static_cast<size_t>(R));
+        std::vector<std::vector<float>>    gu_sc(static_cast<size_t>(R)),   dn_sc(static_cast<size_t>(R));
         for (int rep = 0; rep < R; ++rep) {
-            if (!i8) bf16_shards[static_cast<size_t>(rep)].assign(shard_elems, 0);
-            else {
-                s8_shards[static_cast<size_t>(rep)].assign(shard_elems, 0);
-                sc_shards[static_cast<size_t>(rep)].assign(static_cast<size_t>(L) * static_cast<size_t>(GU_sh), 1.0f);
+            if (!i8) {
+                gu_bf16[static_cast<size_t>(rep)].assign(gu_shard_elems, 0);
+                dn_bf16[static_cast<size_t>(rep)].assign(dn_shard_elems, 0);
+            } else {
+                gu_s8[static_cast<size_t>(rep)].assign(gu_shard_elems, 0);
+                gu_sc[static_cast<size_t>(rep)].assign(static_cast<size_t>(L) * static_cast<size_t>(GU_sh), 1.0f);
+                dn_s8[static_cast<size_t>(rep)].assign(dn_shard_elems, 0);
+                dn_sc[static_cast<size_t>(rep)].assign(static_cast<size_t>(L) * static_cast<size_t>(D), 1.0f);
             }
         }
-        std::vector<float> gate_f32, up_f32;
+        std::vector<float> gate_f32, up_f32, down_f32;
+        std::vector<float> dn_slice(static_cast<size_t>(D) * static_cast<size_t>(F_sh));
         for (int l = 0; l < L; ++l) {
-            dequantize_full_matrix_f32(host_engine.get_layer_tensors(l).ffn_gate, F, D, gate_f32);
-            dequantize_full_matrix_f32(host_engine.get_layer_tensors(l).ffn_up,   F, D, up_f32);
+            const auto& lt = host_engine.get_layer_tensors(static_cast<uint32_t>(l));
+            const int layer_F = (lt.ffn_gate && lt.ffn_gate->shape.size() > 1)
+                ? std::min<int>(F, static_cast<int>(lt.ffn_gate->shape[1]))
+                : ((static_cast<size_t>(l) < model_cfg_.hidden_dim_per_layer.size() && model_cfg_.hidden_dim_per_layer[static_cast<size_t>(l)] > 0)
+                    ? std::min<int>(F, static_cast<int>(model_cfg_.hidden_dim_per_layer[static_cast<size_t>(l)]))
+                    : F);
+            const int lF_sh = layer_F / R;
+            const int l_h_ffn_dn = (model_cfg_.turbo_hadamard_ffn_down > 0 && (layer_F % static_cast<int>(model_cfg_.turbo_hadamard_ffn_down)) == 0)
+                ? static_cast<int>(model_cfg_.turbo_hadamard_ffn_down) : 0;
+
+            dequantize_full_matrix_f32(lt.ffn_gate, layer_F, D, gate_f32);
+            dequantize_full_matrix_f32(lt.ffn_up,   layer_F, D, up_f32);
+            dequantize_full_matrix_f32(lt.ffn_down, D, layer_F, down_f32);
             if (h_ffn > 0) {
-                unrotate_matrix_rows(gate_f32, F, D, h_ffn);
-                unrotate_matrix_rows(up_f32,   F, D, h_ffn);
+                unrotate_matrix_rows(gate_f32, layer_F, D, h_ffn);
+                unrotate_matrix_rows(up_f32,   layer_F, D, h_ffn);
             }
+            if (l_h_ffn_dn > 0) {
+                unrotate_matrix_rows(down_f32, D, layer_F, l_h_ffn_dn);
+            }
+
             for (int rep = 0; rep < R; ++rep) {
                 const size_t base_el = static_cast<size_t>(l) * static_cast<size_t>(GU_sh) * static_cast<size_t>(D);
                 const size_t base_sc = static_cast<size_t>(l) * static_cast<size_t>(GU_sh);
-                const float* g_src = gate_f32.data() + static_cast<size_t>(rep * F_sh) * static_cast<size_t>(D);
-                const float* u_src = up_f32.data()   + static_cast<size_t>(rep * F_sh) * static_cast<size_t>(D);
+                const float* g_src = gate_f32.data() + static_cast<size_t>(rep * lF_sh) * static_cast<size_t>(D);
+                const float* u_src = up_f32.data()   + static_cast<size_t>(rep * lF_sh) * static_cast<size_t>(D);
                 if (!i8) {
-                    HavenTpuPjrtBackend::convert_f32_to_bf16(g_src, bf16_shards[static_cast<size_t>(rep)].data() + base_el, static_cast<size_t>(F_sh) * static_cast<size_t>(D));
-                    HavenTpuPjrtBackend::convert_f32_to_bf16(u_src, bf16_shards[static_cast<size_t>(rep)].data() + base_el + static_cast<size_t>(F_sh) * static_cast<size_t>(D), static_cast<size_t>(F_sh) * static_cast<size_t>(D));
+                    HavenTpuPjrtBackend::convert_f32_to_bf16(g_src, gu_bf16[static_cast<size_t>(rep)].data() + base_el, static_cast<size_t>(lF_sh) * static_cast<size_t>(D));
+                    HavenTpuPjrtBackend::convert_f32_to_bf16(u_src, gu_bf16[static_cast<size_t>(rep)].data() + base_el + static_cast<size_t>(F_sh) * static_cast<size_t>(D), static_cast<size_t>(lF_sh) * static_cast<size_t>(D));
                 } else {
-                    quantize_f32_to_s8_per_row(g_src, F_sh, D,
-                        s8_shards[static_cast<size_t>(rep)].data() + base_el,
-                        sc_shards[static_cast<size_t>(rep)].data() + base_sc);
-                    quantize_f32_to_s8_per_row(u_src, F_sh, D,
-                        s8_shards[static_cast<size_t>(rep)].data() + base_el + static_cast<size_t>(F_sh) * static_cast<size_t>(D),
-                        sc_shards[static_cast<size_t>(rep)].data() + base_sc + static_cast<size_t>(F_sh));
+                    quantize_f32_to_s8_per_row(g_src, lF_sh, D,
+                        gu_s8[static_cast<size_t>(rep)].data() + base_el,
+                        gu_sc[static_cast<size_t>(rep)].data() + base_sc);
+                    quantize_f32_to_s8_per_row(u_src, lF_sh, D,
+                        gu_s8[static_cast<size_t>(rep)].data() + base_el + static_cast<size_t>(F_sh) * static_cast<size_t>(D),
+                        gu_sc[static_cast<size_t>(rep)].data() + base_sc + static_cast<size_t>(F_sh));
+                }
+
+                std::fill(dn_slice.begin(), dn_slice.end(), 0.0f);
+                const int c_off = rep * lF_sh;
+                for (int rr = 0; rr < D; ++rr) {
+                    const float* src_row = down_f32.data() + static_cast<size_t>(rr) * static_cast<size_t>(layer_F) + static_cast<size_t>(c_off);
+                    std::memcpy(dn_slice.data() + static_cast<size_t>(rr) * static_cast<size_t>(F_sh),
+                                src_row, static_cast<size_t>(lF_sh) * sizeof(float));
+                }
+                const size_t dn_off = static_cast<size_t>(l) * static_cast<size_t>(D) * static_cast<size_t>(F_sh);
+                if (!i8) {
+                    HavenTpuPjrtBackend::convert_f32_to_bf16(dn_slice.data(), dn_bf16[static_cast<size_t>(rep)].data() + dn_off, dn_slice.size());
+                } else {
+                    quantize_f32_to_s8_per_row(dn_slice.data(), D, F_sh,
+                        dn_s8[static_cast<size_t>(rep)].data() + dn_off,
+                        dn_sc[static_cast<size_t>(rep)].data() + static_cast<size_t>(l) * static_cast<size_t>(D));
                 }
             }
         }
         for (int rep = 0; rep < R; ++rep) {
             const int dev = replica_dev_indices_[static_cast<size_t>(rep)];
-            PJRT_Buffer* wb = nullptr;
+            PJRT_Buffer* wb_gu = nullptr;
+            PJRT_Buffer* wb_dn = nullptr;
             if (!i8) {
-                wb = backend_->upload_bf16_nd(bf16_shards[static_cast<size_t>(rep)].data(), {L, GU_sh, D}, dev);
-                total_bytes += shard_elems * sizeof(uint16_t);
+                wb_gu = backend_->upload_bf16_nd(gu_bf16[static_cast<size_t>(rep)].data(), {L, GU_sh, D}, dev);
+                wb_dn = backend_->upload_bf16_nd(dn_bf16[static_cast<size_t>(rep)].data(), {L, D, F_sh}, dev);
+                total_bytes += (gu_shard_elems + dn_shard_elems) * sizeof(uint16_t);
             } else {
-                wb = backend_->upload_s8_nd(s8_shards[static_cast<size_t>(rep)].data(), {L, GU_sh, D}, dev);
-                PJRT_Buffer* sb = backend_->upload_f32_nd(sc_shards[static_cast<size_t>(rep)].data(), {L, GU_sh}, dev);
-                if (!sb) { backend_->destroy_buffer(wb); return false; }
-                replica_scale_bufs[static_cast<size_t>(rep)].push_back(sb);
-                total_bytes += shard_elems + static_cast<size_t>(L) * static_cast<size_t>(GU_sh) * sizeof(float);
+                wb_gu = backend_->upload_s8_nd(gu_s8[static_cast<size_t>(rep)].data(), {L, GU_sh, D}, dev);
+                PJRT_Buffer* sb_gu = backend_->upload_f32_nd(gu_sc[static_cast<size_t>(rep)].data(), {L, GU_sh}, dev);
+                wb_dn = backend_->upload_s8_nd(dn_s8[static_cast<size_t>(rep)].data(), {L, D, F_sh}, dev);
+                PJRT_Buffer* sb_dn = backend_->upload_f32_nd(dn_sc[static_cast<size_t>(rep)].data(), {L, D}, dev);
+                if (!sb_gu || !sb_dn) {
+                    backend_->destroy_buffer(wb_gu); backend_->destroy_buffer(sb_gu);
+                    backend_->destroy_buffer(wb_dn); backend_->destroy_buffer(sb_dn);
+                    return false;
+                }
+                replica_scale_bufs[static_cast<size_t>(rep)].push_back(sb_gu);
+                replica_scale_bufs[static_cast<size_t>(rep)].push_back(sb_dn);
+                total_bytes += gu_shard_elems + dn_shard_elems +
+                               (static_cast<size_t>(L) * static_cast<size_t>(GU_sh + D)) * sizeof(float);
             }
-            if (!wb) return false;
-            replica_weight_bufs_[static_cast<size_t>(rep)].push_back(wb);
+            if (!wb_gu || !wb_dn) {
+                backend_->destroy_buffer(wb_gu);
+                backend_->destroy_buffer(wb_dn);
+                return false;
+            }
+            replica_weight_bufs_[static_cast<size_t>(rep)].push_back(wb_gu);
+            replica_weight_bufs_[static_cast<size_t>(rep)].push_back(wb_dn);
         }
     }
-    if (!upload_sharded_stack(all_layers, [&](int l){ return host_engine.get_layer_tensors(l).ffn_down; }, D, F, false, true, false, 0, h_ffn_dn)) return false;
 
     // 1b. Sparse Mixture-of-Experts 4D weight stacks (streamed replica-by-replica to keep peak host RAM minimal!)
     if (spec_.is_moe) {
