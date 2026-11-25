@@ -186,7 +186,7 @@ static int run_synthetic_multi_arch_ir_suite() {
         cases.push_back({"Gemma-2-27B-46L", mc, false, false});
     }
 
-    // 6. Ava 26B / Gemma 4 26B-A4B MoE (30L Hybrid SWA-256(8kv)+Global-512(2kv, k_eq_v), 128E Top-8, Shared+MoE)
+    // 6. Ava 26B / Gemma 4.5 26B-A4B MoE (30L Hybrid SWA-256(8kv)+Global-512(2kv, k_eq_v), 128E Top-8, Shared+MoE)
     {
         ModelConfig mc;
         mc.architecture = "gemma4";
@@ -209,10 +209,31 @@ static int run_synthetic_multi_arch_ir_suite() {
         cases.push_back({"Ava-26B-A4B-MoE-30L", mc, false, false});
     }
 
+    // 7. Gemma 4.5 31B Dense (60L Hybrid SWA-256(16kv)+Global-512(4kv, k_eq_v), 32Q, F=21504, GeGLU, Tied)
+    {
+        ModelConfig mc;
+        mc.architecture = "gemma4";
+        mc.is_gemma = true;
+        mc.num_layers = 60;
+        mc.embedding_dim = 5376;
+        mc.hidden_dim = 21504;
+        mc.vocab_size = 262144;
+        mc.num_heads = 32;
+        mc.num_kv_heads = 16;
+        mc.head_dim = 512;
+        mc.head_dim_swa = 256;
+        mc.sliding_window = 1024;
+        mc.shared_kv_layers = 0;
+        mc.final_logit_softcapping = 30.0f;
+        mc.ffn_activation = FfnActivation::GELU;
+        cases.push_back({"Gemma-4.5-31B-Dense-60L", mc, false, false});
+    }
+
     int total_checks = 0;
     for (const auto& ac : cases) {
         const bool is_moe = (ac.mc.expert_count > 0);
-        std::vector<int> replicas = is_moe ? std::vector<int>{1, 4, 8} : std::vector<int>{1, 4};
+        const bool test_r8 = is_moe || (ac.mc.num_layers >= 60 && (ac.mc.num_heads % 8 == 0) && (ac.mc.hidden_dim % 8 == 0));
+        std::vector<int> replicas = test_r8 ? std::vector<int>{1, 4, 8} : std::vector<int>{1, 4};
         for (int R : replicas) {
             for (int B : {1, 16, 128}) {
                 for (bool i8 : {false, true}) {
@@ -251,7 +272,7 @@ static int run_synthetic_multi_arch_ir_suite() {
                 }
             }
         }
-        std::cout << "  [PASS] " << ac.name << " (R=" << (is_moe ? "1,4,8" : "1,4") << " | B=1,16,128 | BF16,INT8 | Decode + Slot-Prefill S=8,16,32,128)\n";
+        std::cout << "  [PASS] " << ac.name << " (R=" << (test_r8 ? "1,4,8" : "1,4") << " | B=1,16,128 | BF16,INT8 | Decode + Slot-Prefill S=8,16,32,128)\n";
     }
 
     std::cout << "ALL " << total_checks << " SYNTHETIC MULTI-ARCH STABLEHLO GRAPHS VERIFIED!\n";
@@ -345,7 +366,9 @@ int main(int argc, char** argv) {
 
     // Offline StableHLO IR verification mode (runs locally on Windows or Linux with zero TPU!)
     if (emit_only) {
-        std::vector<int> reps = spec.is_moe ? std::vector<int>{1, 4, 8} : std::vector<int>{1, 4};
+        const bool can_r8 = (spec.hidden_dim % 8 == 0) && (spec.num_heads % 8 == 0) &&
+                            (spec.vocab_size % 8 == 0) && (!spec.is_moe || (spec.expert_ffn_dim % 8 == 0));
+        std::vector<int> reps = can_r8 ? std::vector<int>{1, 4, 8} : std::vector<int>{1, 4};
         for (int R : reps) {
             for (bool i8 : {false, true}) {
                 for (bool onchip_emb : {false, true}) {
@@ -383,13 +406,13 @@ int main(int argc, char** argv) {
               << tpu.get_pjrt_major() << "." << tpu.get_pjrt_minor() << ")\n";
 
     // Prepare exact reference prompt & compute CPU Ground-Truth Logits for parity check!
-    const std::string ava_sys = "<|turn>system\nYou are Ava, Daniel's sovereign AI companion built on Gemma 4 Turbo MoE. Speak naturally, directly, intelligently, and concisely without corporate filler.<turn|>\n";
+    const std::string ava_sys = "<|turn>system\nYou are Ava, Daniel's sovereign AI companion built on Gemma 4.5 Turbo. Speak naturally, directly, intelligently, and concisely without corporate filler.<turn|>\n";
     const std::string prompt_str = spec.is_moe
         ? host_engine.format_chat_prompt(
-            "Hey Ava! All 30 of your Gemma 4 26B-A4B MoE layers and 128 experts are now running natively inside haven.cpp on Google Cloud TPU Trillium HBM3. How does pure C++20 silicon speed feel?",
+            "Hey Ava! All 30 of your Gemma 4.5 26B-A4B MoE layers and 128 experts are now running natively inside haven.cpp on Google Cloud TPU Trillium HBM3. How does pure C++20 silicon speed feel?",
             ava_sys)
         : host_engine.format_chat_prompt(
-            "Hey Aura! All 42 of your transformer layers are now running fully on-chip inside Google TPU Trillium HBM3. How does pure silicon speed feel?");
+            "Hey Aura! All " + std::to_string(mc.num_layers) + " of your Gemma 4.5 transformer layers are now running fully on-chip inside Google TPU Trillium HBM3. How does pure silicon speed feel?");
     auto prompt_toks = host_engine.tokenize(prompt_str, true);
     std::cout << "Prompt tokens: " << prompt_toks.size() << "\n";
 
@@ -409,7 +432,9 @@ int main(int argc, char** argv) {
 
     // Live Async Per-Slot pos_vec[B] & Slot-Targeted Multi-Bucket Prefill Parity Verification!
     {
-        const int R_test = (n_devs >= 8 && spec.is_moe) ? 8 : ((n_devs >= 4) ? 4 : 1);
+        const bool can_r8 = (n_devs >= 8) && (spec.hidden_dim % 8 == 0) && (spec.num_heads % 8 == 0) &&
+                            (spec.vocab_size % 8 == 0) && (!spec.is_moe || (spec.expert_ffn_dim % 8 == 0));
+        const int R_test = can_r8 ? 8 : ((n_devs >= 4) ? 4 : 1);
         std::cout << "\n----------------------------------------------------------------------\n";
         std::cout << "[VERIFY] Multi-Bucket Slot-Targeted Prefill + Async Per-Slot pos_vec[B=4] (R=" << R_test << ")\n";
         std::cout << "----------------------------------------------------------------------\n";
@@ -663,16 +688,22 @@ int main(int argc, char** argv) {
         gemma_tpu.shutdown();
     };
 
+    const bool can_r8 = (n_devs >= 8) && (spec.hidden_dim % 8 == 0) && (spec.num_heads % 8 == 0) &&
+                        (spec.vocab_size % 8 == 0) && (!spec.is_moe || (spec.expert_ffn_dim % 8 == 0));
+    // Large dense models (e.g. Gemma 4.5 31B Dense, ~62 GB BF16) exceed a single 32 GB v6e chip
+    const bool is_large_dense = (!spec.is_moe && (static_cast<uint64_t>(spec.num_layers) * static_cast<uint64_t>(spec.embedding_dim) * static_cast<uint64_t>(spec.hidden_dim) * 3ULL > 4000000000ULL));
+
     if (spec.is_moe) {
-        // MoE 26B-A4B Suite: 4-chip (v6e-4) and 8-chip (v6e-8) pod scaling!
+        // MoE 26B-A4B Suite: 8-chip (v6e-8) pod and 4-chip (v6e-4) scaling!
         if (n_devs >= 8) {
-            run_config_bench("M3. Ava 26B-A4B Interactive (8-Chip v6e-8 W8A16 INT8)",         8, 1,   true,  false, 128, 128, true);
-            run_config_bench("M3-P. Ava 26B-A4B W8A8/W8A16 INT8 Parity (8-Chip FullLogits)",  8, 1,   true,  true,  32,  128, true);
-            run_config_bench("M4. Ava 26B-A4B Batch B=32 (8-Chip v6e-8 W8A8 INT8)",           8, 32,  true,  false, 64,  0,   true);
-            run_config_bench("M5. Ava 26B-A4B Batch B=64 (8-Chip v6e-8 W8A8 INT8)",           8, 64,  true,  false, 64,  0,   true);
-            run_config_bench("M6. Ava 26B-A4B Batch B=128 (8-Chip v6e-8 W8A8 INT8)",          8, 128, true,  false, 64,  0,   true);
-            run_config_bench("M7. Ava 26B-A4B Batch B=128 (8-Chip v6e-8 BF16)",               8, 128, false, false, 64,  0,   true);
-            run_config_bench("M2. Ava 26B-A4B Interactive (8-Chip v6e-8 BF16 OnChipEmb)",     8, 1,   false, false, 128, 128, true);
+            run_config_bench("M8A. Gemma 4.5 26B-A4B Interactive (8-Chip v6e-8 Hadamard W8A8)",          8, 1,   true,  false, 128, 128, true, false);
+            run_config_bench("M8A-P. Gemma 4.5 26B-A4B Hadamard W8A8 Parity (8-Chip FullLogits)",      8, 1,   true,  true,  32,  128, true, false);
+            run_config_bench("M8B. Gemma 4.5 26B-A4B Interactive (8-Chip v6e-8 Pure BF16)",            8, 1,   false, false, 128, 128, true, false);
+            run_config_bench("M8C. Gemma 4.5 26B-A4B Batch B=64 (8-Chip v6e-8 Hadamard W8A8)",         8, 64,  true,  false, 64,  0,   true, false);
+            run_config_bench("M8D. Gemma 4.5 26B-A4B Batch B=128 (8-Chip v6e-8 Hadamard W8A8)",        8, 128, true,  false, 64,  0,   true, false);
+            run_config_bench("M8E. Gemma 4.5 26B-A4B Batch B=256 (8-Chip v6e-8 Hadamard W8A8 BF16KV)", 8, 256, true,  false, 64,  0,   true, false);
+            run_config_bench("M8F. Gemma 4.5 26B-A4B Batch B=512 (8-Chip v6e-8 Hadamard W8A8 FP8KV!)", 8, 512, true,  false, 64,  0,   true, true);
+            run_config_bench("M8G. Gemma 4.5 26B-A4B Batch B=128 (8-Chip v6e-8 Pure BF16)",            8, 128, false, false, 64,  0,   true, false);
         } else if (n_devs >= 4) {
             run_config_bench("M4C. Ava 26B-A4B Interactive (4-Chip Hadamard W8A8 + Pow2-SWA)",    4, 1,   true,  false, 128, 128, true,  false);
             run_config_bench("M4C-P. Ava 26B-A4B Hadamard W8A8 Parity (FullLogits)",            4, 1,   true,  true,  32,  128, true,  false);
@@ -684,6 +715,29 @@ int main(int argc, char** argv) {
             run_config_bench("M4B. Ava 26B-A4B Interactive (4-Chip Pure BF16 OnChipEmb)",       4, 1,   false, false, 128, 128, true,  false);
         } else {
             run_config_bench("M1A. Ava 26B-A4B Single-Chip (1-Chip W8A16 INT8)",              1, 1,   true,  false, 64,  128, true);
+        }
+    } else if (is_large_dense) {
+        // Large Dense Suite (Gemma 4.5 31B Dense, 60L, ~62 GB BF16 / ~31 GB INT8): requires R>=4!
+        if (can_r8) {
+            run_config_bench("D8-P. 31B Dense Parity Check (8-Chip v6e-8 BF16 FullLogits)",       8, 1,   false, true,  64,  128, true, false);
+            run_config_bench("D8-IP. 31B Dense INT8 Parity Check (8-Chip v6e-8 W8A16 FullLogits)",8, 1,   true,  true,  32,  128, true, false);
+            run_config_bench("D8-I. 31B Dense Interactive Peak (8-Chip v6e-8 W8A16 INT8)",        8, 1,   true,  false, 128, 128, true, false);
+            run_config_bench("D8-B. 31B Dense Interactive (8-Chip v6e-8 Pure BF16)",              8, 1,   false, false, 128, 128, true, false);
+            run_config_bench("D8-32. 31B Dense Batch B=32 (8-Chip v6e-8 W8A16 INT8)",             8, 32,  true,  false, 64,  0,   true, false);
+            run_config_bench("D8-64. 31B Dense Batch B=64 (8-Chip v6e-8 W8A16 INT8)",             8, 64,  true,  false, 64,  0,   true, false);
+            run_config_bench("D8-128. 31B Dense Batch B=128 (8-Chip v6e-8 W8A16 INT8 BF16KV)",    8, 128, true,  false, 64,  0,   true, false);
+            run_config_bench("D8-128F. 31B Dense Batch B=128 (8-Chip v6e-8 W8A16 INT8 FP8KV)",    8, 128, true,  false, 64,  0,   true, true);
+            run_config_bench("D4-I. 31B Dense Interactive (4-Chip TP W8A16 INT8 comparison)",     4, 1,   true,  false, 128, 128, true, false);
+        } else if (n_devs >= 4) {
+            run_config_bench("D4-P. 31B Dense Parity Check (4-Chip v6e-4 BF16 FullLogits)",       4, 1,   false, true,  64,  128, true, false);
+            run_config_bench("D4-IP. 31B Dense INT8 Parity Check (4-Chip v6e-4 W8A16 FullLogits)",4, 1,   true,  true,  32,  128, true, false);
+            run_config_bench("D4-I. 31B Dense Interactive Peak (4-Chip v6e-4 W8A16 INT8)",        4, 1,   true,  false, 128, 128, true, false);
+            run_config_bench("D4-B. 31B Dense Interactive (4-Chip v6e-4 Pure BF16)",              4, 1,   false, false, 128, 128, true, false);
+            run_config_bench("D4-32. 31B Dense Batch B=32 (4-Chip v6e-4 W8A16 INT8)",             4, 32,  true,  false, 64,  0,   true, false);
+            run_config_bench("D4-64. 31B Dense Batch B=64 (4-Chip v6e-4 W8A16 INT8)",             4, 64,  true,  false, 64,  0,   true, false);
+            run_config_bench("D4-128F. 31B Dense Batch B=128 (4-Chip v6e-4 W8A16 INT8 FP8KV)",    4, 128, true,  false, 64,  0,   true, true);
+        } else {
+            std::cerr << "Large dense model requires at least 4 TPU chips (>= 128 GB HBM3).\n";
         }
     } else {
         if (!onchip_emb_only) {
@@ -697,6 +751,9 @@ int main(int argc, char** argv) {
                 run_config_bench("2C. Single-Stream Interactive (4-Chip Tensor-Parallel BF16)", 4, 1, false, false, 128, 128);
                 run_config_bench("2D. Single-Stream Interactive (4-Chip Tensor-Parallel W8A16 INT8)", 4, 1, true, false, 128, 128);
             }
+            if (can_r8) {
+                run_config_bench("2E. Single-Stream Interactive (8-Chip Optical ICI TP W8A16 INT8)", 8, 1, true, false, 128, 128, true);
+            }
         }
 
         if (n_devs >= 4) {
@@ -705,6 +762,9 @@ int main(int argc, char** argv) {
             run_config_bench("3C. Cloud Continuous Batching On-Chip Gather (4-Chip TP, B=64, BF16)",   4, 64, false, false, 64, 0, true);
             run_config_bench("3D. Cloud Continuous Batching On-Chip Gather (4-Chip TP, B=128, INT8)",  4, 128, true, false, 64, 0, true);
             run_config_bench("3E. Cloud Continuous Batching On-Chip Gather (4-Chip TP, B=128, BF16)",  4, 128, false, false, 64, 0, true);
+            if (can_r8) {
+                run_config_bench("3F. Cloud Continuous Batching On-Chip Gather (8-Chip TP, B=256, INT8)", 8, 256, true, false, 64, 0, true);
+            }
         } else {
             run_config_bench("3A. Single-Chip On-Chip Gather (1-Chip, B=32, W8A16 INT8)", 1, 32, true, false, 64, 0, true);
         }
