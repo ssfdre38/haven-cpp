@@ -30,16 +30,19 @@ jobs:
             test-security-fuzz \
             test-secure-cluster \
             test-multi-model-arch \
+            test-model-intelligence \
+            haven-modules \
             test-tpu-scheduler \
             test-tpu-gemma4-onchip \
             -j$(nproc)
 
-      - name: Run zero-GGUF security, architecture, scheduler & TPU StableHLO tests
+      - name: Run zero-GGUF security, architecture, intelligence, scheduler & TPU StableHLO tests
         run: |
           ./build/test-turbo-bake
           ./build/test-security-fuzz
           ./build/test-secure-cluster
           ./build/test-multi-model-arch
+          ./build/test-model-intelligence
           ./build/test-tpu-scheduler
           ./build/test-tpu-gemma4-onchip --emit-only-synthetic
 
@@ -66,6 +69,8 @@ jobs:
             test-security-fuzz `
             test-secure-cluster `
             test-multi-model-arch `
+            test-model-intelligence `
+            haven-modules `
             test-tpu-scheduler `
             test-tpu-gemma4-onchip `
             plugin_terminal `
@@ -73,11 +78,12 @@ jobs:
             plugin_vault_sync `
             plugin_browser
 
-      - name: Run zero-GGUF security, architecture, scheduler & TPU StableHLO tests
+      - name: Run zero-GGUF security, architecture, intelligence, scheduler & TPU StableHLO tests
         run: |
           .\build\test-turbo-bake.exe
           .\build\test-security-fuzz.exe
           .\build\test-secure-cluster.exe
           .\build\test-multi-model-arch.exe
+          .\build\test-model-intelligence.exe
           .\build\test-tpu-scheduler.exe
           .\build\test-tpu-gemma4-onchip.exe --emit-only-synthetic

@@ -65,6 +65,7 @@ set(HAVEN_CORE_SRCS
     src/haven_memory.cpp
     src/haven_sampler.cpp
     src/haven_gguf.cpp
+    src/haven_intelligence.cpp
     src/haven_kvcache.cpp
     src/haven_knowledge_store.cpp
     src/haven_attention_telemetry.cpp
@@ -203,6 +204,40 @@ target_link_libraries(test-tpu-gemma4-onchip PRIVATE haven_core)
 # Native Zero-Compile-Time CUDA Engine Verification & Benchmark
 add_executable(test-cuda-gemma4 tests/test_cuda_gemma4.cpp)
 target_link_libraries(test-cuda-gemma4 PRIVATE haven_core)
+
+# Model Intelligence Header DNA Router & Dynamic Microkernel Module Suite
+add_executable(test-model-intelligence tests/test_model_intelligence.cpp)
+target_link_libraries(test-model-intelligence PRIVATE haven_core)
+
+# Dynamic Zero-Bloat Microkernel Modules (Arch / Backend / Capability)
+function(haven_add_microkernel_module target_name subdir source_file)
+    add_library(${target_name} SHARED ${source_file})
+    set_target_properties(${target_name} PROPERTIES
+        PREFIX ""
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/modules/${subdir}"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/modules/${subdir}"
+    )
+    if (NOT WIN32)
+        target_link_libraries(${target_name} PRIVATE dl)
+    endif()
+endfunction()
+
+haven_add_microkernel_module(haven_arch_gemma4  arch    modules/arch/haven_arch_gemma4.cpp)
+haven_add_microkernel_module(haven_arch_llama   arch    modules/arch/haven_arch_llama.cpp)
+haven_add_microkernel_module(haven_arch_qwen    arch    modules/arch/haven_arch_qwen.cpp)
+haven_add_microkernel_module(haven_arch_phi     arch    modules/arch/haven_arch_phi.cpp)
+haven_add_microkernel_module(haven_backend_avx2 backend modules/backend/haven_backend_avx2.cpp)
+haven_add_microkernel_module(haven_backend_cuda backend modules/backend/haven_backend_cuda.cpp)
+haven_add_microkernel_module(haven_backend_tpu  backend modules/backend/haven_backend_tpu.cpp)
+haven_add_microkernel_module(haven_cap_moe      cap     modules/cap/haven_cap_moe.cpp)
+haven_add_microkernel_module(haven_cap_turbo    cap     modules/cap/haven_cap_turbo.cpp)
+haven_add_microkernel_module(haven_cap_vision   cap     modules/cap/haven_cap_vision.cpp)
+
+add_custom_target(haven-modules DEPENDS
+    haven_arch_gemma4 haven_arch_llama haven_arch_qwen haven_arch_phi
+    haven_backend_avx2 haven_backend_cuda haven_backend_tpu
+    haven_cap_moe haven_cap_turbo haven_cap_vision
+)
 
 # Multi-Tenant TPU Continuous-Batching Scheduler Unit Test
 add_executable(test-tpu-scheduler tests/test_tpu_scheduler.cpp)

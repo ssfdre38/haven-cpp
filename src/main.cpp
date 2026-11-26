@@ -1,5 +1,6 @@
 #include "haven/haven_engine.h"
 #include "haven/haven_cuda.h"
+#include "haven/haven_intelligence.h"
 #include <iostream>
 #include <chrono>
 #include <vector>
@@ -217,6 +218,9 @@ int main(int argc, char** argv) {
     std::string model_path = "C:\\Users\\admin\\gemma4-turbo-family\\haven-chat-v5.0.gguf";
     bool run_benchmark = false;
     bool use_cuda_gpu = false;
+    bool force_cpu = false;
+    bool inspect_only = false;
+    bool inspect_json = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -224,18 +228,64 @@ int main(int argc, char** argv) {
             run_benchmark = true;
         } else if (arg == "--gpu" || arg == "--cuda") {
             use_cuda_gpu = true;
+        } else if (arg == "--cpu") {
+            force_cpu = true;
+        } else if (arg == "--inspect" || arg == "-i") {
+            inspect_only = true;
+        } else if (arg == "--inspect-json") {
+            inspect_only = true;
+            inspect_json = true;
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: haven-cli.exe [options] [model_path.gguf]\n\n"
                       << "Options:\n"
-                      << "  --chat, -c    Launch interactive companion chat REPL (default)\n"
-                      << "  --gpu, --cuda Accelerate interactive chat with native zero-compile CUDA backend\n"
-                      << "  --bench, -b   Run 12-system enterprise benchmark suite\n"
-                      << "  --tpu, -t     Run TPU fabric & Pathways asynchronous accelerator benchmark\n"
-                      << "  --help, -h    Display this help menu\n";
+                      << "  --chat, -c      Launch interactive companion chat REPL (default)\n"
+                      << "  --inspect, -i   Zero-mmap GGUF header DNA probe & microkernel routing plan (<2 ms)\n"
+                      << "  --inspect-json  Machine-readable JSON output for --inspect\n"
+                      << "  --gpu, --cuda   Accelerate interactive chat with native zero-compile CUDA backend\n"
+                      << "  --cpu           Force native AVX2+FMA CPU backend\n"
+                      << "  --bench, -b     Run 12-system enterprise benchmark suite\n"
+                      << "  --tpu, -t       Run TPU fabric & Pathways asynchronous accelerator benchmark\n"
+                      << "  --help, -h      Display this help menu\n";
             return 0;
         } else if (!arg.starts_with("-")) {
             model_path = arg;
         }
+    }
+
+    // Header-first Model Intelligence Probe & Zero-Bloat Microkernel Module Activation
+    haven::ModelFingerprint fp;
+    std::string probe_err;
+    haven::HavenModuleLoader module_loader;
+    haven::ExecutionPlan intel_plan;
+    bool intel_ready = false;
+    if (haven::HavenModelIntelligence::probe_gguf_header(model_path, fp, probe_err)) {
+        auto hw = haven::HavenModelIntelligence::probe_hardware();
+        haven::RoutingOptions ropts;
+        if (force_cpu) ropts.preferred_backend = haven::BackendKind::CPU_AVX2;
+        else if (use_cuda_gpu) ropts.preferred_backend = haven::BackendKind::CUDA_NATIVE;
+        intel_plan = haven::HavenModelIntelligence::plan_execution(fp, hw, ropts);
+        std::string mod_log;
+        module_loader.activate_plan(intel_plan, mod_log);
+        intel_ready = true;
+
+        if (inspect_only) {
+            auto loaded = module_loader.get_active_module_ids();
+            if (inspect_json) {
+                std::cout << haven::HavenModelIntelligence::to_json(intel_plan, loaded) << "\n";
+            } else {
+                std::cout << haven::HavenModelIntelligence::format_report(intel_plan, loaded);
+                if (!mod_log.empty()) {
+                    std::cout << "[Module Loader]\n" << mod_log;
+                }
+            }
+            return 0;
+        }
+        if (!force_cpu && intel_plan.selected_backend == haven::BackendKind::CUDA_NATIVE) {
+            use_cuda_gpu = true;
+        }
+    } else if (inspect_only) {
+        std::cerr << "❌ Header probe failed: " << probe_err << "\n";
+        return 1;
     }
 
     haven::HavenEngine haven_engine;
@@ -246,6 +296,13 @@ int main(int argc, char** argv) {
     }
     auto end_load = std::chrono::high_resolution_clock::now();
     double load_ms = std::chrono::duration<double, std::milli>(end_load - start_load).count();
+    if (intel_ready) {
+        std::cout << "🧠 [HavenIntelligence] " << intel_plan.selected_arch_module
+                  << " + " << intel_plan.selected_backend_module
+                  << " (" << module_loader.get_active_module_count() << " resident / "
+                  << intel_plan.skipped_modules.size() << " skipped, probe="
+                  << std::fixed << std::setprecision(2) << intel_plan.fingerprint.probe_time_ms << " ms)\n";
+    }
 
     if (run_benchmark) {
         run_benchmark_suite(haven_engine, model_path);

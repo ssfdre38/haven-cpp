@@ -6,6 +6,7 @@
 #include "haven/haven_tpu_gemma4.h"
 #include "haven/haven_tpu_scheduler.h"
 #include "haven/haven_cuda.h"
+#include "haven/haven_intelligence.h"
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -176,6 +177,9 @@ private:
     HavenTpuGemma4Engine tpu_gemma4_;
     TpuContinuousBatchScheduler tpu_scheduler_;
     HavenCudaEngine cuda_engine_;
+    HavenModuleLoader module_loader_;
+    ExecutionPlan active_plan_;
+    bool has_active_plan_ = false;
     bool is_mlx_active_ = false;
     bool tpu_onchip_active_ = false;
     bool cuda_native_active_ = false;
@@ -349,6 +353,33 @@ private:
         cuda_native_active_ = false;
         cuda_engine_.shutdown();
         mlx_engine_.unload();
+
+        // Header-first Model Intelligence Probe & Zero-Bloat Microkernel Module Hot-Swap
+        {
+            ModelFingerprint fp;
+            std::string probe_err;
+            if (HavenModelIntelligence::probe_gguf_header(target_path, fp, probe_err)) {
+                auto hw = HavenModelIntelligence::probe_hardware();
+                RoutingOptions ropts;
+                ropts.target_context_len = static_cast<uint32_t>(std::clamp(tpu_opts_.max_seq_len, 256, 8192));
+                if (tpu_opts_.enable_cuda_native && !tpu_opts_.force_cuda_pjrt) {
+                    ropts.preferred_backend = BackendKind::CUDA_NATIVE;
+                } else if (tpu_opts_.enable_onchip) {
+                    ropts.preferred_backend = BackendKind::TPU_PJRT;
+                }
+                active_plan_ = HavenModelIntelligence::plan_execution(fp, hw, ropts);
+                std::string mod_log;
+                module_loader_.activate_plan(active_plan_, mod_log);
+                has_active_plan_ = true;
+                std::cout << "[HavenServer] 🧠 Intelligence (" << active_plan_.fingerprint.probe_time_ms << " ms): "
+                          << active_plan_.selected_arch_module << " + " << active_plan_.selected_backend_module
+                          << " (" << module_loader_.get_active_module_count() << " active / "
+                          << active_plan_.skipped_modules.size() << " skipped) — "
+                          << active_plan_.decision_reason << "\n" << std::flush;
+            } else {
+                has_active_plan_ = false;
+            }
+        }
 
         if (!haven_engine_.load_model(target_path)) {
             err_out = "Failed to load GGUF file: " + target_path;
@@ -2650,6 +2681,12 @@ private:
         else if (path == "/slots" || path.starts_with("/slots?")) {
             std::string json = "[{\"id\":0,\"id_task\":0,\"is_processing\":false,\"n_ctx\":16384,\"state\":0}]";
             send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
+        }
+        else if (path == "/v1/intelligence" || path == "/api/intelligence") {
+            std::string resp_body = has_active_plan_
+                ? HavenModelIntelligence::to_json(active_plan_, module_loader_.get_active_module_ids())
+                : "{\"loaded\":false,\"message\":\"No model profiled yet.\"}";
+            send_http_response(sock, "200 OK", "application/json; charset=utf-8", resp_body, cors_hdr);
         }
         else if (path == "/v1/models" || path == "/api/models") {
             std::string resp_body = get_models_json();
