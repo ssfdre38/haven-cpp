@@ -19,11 +19,20 @@ namespace haven {
 namespace {
 
 // ============================================================================
-// Device Constants & Bit-Exact Format Helpers (100% parity with Avx2Math!)
+// Device Constants, Q8_1 Activation Format & Bit-Exact Helpers
 // ============================================================================
 
 __constant__ int8_t d_kvalues_iq4nl[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+};
+
+// 16-byte aligned 32-element quantized activation block for __dp4a integer GEMV & grouped MoE
+struct alignas(16) block_q8_1_gpu {
+    int8_t qs[32];  // 32 int8 quantized activations (8 x int32 for __dp4a)
+    float  d;       // scale = max_abs / 127.0f
+    float  s_lo;    // exact float sum of x[0..15]
+    float  s_hi;    // exact float sum of x[16..31]
+    float  _pad;    // 48 bytes total (16-byte aligned)
 };
 
 __device__ __forceinline__ float d_fp16_to_f32(uint16_t h) {
@@ -45,6 +54,10 @@ __device__ __forceinline__ void d_get_scale_min_k4(int j, const uint8_t* q, uint
         d = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4);
         m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
     }
+}
+
+__device__ __forceinline__ int32_t pack4_i8(int a, int b, int c, int d) {
+    return (a & 0xFF) | ((b & 0xFF) << 8) | ((c & 0xFF) << 16) | ((d & 0xFF) << 24);
 }
 
 __device__ __forceinline__ float warp_reduce_sum(float v) {
@@ -73,17 +86,56 @@ __device__ __forceinline__ float d_silu(float g) {
 }
 
 // ============================================================================
-// Warp-Specialized Quantized Row Dot Product (32 lanes per row, 100% coalesced)
-// Returns full warp-reduced dot product in lane 0!
+// Fast Q8_1 Activation Quantizer (1 warp per 32 floats -> 8 warps/CTA)
+// ============================================================================
+__global__ void k_quantize_q8_1(const float* __restrict__ x, block_q8_1_gpu* __restrict__ out, int total_blocks) {
+    const int wid = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int b = (blockIdx.x << 3) + wid;
+    if (b >= total_blocks) return;
+
+    const float v = x[(b << 5) + lane];
+    float amax = fabsf(v);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, offset));
+    }
+
+    // Half-warp sums (lanes 0..15 -> s_lo, lanes 16..31 -> s_hi)
+    float hsum = v;
+    #pragma unroll
+    for (int offset = 8; offset > 0; offset >>= 1) {
+        hsum += __shfl_down_sync(0xFFFFFFFFu, hsum, offset);
+    }
+
+    const float d = amax * (1.0f / 127.0f);
+    const float inv_d = (amax > 1e-30f) ? (127.0f / amax) : 0.0f;
+    int q = __float2int_rn(v * inv_d);
+    q = max(-127, min(127, q));
+
+    block_q8_1_gpu* dst = out + b;
+    dst->qs[lane] = static_cast<int8_t>(q);
+    if (lane == 0) {
+        dst->d = d;
+        dst->s_lo = hsum;
+    } else if (lane == 16) {
+        dst->s_hi = hsum;
+    }
+}
+
+// ============================================================================
+// V2 Warp-Specialized __dp4a + __shfl_sync Quantized Dot Products
+// ZERO __constant__ LUT serialization! 4x lower activation traffic via Q8_1!
 // ============================================================================
 
-__device__ __forceinline__ float warp_dot_iq4_xs(const uint8_t* __restrict__ row_ptr,
-                                                 const float* __restrict__ x,
-                                                 int K, int lane) {
-    const int nb = K >> 8; // K / 256
+__device__ __forceinline__ float warp_dot_iq4_xs_q8(const uint8_t* __restrict__ row_ptr,
+                                                    const block_q8_1_gpu* __restrict__ x_q8,
+                                                    int K, int lane) {
+    // Hold 16-entry IQ4NL LUT directly in warp registers (1-cycle SHFL.IDX, zero bank/const stalls!)
+    const int lut_i = static_cast<int>(d_kvalues_iq4nl[lane & 15]);
+    const int nb = K >> 8;     // K / 256
     const int ib = lane >> 2;  // 0..7 sub-block within 256-elem super-block
-    const int t  = lane & 3;   // 0..3 (4 bytes = 8 weights per lane -> 128B coalesced per warp!)
-    const int sub_off = (ib << 5) + (t << 2);
+    const int t  = lane & 3;   // 0..3 (4 bytes = 8 nibbles -> 128B coalesced per warp!)
     float acc = 0.0f;
 
     for (int b = 0; b < nb; ++b) {
@@ -94,163 +146,249 @@ __device__ __forceinline__ float warp_dot_iq4_xs(const uint8_t* __restrict__ row
         const int ls = ((sl >> (4 * (ib & 1))) & 0x0F) | (((sh >> (2 * ib)) & 3) << 4);
         const float dl = d * static_cast<float>(ls - 32);
 
-        // Coalesced 4-byte load: blk->qs is at offset +8 inside 136B (8B-aligned) struct!
         const uint32_t q4 = *reinterpret_cast<const uint32_t*>(blk->qs + (lane << 2));
-        const float* xb = x + (b << 8) + sub_off;
-        const float4 xlo = *reinterpret_cast<const float4*>(xb);
-        const float4 xhi = *reinterpret_cast<const float4*>(xb + 16);
+        const int32_t w_lo = pack4_i8(
+            __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >>  0) & 0x0Fu),
+            __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >>  8) & 0x0Fu),
+            __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 16) & 0x0Fu),
+            __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 24) & 0x0Fu));
+        const int32_t w_hi = pack4_i8(
+            __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >>  4) & 0x0Fu),
+            __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 12) & 0x0Fu),
+            __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 20) & 0x0Fu),
+            __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 28) & 0x0Fu));
 
-        float s = 0.0f;
-        s = fmaf(static_cast<float>(d_kvalues_iq4nl[(q4 >>  0) & 0x0Fu]), xlo.x, s);
-        s = fmaf(static_cast<float>(d_kvalues_iq4nl[(q4 >>  4) & 0x0Fu]), xhi.x, s);
-        s = fmaf(static_cast<float>(d_kvalues_iq4nl[(q4 >>  8) & 0x0Fu]), xlo.y, s);
-        s = fmaf(static_cast<float>(d_kvalues_iq4nl[(q4 >> 12) & 0x0Fu]), xhi.y, s);
-        s = fmaf(static_cast<float>(d_kvalues_iq4nl[(q4 >> 16) & 0x0Fu]), xlo.z, s);
-        s = fmaf(static_cast<float>(d_kvalues_iq4nl[(q4 >> 20) & 0x0Fu]), xhi.z, s);
-        s = fmaf(static_cast<float>(d_kvalues_iq4nl[(q4 >> 24) & 0x0Fu]), xlo.w, s);
-        s = fmaf(static_cast<float>(d_kvalues_iq4nl[(q4 >> 28) & 0x0Fu]), xhi.w, s);
-        acc = fmaf(dl, s, acc);
+        const block_q8_1_gpu& xb = x_q8[(b << 3) + ib];
+        const int32_t* xq = reinterpret_cast<const int32_t*>(xb.qs);
+        int sumi = __dp4a(w_lo, xq[t], 0);
+        sumi     = __dp4a(w_hi, xq[t + 4], sumi);
+        acc = fmaf(dl * xb.d, static_cast<float>(sumi), acc);
     }
     return warp_reduce_sum(acc);
 }
 
-__device__ __forceinline__ float warp_dot_iq4_nl(const uint8_t* __restrict__ row_ptr,
-                                                 const float* __restrict__ x,
-                                                 int K, int lane) {
-    const int nb = K >> 5; // K / 32
-    const int b_off = lane >> 4; // 0 or 1 (2 blocks processed concurrently by 32 lanes)
-    const int j = lane & 15;     // 0..15 byte index within 16-byte qs
+__device__ __forceinline__ float warp_dot_iq4_nl_q8(const uint8_t* __restrict__ row_ptr,
+                                                    const block_q8_1_gpu* __restrict__ x_q8,
+                                                    int K, int lane) {
+    const int lut_i = static_cast<int>(d_kvalues_iq4nl[lane & 15]);
+    const int nb = K >> 5;       // K / 32
+    const int b_off = lane >> 2; // 0..7 (8 blocks concurrently per warp!)
+    const int t = lane & 3;      // 0..3 (4 bytes = 8 nibbles)
     float acc = 0.0f;
-    for (int b = b_off; b < nb; b += 2) {
-        const block_iq4_nl* blk = reinterpret_cast<const block_iq4_nl*>(row_ptr + static_cast<size_t>(b) * sizeof(block_iq4_nl));
-        const float d = d_fp16_to_f32(blk->d);
-        const uint8_t q = blk->qs[j];
-        const float* xb = x + (b << 5);
-        const float s = static_cast<float>(d_kvalues_iq4nl[q & 0x0Fu]) * xb[j]
-                      + static_cast<float>(d_kvalues_iq4nl[q >> 4])    * xb[j + 16];
-        acc = fmaf(d, s, acc);
+
+    // Loop with uniform warp trips so __shfl_sync always sees full active mask
+    const int n_iters = (nb + 7) >> 3;
+    for (int it = 0; it < n_iters; ++it) {
+        const int b = (it << 3) + b_off;
+        const bool active = (b < nb);
+        uint32_t q4 = 0u;
+        float d = 0.0f;
+        if (active) {
+            const block_iq4_nl* blk = reinterpret_cast<const block_iq4_nl*>(row_ptr + static_cast<size_t>(b) * sizeof(block_iq4_nl));
+            d = d_fp16_to_f32(blk->d);
+            memcpy(&q4, blk->qs + (t << 2), sizeof(uint32_t));
+        }
+        const int32_t w_lo = pack4_i8(
+            __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >>  0) & 0x0Fu),
+            __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >>  8) & 0x0Fu),
+            __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 16) & 0x0Fu),
+            __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 24) & 0x0Fu));
+        const int32_t w_hi = pack4_i8(
+            __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >>  4) & 0x0Fu),
+            __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 12) & 0x0Fu),
+            __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 20) & 0x0Fu),
+            __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 28) & 0x0Fu));
+        if (active) {
+            const block_q8_1_gpu& xb = x_q8[b];
+            const int32_t* xq = reinterpret_cast<const int32_t*>(xb.qs);
+            int sumi = __dp4a(w_lo, xq[t], 0);
+            sumi     = __dp4a(w_hi, xq[t + 4], sumi);
+            acc = fmaf(d * xb.d, static_cast<float>(sumi), acc);
+        }
     }
     return warp_reduce_sum(acc);
 }
 
-__device__ __forceinline__ float warp_dot_q6_k(const uint8_t* __restrict__ row_ptr,
-                                               const float* __restrict__ x,
-                                               int K, int lane) {
-    const int nb = K >> 8; // K / 256
-    const int is = lane >> 4; // 0 or 1
+__device__ __forceinline__ float warp_dot_q6_k_q8(const uint8_t* __restrict__ row_ptr,
+                                                  const block_q8_1_gpu* __restrict__ x_q8,
+                                                  int K, int lane) {
+    const int nb = K >> 8;
+    const int grp = lane >> 3;        // 0..3 (q1, q2, q3, q4)
+    const int l4  = (lane & 7) << 2;  // 0, 4, 8, ..., 28
+    const int half16 = l4 >> 4;       // 0 or 1
+    const int ql_off = ((grp & 1) << 5) + l4;
+    const int qh_shift = grp << 1;
+    const bool high_nib = (grp >= 2);
     float acc = 0.0f;
+
     for (int b = 0; b < nb; ++b) {
         const block_q6_K* blk = reinterpret_cast<const block_q6_K*>(row_ptr + static_cast<size_t>(b) * sizeof(block_q6_K));
         const float d = d_fp16_to_f32(blk->d);
-        const float* xb = x + (b << 8);
         #pragma unroll
         for (int c = 0; c < 2; ++c) {
             const uint8_t* ql = blk->ql + (c << 6);
             const uint8_t* qh = blk->qh + (c << 5);
-            const int8_t* sc = blk->scales + (c << 3);
-            const float* xc = xb + (c << 7);
+            const int8_t*  sc = blk->scales + (c << 3);
 
-            const uint8_t ql0 = ql[lane];
-            const uint8_t ql1 = ql[lane + 32];
-            const uint8_t qhb = qh[lane];
+            uint32_t ql4, qh4;
+            memcpy(&ql4, ql + ql_off, sizeof(uint32_t));
+            memcpy(&qh4, qh + l4, sizeof(uint32_t));
 
-            const float q1 = static_cast<float>(static_cast<int>((ql0 & 0x0Fu) | (((qhb >> 0) & 3u) << 4)) - 32);
-            const float q2 = static_cast<float>(static_cast<int>((ql1 & 0x0Fu) | (((qhb >> 2) & 3u) << 4)) - 32);
-            const float q3 = static_cast<float>(static_cast<int>((ql0 >> 4)    | (((qhb >> 4) & 3u) << 4)) - 32);
-            const float q4 = static_cast<float>(static_cast<int>((ql1 >> 4)    | (((qhb >> 6) & 3u) << 4)) - 32);
-
-            float s = 0.0f;
-            s = fmaf(static_cast<float>(sc[is + 0]) * q1, xc[lane +  0], s);
-            s = fmaf(static_cast<float>(sc[is + 2]) * q2, xc[lane + 32], s);
-            s = fmaf(static_cast<float>(sc[is + 4]) * q3, xc[lane + 64], s);
-            s = fmaf(static_cast<float>(sc[is + 6]) * q4, xc[lane + 96], s);
-            acc = fmaf(d, s, acc);
+            auto dec = [&](int shift_b) -> int {
+                const uint32_t qb = (ql4 >> shift_b) & 0xFFu;
+                const uint32_t hb = (qh4 >> shift_b) & 0xFFu;
+                const uint32_t nib = high_nib ? (qb >> 4) : (qb & 0x0Fu);
+                const uint32_t hi2 = (hb >> qh_shift) & 3u;
+                return static_cast<int>(nib | (hi2 << 4)) - 32;
+            };
+            const int32_t w4 = pack4_i8(dec(0), dec(8), dec(16), dec(24));
+            const block_q8_1_gpu& xb = x_q8[(b << 3) + (c << 2) + grp];
+            const int32_t x4 = reinterpret_cast<const int32_t*>(xb.qs)[l4 >> 2];
+            const int sumi = __dp4a(w4, x4, 0);
+            acc = fmaf(d * static_cast<float>(sc[(grp << 1) + half16]) * xb.d, static_cast<float>(sumi), acc);
         }
     }
     return warp_reduce_sum(acc);
 }
 
-__device__ __forceinline__ float warp_dot_q5_k(const uint8_t* __restrict__ row_ptr,
-                                               const float* __restrict__ x,
-                                               int K, int lane) {
+__device__ __forceinline__ float warp_dot_q5_k_q8(const uint8_t* __restrict__ row_ptr,
+                                                  const block_q8_1_gpu* __restrict__ x_q8,
+                                                  int K, int lane) {
     const int nb = K >> 8;
+    const int j  = lane >> 3;        // 0..3 (all 4 64-elem groups in parallel!)
+    const int l4 = (lane & 7) << 2;  // 0, 4, ..., 28
+    const uint8_t u1 = static_cast<uint8_t>(1u << (2 * j));
+    const uint8_t u2 = static_cast<uint8_t>(2u << (2 * j));
     float acc = 0.0f;
+
     for (int b = 0; b < nb; ++b) {
         const block_q5_K* blk = reinterpret_cast<const block_q5_K*>(row_ptr + static_cast<size_t>(b) * sizeof(block_q5_K));
         const float d = d_fp16_to_f32(blk->d);
         const float dmin = d_fp16_to_f32(blk->dmin);
-        const uint8_t qhb = blk->qh[lane];
-        const float* xb = x + (b << 8);
-        #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            uint8_t sc1, m1, sc2, m2;
-            d_get_scale_min_k4(2 * j,     blk->scales, sc1, m1);
-            d_get_scale_min_k4(2 * j + 1, blk->scales, sc2, m2);
-            const uint8_t ql = blk->qs[(j << 5) + lane];
-            const uint8_t u1 = static_cast<uint8_t>(1u << (2 * j));
-            const uint8_t u2 = static_cast<uint8_t>(2u << (2 * j));
-            const float v1 = (d * static_cast<float>(sc1)) * static_cast<float>((ql & 0x0Fu) + ((qhb & u1) ? 16 : 0))
-                           - (dmin * static_cast<float>(m1));
-            const float v2 = (d * static_cast<float>(sc2)) * static_cast<float>((ql >> 4)    + ((qhb & u2) ? 16 : 0))
-                           - (dmin * static_cast<float>(m2));
-            acc = fmaf(v1, xb[(j << 6) + lane],      acc);
-            acc = fmaf(v2, xb[(j << 6) + 32 + lane], acc);
+        uint8_t sc1, m1, sc2, m2;
+        d_get_scale_min_k4(2 * j,     blk->scales, sc1, m1);
+        d_get_scale_min_k4(2 * j + 1, blk->scales, sc2, m2);
+
+        const uint32_t ql4 = *reinterpret_cast<const uint32_t*>(blk->qs + (j << 5) + l4);
+        const uint32_t qh4 = *reinterpret_cast<const uint32_t*>(blk->qh + l4);
+
+        auto dlo = [&](int sb) -> int {
+            return static_cast<int>(((ql4 >> sb) & 0x0Fu) + ((((qh4 >> sb) & 0xFFu) & u1) ? 16u : 0u));
+        };
+        auto dhi = [&](int sb) -> int {
+            return static_cast<int>((((ql4 >> (sb + 4)) & 0x0Fu)) + ((((qh4 >> sb) & 0xFFu) & u2) ? 16u : 0u));
+        };
+        const int32_t w_lo = pack4_i8(dlo(0), dlo(8), dlo(16), dlo(24));
+        const int32_t w_hi = pack4_i8(dhi(0), dhi(8), dhi(16), dhi(24));
+
+        const block_q8_1_gpu& x0 = x_q8[(b << 3) + (j << 1) + 0];
+        const block_q8_1_gpu& x1 = x_q8[(b << 3) + (j << 1) + 1];
+        const int s0 = __dp4a(w_lo, reinterpret_cast<const int32_t*>(x0.qs)[l4 >> 2], 0);
+        const int s1 = __dp4a(w_hi, reinterpret_cast<const int32_t*>(x1.qs)[l4 >> 2], 0);
+        acc = fmaf(d * static_cast<float>(sc1) * x0.d, static_cast<float>(s0), acc);
+        acc = fmaf(d * static_cast<float>(sc2) * x1.d, static_cast<float>(s1), acc);
+        if ((lane & 7) == 0) {
+            acc = fmaf(-dmin * static_cast<float>(m1), x0.s_lo + x0.s_hi, acc);
+            acc = fmaf(-dmin * static_cast<float>(m2), x1.s_lo + x1.s_hi, acc);
         }
     }
     return warp_reduce_sum(acc);
 }
 
-__device__ __forceinline__ float warp_dot_q4_k(const uint8_t* __restrict__ row_ptr,
-                                               const float* __restrict__ x,
-                                               int K, int lane) {
+__device__ __forceinline__ float warp_dot_q4_k_q8(const uint8_t* __restrict__ row_ptr,
+                                                  const block_q8_1_gpu* __restrict__ x_q8,
+                                                  int K, int lane) {
     const int nb = K >> 8;
+    const int j  = lane >> 3;
+    const int l4 = (lane & 7) << 2;
     float acc = 0.0f;
+
     for (int b = 0; b < nb; ++b) {
         const block_q4_K* blk = reinterpret_cast<const block_q4_K*>(row_ptr + static_cast<size_t>(b) * sizeof(block_q4_K));
         const float d = d_fp16_to_f32(blk->d);
         const float dmin = d_fp16_to_f32(blk->dmin);
-        const float* xb = x + (b << 8);
-        #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            uint8_t sc1, m1, sc2, m2;
-            d_get_scale_min_k4(2 * j,     blk->scales, sc1, m1);
-            d_get_scale_min_k4(2 * j + 1, blk->scales, sc2, m2);
-            const uint8_t ql = blk->qs[(j << 5) + lane];
-            const float v1 = (d * static_cast<float>(sc1)) * static_cast<float>(ql & 0x0Fu) - (dmin * static_cast<float>(m1));
-            const float v2 = (d * static_cast<float>(sc2)) * static_cast<float>(ql >> 4)    - (dmin * static_cast<float>(m2));
-            acc = fmaf(v1, xb[(j << 6) + lane],      acc);
-            acc = fmaf(v2, xb[(j << 6) + 32 + lane], acc);
+        uint8_t sc1, m1, sc2, m2;
+        d_get_scale_min_k4(2 * j,     blk->scales, sc1, m1);
+        d_get_scale_min_k4(2 * j + 1, blk->scales, sc2, m2);
+
+        const uint32_t ql4 = *reinterpret_cast<const uint32_t*>(blk->qs + (j << 5) + l4);
+        const int32_t w_lo = static_cast<int32_t>(ql4 & 0x0F0F0F0Fu);
+        const int32_t w_hi = static_cast<int32_t>((ql4 >> 4) & 0x0F0F0F0Fu);
+
+        const block_q8_1_gpu& x0 = x_q8[(b << 3) + (j << 1) + 0];
+        const block_q8_1_gpu& x1 = x_q8[(b << 3) + (j << 1) + 1];
+        const int s0 = __dp4a(w_lo, reinterpret_cast<const int32_t*>(x0.qs)[l4 >> 2], 0);
+        const int s1 = __dp4a(w_hi, reinterpret_cast<const int32_t*>(x1.qs)[l4 >> 2], 0);
+        acc = fmaf(d * static_cast<float>(sc1) * x0.d, static_cast<float>(s0), acc);
+        acc = fmaf(d * static_cast<float>(sc2) * x1.d, static_cast<float>(s1), acc);
+        if ((lane & 7) == 0) {
+            acc = fmaf(-dmin * static_cast<float>(m1), x0.s_lo + x0.s_hi, acc);
+            acc = fmaf(-dmin * static_cast<float>(m2), x1.s_lo + x1.s_hi, acc);
         }
     }
     return warp_reduce_sum(acc);
 }
 
-__device__ __forceinline__ float warp_dot_q5_1(const uint8_t* __restrict__ row_ptr,
-                                               const float* __restrict__ x,
-                                               int K, int lane) {
+__device__ __forceinline__ float warp_dot_q5_1_q8(const uint8_t* __restrict__ row_ptr,
+                                                  const block_q8_1_gpu* __restrict__ x_q8,
+                                                  int K, int lane) {
     const int nb = K >> 5;
-    const int b_off = lane >> 4;
-    const int j = lane & 15;
+    const int b_off = lane >> 2; // 8 blocks concurrently per warp
+    const int t = lane & 3;
     float acc = 0.0f;
-    for (int b = b_off; b < nb; b += 2) {
+
+    for (int b = b_off; b < nb; b += 8) {
         const block_q5_1* blk = reinterpret_cast<const block_q5_1*>(row_ptr + static_cast<size_t>(b) * sizeof(block_q5_1));
         const float d = d_fp16_to_f32(blk->d);
         const float m = d_fp16_to_f32(blk->m);
-        uint32_t qh;
+        uint32_t qh, q4;
         memcpy(&qh, blk->qh, sizeof(uint32_t));
-        const uint8_t q = blk->qs[j];
-        const int x0 = (q & 0x0Fu) | (((qh >> j) & 1u) << 4);
-        const int x1 = (q >> 4)    | (((qh >> (j + 16)) & 1u) << 4);
-        const float* xb = x + (b << 5);
-        acc = fmaf(fmaf(d, static_cast<float>(x0), m), xb[j],      acc);
-        acc = fmaf(fmaf(d, static_cast<float>(x1), m), xb[j + 16], acc);
+        memcpy(&q4, blk->qs + (t << 2), sizeof(uint32_t));
+        const int j0 = t << 2;
+        auto xlo = [&](int r) -> int {
+            return static_cast<int>(((q4 >> (r * 8)) & 0x0Fu) | (((qh >> (j0 + r)) & 1u) << 4));
+        };
+        auto xhi = [&](int r) -> int {
+            return static_cast<int>(((q4 >> (r * 8 + 4)) & 0x0Fu) | (((qh >> (j0 + r + 16)) & 1u) << 4));
+        };
+        const int32_t w_lo = pack4_i8(xlo(0), xlo(1), xlo(2), xlo(3));
+        const int32_t w_hi = pack4_i8(xhi(0), xhi(1), xhi(2), xhi(3));
+        const block_q8_1_gpu& xb = x_q8[b];
+        const int32_t* xq = reinterpret_cast<const int32_t*>(xb.qs);
+        int sumi = __dp4a(w_lo, xq[t], 0);
+        sumi     = __dp4a(w_hi, xq[t + 4], sumi);
+        acc = fmaf(d * xb.d, static_cast<float>(sumi), acc);
+        if (t == 0) {
+            acc = fmaf(m, xb.s_lo + xb.s_hi, acc);
+        }
     }
     return warp_reduce_sum(acc);
 }
 
-__device__ __forceinline__ float warp_dot_q5_0(const uint8_t* __restrict__ row_ptr,
-                                               const float* __restrict__ x,
-                                               int K, int lane) {
+__device__ __forceinline__ float warp_dot_q8_0_q8(const uint8_t* __restrict__ row_ptr,
+                                                  const block_q8_1_gpu* __restrict__ x_q8,
+                                                  int K, int lane) {
+    const int nb = K >> 5;
+    const int b_off = lane >> 2;
+    const int t = lane & 3;
+    float acc = 0.0f;
+    for (int b = b_off; b < nb; b += 8) {
+        const block_q8_0* blk = reinterpret_cast<const block_q8_0*>(row_ptr + static_cast<size_t>(b) * sizeof(block_q8_0));
+        const float d = d_fp16_to_f32(blk->d);
+        int32_t w0, w1;
+        memcpy(&w0, blk->qs + (t << 2), sizeof(int32_t));
+        memcpy(&w1, blk->qs + 16 + (t << 2), sizeof(int32_t));
+        const block_q8_1_gpu& xb = x_q8[b];
+        const int32_t* xq = reinterpret_cast<const int32_t*>(xb.qs);
+        int sumi = __dp4a(w0, xq[t], 0);
+        sumi     = __dp4a(w1, xq[t + 4], sumi);
+        acc = fmaf(d * xb.d, static_cast<float>(sumi), acc);
+    }
+    return warp_reduce_sum(acc);
+}
+
+// Exact F32 fallback dot products for rare / unquantized formats (Q5_0, Q4_0, Q3_K, BF16, F16, F32)
+__device__ __forceinline__ float warp_dot_q5_0(const uint8_t* __restrict__ row_ptr, const float* __restrict__ x, int K, int lane) {
     const int nb = K >> 5;
     const int b_off = lane >> 4;
     const int j = lane & 15;
@@ -258,8 +396,7 @@ __device__ __forceinline__ float warp_dot_q5_0(const uint8_t* __restrict__ row_p
     for (int b = b_off; b < nb; b += 2) {
         const block_q5_0* blk = reinterpret_cast<const block_q5_0*>(row_ptr + static_cast<size_t>(b) * sizeof(block_q5_0));
         const float d = d_fp16_to_f32(blk->d);
-        uint32_t qh;
-        memcpy(&qh, blk->qh, sizeof(uint32_t));
+        uint32_t qh; memcpy(&qh, blk->qh, sizeof(uint32_t));
         const uint8_t q = blk->qs[j];
         const int x0 = static_cast<int>((q & 0x0Fu) | (((qh >> j) & 1u) << 4)) - 16;
         const int x1 = static_cast<int>((q >> 4)    | (((qh >> (j + 16)) & 1u) << 4)) - 16;
@@ -270,22 +407,7 @@ __device__ __forceinline__ float warp_dot_q5_0(const uint8_t* __restrict__ row_p
     return warp_reduce_sum(acc);
 }
 
-__device__ __forceinline__ float warp_dot_q8_0(const uint8_t* __restrict__ row_ptr,
-                                               const float* __restrict__ x,
-                                               int K, int lane) {
-    const int nb = K >> 5;
-    float acc = 0.0f;
-    for (int b = 0; b < nb; ++b) {
-        const block_q8_0* blk = reinterpret_cast<const block_q8_0*>(row_ptr + static_cast<size_t>(b) * sizeof(block_q8_0));
-        const float d = d_fp16_to_f32(blk->d);
-        acc = fmaf(d * static_cast<float>(blk->qs[lane]), x[(b << 5) + lane], acc);
-    }
-    return warp_reduce_sum(acc);
-}
-
-__device__ __forceinline__ float warp_dot_q4_0(const uint8_t* __restrict__ row_ptr,
-                                               const float* __restrict__ x,
-                                               int K, int lane) {
+__device__ __forceinline__ float warp_dot_q4_0(const uint8_t* __restrict__ row_ptr, const float* __restrict__ x, int K, int lane) {
     const int nb = K >> 5;
     const int b_off = lane >> 4;
     const int j = lane & 15;
@@ -301,9 +423,7 @@ __device__ __forceinline__ float warp_dot_q4_0(const uint8_t* __restrict__ row_p
     return warp_reduce_sum(acc);
 }
 
-__device__ __forceinline__ float warp_dot_q3_k(const uint8_t* __restrict__ row_ptr,
-                                               const float* __restrict__ x,
-                                               int K, int lane) {
+__device__ __forceinline__ float warp_dot_q3_k(const uint8_t* __restrict__ row_ptr, const float* __restrict__ x, int K, int lane) {
     const int nb = K >> 8;
     float acc = 0.0f;
     for (int b = 0; b < nb; ++b) {
@@ -311,21 +431,17 @@ __device__ __forceinline__ float warp_dot_q3_k(const uint8_t* __restrict__ row_p
         const float d_all = d_fp16_to_f32(blk->d);
         uint32_t aux[4];
         memcpy(aux, blk->scales, 12);
-        const uint32_t kmask1 = 0x03030303u;
-        const uint32_t kmask2 = 0x0f0f0f0fu;
-        const uint32_t tmp = aux[2];
+        const uint32_t kmask1 = 0x03030303u, kmask2 = 0x0f0f0f0fu, tmp = aux[2];
         aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
         aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
         aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
         aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
         const int8_t* sc = reinterpret_cast<const int8_t*>(aux);
         const float* xb = x + (b << 8);
-        const int half = lane >> 4; // 0 for 0..15, 1 for 16..31
-        const int is_base = half;
+        const int is_base = lane >> 4;
         #pragma unroll
         for (int c = 0; c < 2; ++c) {
-            const uint8_t* q = blk->qs + (c << 5);
-            const uint8_t qb = q[lane];
+            const uint8_t qb = blk->qs[(c << 5) + lane];
             const uint8_t hmb = blk->hmask[lane];
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
@@ -339,20 +455,22 @@ __device__ __forceinline__ float warp_dot_q3_k(const uint8_t* __restrict__ row_p
     return warp_reduce_sum(acc);
 }
 
-__device__ __forceinline__ float warp_dot_bf16(const uint8_t* __restrict__ row_ptr,
-                                               const float* __restrict__ x,
-                                               int K, int lane) {
+__device__ __forceinline__ float warp_dot_bf16(const uint8_t* __restrict__ row_ptr, const float* __restrict__ x, int K, int lane) {
     const uint16_t* w = reinterpret_cast<const uint16_t*>(row_ptr);
     float acc = 0.0f;
-    for (int i = lane; i < K; i += 32) {
-        acc = fmaf(d_bf16_to_f32(w[i]), x[i], acc);
+    const int K2 = K >> 1;
+    const uint32_t* w2 = reinterpret_cast<const uint32_t*>(w);
+    const float2* x2 = reinterpret_cast<const float2*>(x);
+    for (int i = lane; i < K2; i += 32) {
+        const uint32_t pair = w2[i];
+        const float2 xv = x2[i];
+        acc = fmaf(d_bf16_to_f32(static_cast<uint16_t>(pair & 0xFFFFu)), xv.x, acc);
+        acc = fmaf(d_bf16_to_f32(static_cast<uint16_t>(pair >> 16)),      xv.y, acc);
     }
     return warp_reduce_sum(acc);
 }
 
-__device__ __forceinline__ float warp_dot_f16(const uint8_t* __restrict__ row_ptr,
-                                              const float* __restrict__ x,
-                                              int K, int lane) {
+__device__ __forceinline__ float warp_dot_f16(const uint8_t* __restrict__ row_ptr, const float* __restrict__ x, int K, int lane) {
     const uint16_t* w = reinterpret_cast<const uint16_t*>(row_ptr);
     float acc = 0.0f;
     for (int i = lane; i < K; i += 32) {
@@ -361,46 +479,42 @@ __device__ __forceinline__ float warp_dot_f16(const uint8_t* __restrict__ row_pt
     return warp_reduce_sum(acc);
 }
 
-__device__ __forceinline__ float warp_dot_f32(const uint8_t* __restrict__ row_ptr,
-                                              const float* __restrict__ x,
-                                              int K, int lane) {
+__device__ __forceinline__ float warp_dot_f32(const uint8_t* __restrict__ row_ptr, const float* __restrict__ x, int K, int lane) {
     const float* w = reinterpret_cast<const float*>(row_ptr);
     float acc = 0.0f;
     const int K4 = K >> 2;
     const float4* w4 = reinterpret_cast<const float4*>(w);
     const float4* x4 = reinterpret_cast<const float4*>(x);
     for (int i = lane; i < K4; i += 32) {
-        float4 a = w4[i];
-        float4 b = x4[i];
+        float4 a = w4[i], b = x4[i];
         acc = fmaf(a.x, b.x, acc);
         acc = fmaf(a.y, b.y, acc);
         acc = fmaf(a.z, b.z, acc);
         acc = fmaf(a.w, b.w, acc);
     }
-    for (int i = (K4 << 2) + lane; i < K; i += 32) {
-        acc = fmaf(w[i], x[i], acc);
-    }
+    for (int i = (K4 << 2) + lane; i < K; i += 32) acc = fmaf(w[i], x[i], acc);
     return warp_reduce_sum(acc);
 }
 
-__device__ __forceinline__ float warp_dot_any(const uint8_t* __restrict__ row_ptr,
-                                              QuantType qtype,
-                                              const float* __restrict__ x,
-                                              int K, int lane) {
+__device__ __forceinline__ float warp_dot_any_q8(const uint8_t* __restrict__ row_ptr,
+                                                 QuantType qtype,
+                                                 const block_q8_1_gpu* __restrict__ x_q8,
+                                                 const float* __restrict__ x_f32,
+                                                 int K, int lane) {
     switch (qtype) {
-        case QuantType::IQ4_XS: return warp_dot_iq4_xs(row_ptr, x, K, lane);
-        case QuantType::IQ4_NL: return warp_dot_iq4_nl(row_ptr, x, K, lane);
-        case QuantType::Q6_K:   return warp_dot_q6_k(row_ptr, x, K, lane);
-        case QuantType::Q5_K:   return warp_dot_q5_k(row_ptr, x, K, lane);
-        case QuantType::Q4_K:   return warp_dot_q4_k(row_ptr, x, K, lane);
-        case QuantType::Q5_1:   return warp_dot_q5_1(row_ptr, x, K, lane);
-        case QuantType::Q5_0:   return warp_dot_q5_0(row_ptr, x, K, lane);
-        case QuantType::Q8_0:   return warp_dot_q8_0(row_ptr, x, K, lane);
-        case QuantType::Q4_0:   return warp_dot_q4_0(row_ptr, x, K, lane);
-        case QuantType::Q3_K:   return warp_dot_q3_k(row_ptr, x, K, lane);
-        case QuantType::BF16:   return warp_dot_bf16(row_ptr, x, K, lane);
-        case QuantType::F16:    return warp_dot_f16(row_ptr, x, K, lane);
-        case QuantType::F32:    return warp_dot_f32(row_ptr, x, K, lane);
+        case QuantType::IQ4_XS: return warp_dot_iq4_xs_q8(row_ptr, x_q8, K, lane);
+        case QuantType::IQ4_NL: return warp_dot_iq4_nl_q8(row_ptr, x_q8, K, lane);
+        case QuantType::Q6_K:   return warp_dot_q6_k_q8(row_ptr, x_q8, K, lane);
+        case QuantType::Q5_K:   return warp_dot_q5_k_q8(row_ptr, x_q8, K, lane);
+        case QuantType::Q4_K:   return warp_dot_q4_k_q8(row_ptr, x_q8, K, lane);
+        case QuantType::Q5_1:   return warp_dot_q5_1_q8(row_ptr, x_q8, K, lane);
+        case QuantType::Q8_0:   return warp_dot_q8_0_q8(row_ptr, x_q8, K, lane);
+        case QuantType::Q5_0:   return warp_dot_q5_0(row_ptr, x_f32, K, lane);
+        case QuantType::Q4_0:   return warp_dot_q4_0(row_ptr, x_f32, K, lane);
+        case QuantType::Q3_K:   return warp_dot_q3_k(row_ptr, x_f32, K, lane);
+        case QuantType::BF16:   return warp_dot_bf16(row_ptr, x_f32, K, lane);
+        case QuantType::F16:    return warp_dot_f16(row_ptr, x_f32, K, lane);
+        case QuantType::F32:    return warp_dot_f32(row_ptr, x_f32, K, lane);
         default: return 0.0f;
     }
 }
@@ -409,28 +523,28 @@ __device__ __forceinline__ float warp_dot_any(const uint8_t* __restrict__ row_pt
 // Core GEMV & Fused GEMV Kernels (4 warps = 4 rows per 128-thread block)
 // ============================================================================
 
-__global__ void k_gemv_quant(const uint8_t* __restrict__ W, QuantType qtype, size_t row_bytes,
-                             const float* __restrict__ x, const float* __restrict__ bias,
-                             float* __restrict__ y, int N, int K, float scale_out) {
+__global__ void k_gemv_quant_q8(const uint8_t* __restrict__ W, QuantType qtype, size_t row_bytes,
+                                const block_q8_1_gpu* __restrict__ x_q8, const float* __restrict__ x_f32,
+                                const float* __restrict__ bias,
+                                float* __restrict__ y, int N, int K, float scale_out) {
     const int warp_id = threadIdx.x >> 5;
     const int lane    = threadIdx.x & 31;
     const int row     = (blockIdx.x << 2) + warp_id;
     if (row >= N) return;
     const uint8_t* rp = W + static_cast<size_t>(row) * row_bytes;
-    float sum = warp_dot_any(rp, qtype, x, K, lane);
+    float sum = warp_dot_any_q8(rp, qtype, x_q8, x_f32, K, lane);
     if (lane == 0) {
         if (bias) sum += bias[row];
         y[row] = sum * scale_out;
     }
 }
 
-// Fused Q+K+V GEMV: reads x[D] ONCE for Q, optional K, optional V (saves 2x activation traffic + 2 launches!)
-__global__ void k_fused_qkv_gemv(const uint8_t* __restrict__ Wq, QuantType qt_q, size_t rb_q, const float* __restrict__ bq,
-                                 const uint8_t* __restrict__ Wk, QuantType qt_k, size_t rb_k, const float* __restrict__ bk,
-                                 const uint8_t* __restrict__ Wv, QuantType qt_v, size_t rb_v, const float* __restrict__ bv,
-                                 const float* __restrict__ x,
-                                 float* __restrict__ q_out, float* __restrict__ k_out, float* __restrict__ v_out,
-                                 int q_dim, int k_dim, int v_dim, int D, bool k_eq_v) {
+__global__ void k_fused_qkv_gemv_q8(const uint8_t* __restrict__ Wq, QuantType qt_q, size_t rb_q, const float* __restrict__ bq,
+                                    const uint8_t* __restrict__ Wk, QuantType qt_k, size_t rb_k, const float* __restrict__ bk,
+                                    const uint8_t* __restrict__ Wv, QuantType qt_v, size_t rb_v, const float* __restrict__ bv,
+                                    const block_q8_1_gpu* __restrict__ x_q8, const float* __restrict__ x_f32,
+                                    float* __restrict__ q_out, float* __restrict__ k_out, float* __restrict__ v_out,
+                                    int q_dim, int k_dim, int v_dim, int D, bool k_eq_v) {
     const int warp_id = threadIdx.x >> 5;
     const int lane    = threadIdx.x & 31;
     const int idx     = (blockIdx.x << 2) + warp_id;
@@ -438,11 +552,11 @@ __global__ void k_fused_qkv_gemv(const uint8_t* __restrict__ Wq, QuantType qt_q,
     if (idx >= total) return;
 
     if (idx < q_dim) {
-        float s = warp_dot_any(Wq + static_cast<size_t>(idx) * rb_q, qt_q, x, D, lane);
+        float s = warp_dot_any_q8(Wq + static_cast<size_t>(idx) * rb_q, qt_q, x_q8, x_f32, D, lane);
         if (lane == 0) q_out[idx] = bq ? (s + bq[idx]) : s;
     } else if (idx < q_dim + k_dim) {
         const int r = idx - q_dim;
-        float s = warp_dot_any(Wk + static_cast<size_t>(r) * rb_k, qt_k, x, D, lane);
+        float s = warp_dot_any_q8(Wk + static_cast<size_t>(r) * rb_k, qt_k, x_q8, x_f32, D, lane);
         if (lane == 0) {
             float val = bk ? (s + bk[r]) : s;
             k_out[r] = val;
@@ -450,22 +564,21 @@ __global__ void k_fused_qkv_gemv(const uint8_t* __restrict__ Wq, QuantType qt_q,
         }
     } else {
         const int r = idx - q_dim - k_dim;
-        float s = warp_dot_any(Wv + static_cast<size_t>(r) * rb_v, qt_v, x, D, lane);
+        float s = warp_dot_any_q8(Wv + static_cast<size_t>(r) * rb_v, qt_v, x_q8, x_f32, D, lane);
         if (lane == 0) v_out[r] = bv ? (s + bv[r]) : s;
     }
 }
 
-// Fused FFN Gate + Up + GeGLU/SiLU GEMV: reads x[D] ONCE and writes activated h[F] directly!
-__global__ void k_fused_ffn_gu_act(const uint8_t* __restrict__ Wg, QuantType qt_g, size_t rb_g,
-                                   const uint8_t* __restrict__ Wu, QuantType qt_u, size_t rb_u,
-                                   const float* __restrict__ x, float* __restrict__ h_out,
-                                   int F, int D, bool use_gelu) {
+__global__ void k_fused_ffn_gu_act_q8(const uint8_t* __restrict__ Wg, QuantType qt_g, size_t rb_g,
+                                      const uint8_t* __restrict__ Wu, QuantType qt_u, size_t rb_u,
+                                      const block_q8_1_gpu* __restrict__ x_q8, const float* __restrict__ x_f32,
+                                      float* __restrict__ h_out, int F, int D, bool use_gelu) {
     const int warp_id = threadIdx.x >> 5;
     const int lane    = threadIdx.x & 31;
     const int row     = (blockIdx.x << 2) + warp_id;
     if (row >= F) return;
-    const float g = warp_dot_any(Wg + static_cast<size_t>(row) * rb_g, qt_g, x, D, lane);
-    const float u = warp_dot_any(Wu + static_cast<size_t>(row) * rb_u, qt_u, x, D, lane);
+    const float g = warp_dot_any_q8(Wg + static_cast<size_t>(row) * rb_g, qt_g, x_q8, x_f32, D, lane);
+    const float u = warp_dot_any_q8(Wu + static_cast<size_t>(row) * rb_u, qt_u, x_q8, x_f32, D, lane);
     if (lane == 0) {
         const float act = use_gelu ? d_gelu_tanh(g) : d_silu(g);
         h_out[row] = act * u;
@@ -473,7 +586,7 @@ __global__ void k_fused_ffn_gu_act(const uint8_t* __restrict__ Wg, QuantType qt_
 }
 
 // ============================================================================
-// Dequantize Raw GGUF Tensor Rows -> FP16 Matrix (for cuBLAS Tensor Core Prefill!)
+// Dequantize Raw GGUF Tensor Rows -> FP16 Matrix (Zero-Stall __shfl_sync LUT!)
 // ============================================================================
 
 __global__ void k_dequant_to_f16(const uint8_t* __restrict__ W, QuantType qtype, size_t row_bytes,
@@ -485,37 +598,53 @@ __global__ void k_dequant_to_f16(const uint8_t* __restrict__ W, QuantType qtype,
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (qtype == QuantType::IQ4_XS) {
+        const int lut_i = static_cast<int>(d_kvalues_iq4nl[threadIdx.x & 15]);
         const int nb = K >> 8;
-        const int b = tid >> 7;        // 128 threads per 256-elem block (each thread writes 2 elements: lo + hi)
-        if (b >= nb) return;
+        const int b = tid >> 7;
+        const bool active = (b < nb);
         const int loc = tid & 127;
-        const int ib = loc >> 4;       // 0..7
-        const int j  = loc & 15;       // 0..15
-        const block_iq4_xs* blk = reinterpret_cast<const block_iq4_xs*>(rp + static_cast<size_t>(b) * sizeof(block_iq4_xs));
-        const float d = d_fp16_to_f32(blk->d);
-        const int ls = ((blk->scales_l[ib >> 1] >> (4 * (ib & 1))) & 0x0F) | (((blk->scales_h >> (2 * ib)) & 3) << 4);
-        const float dl = d * static_cast<float>(ls - 32);
-        const uint8_t q = blk->qs[(ib << 4) + j];
-        dst[(b << 8) + (ib << 5) + j]      = __float2half(dl * static_cast<float>(d_kvalues_iq4nl[q & 0x0Fu]));
-        dst[(b << 8) + (ib << 5) + 16 + j] = __float2half(dl * static_cast<float>(d_kvalues_iq4nl[q >> 4]));
+        const int ib = loc >> 4;
+        const int j  = loc & 15;
+        float dl = 0.0f;
+        uint8_t q = 0u;
+        if (active) {
+            const block_iq4_xs* blk = reinterpret_cast<const block_iq4_xs*>(rp + static_cast<size_t>(b) * sizeof(block_iq4_xs));
+            const float d = d_fp16_to_f32(blk->d);
+            const int ls = ((blk->scales_l[ib >> 1] >> (4 * (ib & 1))) & 0x0F) | (((blk->scales_h >> (2 * ib)) & 3) << 4);
+            dl = d * static_cast<float>(ls - 32);
+            q = blk->qs[(ib << 4) + j];
+        }
+        const int w0 = __shfl_sync(0xFFFFFFFFu, lut_i, q & 0x0Fu);
+        const int w1 = __shfl_sync(0xFFFFFFFFu, lut_i, q >> 4);
+        if (active) {
+            dst[(b << 8) + (ib << 5) + j]      = __float2half(dl * static_cast<float>(w0));
+            dst[(b << 8) + (ib << 5) + 16 + j] = __float2half(dl * static_cast<float>(w1));
+        }
     } else if (qtype == QuantType::IQ4_NL) {
+        const int lut_i = static_cast<int>(d_kvalues_iq4nl[threadIdx.x & 15]);
         const int nb = K >> 5;
-        const int b = tid >> 4;        // 16 threads per 32-elem block
-        if (b >= nb) return;
+        const int b = tid >> 4;
+        const bool active = (b < nb);
         const int j = tid & 15;
-        const block_iq4_nl* blk = reinterpret_cast<const block_iq4_nl*>(rp + static_cast<size_t>(b) * sizeof(block_iq4_nl));
-        const float d = d_fp16_to_f32(blk->d);
-        const uint8_t q = blk->qs[j];
-        dst[(b << 5) + j]      = __float2half(d * static_cast<float>(d_kvalues_iq4nl[q & 0x0Fu]));
-        dst[(b << 5) + 16 + j] = __float2half(d * static_cast<float>(d_kvalues_iq4nl[q >> 4]));
+        float d = 0.0f;
+        uint8_t q = 0u;
+        if (active) {
+            const block_iq4_nl* blk = reinterpret_cast<const block_iq4_nl*>(rp + static_cast<size_t>(b) * sizeof(block_iq4_nl));
+            d = d_fp16_to_f32(blk->d);
+            q = blk->qs[j];
+        }
+        const int w0 = __shfl_sync(0xFFFFFFFFu, lut_i, q & 0x0Fu);
+        const int w1 = __shfl_sync(0xFFFFFFFFu, lut_i, q >> 4);
+        if (active) {
+            dst[(b << 5) + j]      = __float2half(d * static_cast<float>(w0));
+            dst[(b << 5) + 16 + j] = __float2half(d * static_cast<float>(w1));
+        }
     } else if (qtype == QuantType::Q6_K) {
         const int nb = K >> 8;
-        const int b = tid >> 6;        // 64 threads per 256-elem block (each thread writes 4 elems)
+        const int b = tid >> 6;
         if (b >= nb) return;
         const int loc = tid & 63;
-        const int c = loc >> 5;        // 0 or 1
-        const int l = loc & 31;
-        const int is = l >> 4;
+        const int c = loc >> 5, l = loc & 31, is = l >> 4;
         const block_q6_K* blk = reinterpret_cast<const block_q6_K*>(rp + static_cast<size_t>(b) * sizeof(block_q6_K));
         const float d = d_fp16_to_f32(blk->d);
         const uint8_t* ql = blk->ql + (c << 6);
@@ -533,21 +662,16 @@ __global__ void k_dequant_to_f16(const uint8_t* __restrict__ W, QuantType qtype,
         dst[base + 96] = __float2half(d * static_cast<float>(sc[is + 6]) * static_cast<float>(q4));
     } else if (qtype == QuantType::Q5_K) {
         const int nb = K >> 8;
-        const int b = tid >> 7;        // 128 threads per 256-elem block
+        const int b = tid >> 7;
         if (b >= nb) return;
-        const int loc = tid & 127;
-        const int j = loc >> 5;        // 0..3
-        const int l = loc & 31;
+        const int loc = tid & 127, j = loc >> 5, l = loc & 31;
         const block_q5_K* blk = reinterpret_cast<const block_q5_K*>(rp + static_cast<size_t>(b) * sizeof(block_q5_K));
-        const float d = d_fp16_to_f32(blk->d);
-        const float dmin = d_fp16_to_f32(blk->dmin);
+        const float d = d_fp16_to_f32(blk->d), dmin = d_fp16_to_f32(blk->dmin);
         uint8_t sc1, m1, sc2, m2;
         d_get_scale_min_k4(2 * j,     blk->scales, sc1, m1);
         d_get_scale_min_k4(2 * j + 1, blk->scales, sc2, m2);
-        const uint8_t ql = blk->qs[(j << 5) + l];
-        const uint8_t qhb = blk->qh[l];
-        const uint8_t u1 = static_cast<uint8_t>(1u << (2 * j));
-        const uint8_t u2 = static_cast<uint8_t>(2u << (2 * j));
+        const uint8_t ql = blk->qs[(j << 5) + l], qhb = blk->qh[l];
+        const uint8_t u1 = static_cast<uint8_t>(1u << (2 * j)), u2 = static_cast<uint8_t>(2u << (2 * j));
         const int base = (b << 8) + (j << 6) + l;
         dst[base]      = __float2half((d * static_cast<float>(sc1)) * static_cast<float>((ql & 0x0Fu) + ((qhb & u1) ? 16 : 0)) - dmin * static_cast<float>(m1));
         dst[base + 32] = __float2half((d * static_cast<float>(sc2)) * static_cast<float>((ql >> 4)    + ((qhb & u2) ? 16 : 0)) - dmin * static_cast<float>(m2));
@@ -555,12 +679,9 @@ __global__ void k_dequant_to_f16(const uint8_t* __restrict__ W, QuantType qtype,
         const int nb = K >> 8;
         const int b = tid >> 7;
         if (b >= nb) return;
-        const int loc = tid & 127;
-        const int j = loc >> 5;
-        const int l = loc & 31;
+        const int loc = tid & 127, j = loc >> 5, l = loc & 31;
         const block_q4_K* blk = reinterpret_cast<const block_q4_K*>(rp + static_cast<size_t>(b) * sizeof(block_q4_K));
-        const float d = d_fp16_to_f32(blk->d);
-        const float dmin = d_fp16_to_f32(blk->dmin);
+        const float d = d_fp16_to_f32(blk->d), dmin = d_fp16_to_f32(blk->dmin);
         uint8_t sc1, m1, sc2, m2;
         d_get_scale_min_k4(2 * j,     blk->scales, sc1, m1);
         d_get_scale_min_k4(2 * j + 1, blk->scales, sc2, m2);
@@ -574,15 +695,11 @@ __global__ void k_dequant_to_f16(const uint8_t* __restrict__ W, QuantType qtype,
         if (b >= nb) return;
         const int j = tid & 15;
         const block_q5_1* blk = reinterpret_cast<const block_q5_1*>(rp + static_cast<size_t>(b) * sizeof(block_q5_1));
-        const float d = d_fp16_to_f32(blk->d);
-        const float m = d_fp16_to_f32(blk->m);
-        uint32_t qh;
-        memcpy(&qh, blk->qh, sizeof(uint32_t));
+        const float d = d_fp16_to_f32(blk->d), m = d_fp16_to_f32(blk->m);
+        uint32_t qh; memcpy(&qh, blk->qh, sizeof(uint32_t));
         const uint8_t q = blk->qs[j];
-        const int x0 = (q & 0x0Fu) | (((qh >> j) & 1u) << 4);
-        const int x1 = (q >> 4)    | (((qh >> (j + 16)) & 1u) << 4);
-        dst[(b << 5) + j]      = __float2half(fmaf(d, static_cast<float>(x0), m));
-        dst[(b << 5) + 16 + j] = __float2half(fmaf(d, static_cast<float>(x1), m));
+        dst[(b << 5) + j]      = __float2half(fmaf(d, static_cast<float>((q & 0x0Fu) | (((qh >> j) & 1u) << 4)), m));
+        dst[(b << 5) + 16 + j] = __float2half(fmaf(d, static_cast<float>((q >> 4)    | (((qh >> (j + 16)) & 1u) << 4)), m));
     } else if (qtype == QuantType::Q5_0) {
         const int nb = K >> 5;
         const int b = tid >> 4;
@@ -590,19 +707,14 @@ __global__ void k_dequant_to_f16(const uint8_t* __restrict__ W, QuantType qtype,
         const int j = tid & 15;
         const block_q5_0* blk = reinterpret_cast<const block_q5_0*>(rp + static_cast<size_t>(b) * sizeof(block_q5_0));
         const float d = d_fp16_to_f32(blk->d);
-        uint32_t qh;
-        memcpy(&qh, blk->qh, sizeof(uint32_t));
+        uint32_t qh; memcpy(&qh, blk->qh, sizeof(uint32_t));
         const uint8_t q = blk->qs[j];
-        const int x0 = static_cast<int>((q & 0x0Fu) | (((qh >> j) & 1u) << 4)) - 16;
-        const int x1 = static_cast<int>((q >> 4)    | (((qh >> (j + 16)) & 1u) << 4)) - 16;
-        dst[(b << 5) + j]      = __float2half(d * static_cast<float>(x0));
-        dst[(b << 5) + 16 + j] = __float2half(d * static_cast<float>(x1));
+        dst[(b << 5) + j]      = __float2half(d * static_cast<float>(static_cast<int>((q & 0x0Fu) | (((qh >> j) & 1u) << 4)) - 16));
+        dst[(b << 5) + 16 + j] = __float2half(d * static_cast<float>(static_cast<int>((q >> 4)    | (((qh >> (j + 16)) & 1u) << 4)) - 16));
     } else if (qtype == QuantType::Q8_0) {
         if (tid >= K) return;
-        const int b = tid >> 5;
-        const int j = tid & 31;
-        const block_q8_0* blk = reinterpret_cast<const block_q8_0*>(rp + static_cast<size_t>(b) * sizeof(block_q8_0));
-        dst[tid] = __float2half(d_fp16_to_f32(blk->d) * static_cast<float>(blk->qs[j]));
+        const block_q8_0* blk = reinterpret_cast<const block_q8_0*>(rp + static_cast<size_t>(tid >> 5) * sizeof(block_q8_0));
+        dst[tid] = __float2half(d_fp16_to_f32(blk->d) * static_cast<float>(blk->qs[tid & 31]));
     } else if (qtype == QuantType::Q4_0) {
         const int nb = K >> 5;
         const int b = tid >> 4;
@@ -615,13 +727,12 @@ __global__ void k_dequant_to_f16(const uint8_t* __restrict__ W, QuantType qtype,
         dst[(b << 5) + j * 2 + 1] = __float2half(d * static_cast<float>(static_cast<int>(q >> 4)    - 8));
     } else if (qtype == QuantType::Q3_K) {
         const int nb = K >> 8;
-        const int b = tid >> 5; // 32 threads per 256-elem block
+        const int b = tid >> 5;
         if (b >= nb) return;
         const int lane = tid & 31;
         const block_q3_K* blk = reinterpret_cast<const block_q3_K*>(rp + static_cast<size_t>(b) * sizeof(block_q3_K));
         const float d_all = d_fp16_to_f32(blk->d);
-        uint32_t aux[4];
-        memcpy(aux, blk->scales, 12);
+        uint32_t aux[4]; memcpy(aux, blk->scales, 12);
         const uint32_t kmask1 = 0x03030303u, kmask2 = 0x0f0f0f0fu, tmp = aux[2];
         aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
         aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
@@ -630,8 +741,7 @@ __global__ void k_dequant_to_f16(const uint8_t* __restrict__ W, QuantType qtype,
         const int8_t* sc = reinterpret_cast<const int8_t*>(aux);
         const int is_base = lane >> 4;
         for (int c = 0; c < 2; ++c) {
-            const uint8_t qb = blk->qs[(c << 5) + lane];
-            const uint8_t hmb = blk->hmask[lane];
+            const uint8_t qb = blk->qs[(c << 5) + lane], hmb = blk->hmask[lane];
             for (int j = 0; j < 4; ++j) {
                 const uint8_t m = static_cast<uint8_t>(1u << (c * 4 + j));
                 const float dl = d_all * static_cast<float>(sc[c * 8 + j * 2 + is_base] - 32);
@@ -641,20 +751,17 @@ __global__ void k_dequant_to_f16(const uint8_t* __restrict__ W, QuantType qtype,
         }
     } else if (qtype == QuantType::BF16) {
         if (tid >= K) return;
-        const uint16_t* w = reinterpret_cast<const uint16_t*>(rp);
-        dst[tid] = __float2half(d_bf16_to_f32(w[tid]));
+        dst[tid] = __float2half(d_bf16_to_f32(reinterpret_cast<const uint16_t*>(rp)[tid]));
     } else if (qtype == QuantType::F16) {
         if (tid >= K) return;
-        const __half* w = reinterpret_cast<const __half*>(rp);
-        dst[tid] = w[tid];
+        dst[tid] = reinterpret_cast<const __half*>(rp)[tid];
     } else if (qtype == QuantType::F32) {
         if (tid >= K) return;
-        const float* w = reinterpret_cast<const float*>(rp);
-        dst[tid] = __float2half(w[tid]);
+        dst[tid] = __float2half(reinterpret_cast<const float*>(rp)[tid]);
     }
 }
 
-// Direct single-row dequantize to F32 (for embedding lookup & Pleias token table lookup on GPU!)
+// Direct single-row dequantize to F32 (for embedding lookup & Pleias token table lookup on GPU)
 __global__ void k_dequant_rows_f32(const uint8_t* __restrict__ W, QuantType qtype, size_t row_bytes,
                                    const uint32_t* __restrict__ tok_ids, int S, int vocab_size,
                                    float* __restrict__ out_f32, int K, float scale) {
@@ -670,8 +777,7 @@ __global__ void k_dequant_rows_f32(const uint8_t* __restrict__ W, QuantType qtyp
         const int nb = K >> 8;
         const int b = tid >> 6;
         if (b >= nb) return;
-        const int loc = tid & 63;
-        const int c = loc >> 5, l = loc & 31, is = l >> 4;
+        const int loc = tid & 63, c = loc >> 5, l = loc & 31, is = l >> 4;
         const block_q6_K* blk = reinterpret_cast<const block_q6_K*>(rp + static_cast<size_t>(b) * sizeof(block_q6_K));
         const float d = d_fp16_to_f32(blk->d) * scale;
         const uint8_t* ql = blk->ql + (c << 6);
@@ -688,18 +794,25 @@ __global__ void k_dequant_rows_f32(const uint8_t* __restrict__ W, QuantType qtyp
         dst[base + 64] = d * static_cast<float>(sc[is + 4]) * static_cast<float>(q3);
         dst[base + 96] = d * static_cast<float>(sc[is + 6]) * static_cast<float>(q4);
     } else if (qtype == QuantType::IQ4_XS) {
+        const int lut_i = static_cast<int>(d_kvalues_iq4nl[threadIdx.x & 15]);
         const int nb = K >> 8;
         const int b = tid >> 7;
-        if (b >= nb) return;
-        const int loc = tid & 127;
-        const int ib = loc >> 4, j = loc & 15;
-        const block_iq4_xs* blk = reinterpret_cast<const block_iq4_xs*>(rp + static_cast<size_t>(b) * sizeof(block_iq4_xs));
-        const float d = d_fp16_to_f32(blk->d) * scale;
-        const int ls = ((blk->scales_l[ib >> 1] >> (4 * (ib & 1))) & 0x0F) | (((blk->scales_h >> (2 * ib)) & 3) << 4);
-        const float dl = d * static_cast<float>(ls - 32);
-        const uint8_t q = blk->qs[(ib << 4) + j];
-        dst[(b << 8) + (ib << 5) + j]      = dl * static_cast<float>(d_kvalues_iq4nl[q & 0x0Fu]);
-        dst[(b << 8) + (ib << 5) + 16 + j] = dl * static_cast<float>(d_kvalues_iq4nl[q >> 4]);
+        const bool active = (b < nb);
+        const int loc = tid & 127, ib = loc >> 4, j = loc & 15;
+        float dl = 0.0f; uint8_t q = 0u;
+        if (active) {
+            const block_iq4_xs* blk = reinterpret_cast<const block_iq4_xs*>(rp + static_cast<size_t>(b) * sizeof(block_iq4_xs));
+            const float d = d_fp16_to_f32(blk->d) * scale;
+            const int ls = ((blk->scales_l[ib >> 1] >> (4 * (ib & 1))) & 0x0F) | (((blk->scales_h >> (2 * ib)) & 3) << 4);
+            dl = d * static_cast<float>(ls - 32);
+            q = blk->qs[(ib << 4) + j];
+        }
+        const int w0 = __shfl_sync(0xFFFFFFFFu, lut_i, q & 0x0Fu);
+        const int w1 = __shfl_sync(0xFFFFFFFFu, lut_i, q >> 4);
+        if (active) {
+            dst[(b << 8) + (ib << 5) + j]      = dl * static_cast<float>(w0);
+            dst[(b << 8) + (ib << 5) + 16 + j] = dl * static_cast<float>(w1);
+        }
     } else if (qtype == QuantType::Q8_0) {
         if (tid >= K) return;
         const block_q8_0* blk = reinterpret_cast<const block_q8_0*>(rp + static_cast<size_t>(tid >> 5) * sizeof(block_q8_0));
@@ -734,15 +847,23 @@ __global__ void k_dequant_rows_f32(const uint8_t* __restrict__ W, QuantType qtyp
         dst[base]      = ((d * static_cast<float>(sc1)) * static_cast<float>((ql & 0x0Fu) + ((qhb & u1) ? 16 : 0)) - dmin * static_cast<float>(m1)) * scale;
         dst[base + 32] = ((d * static_cast<float>(sc2)) * static_cast<float>((ql >> 4)    + ((qhb & u2) ? 16 : 0)) - dmin * static_cast<float>(m2)) * scale;
     } else if (qtype == QuantType::IQ4_NL) {
+        const int lut_i = static_cast<int>(d_kvalues_iq4nl[threadIdx.x & 15]);
         const int nb = K >> 5;
         const int b = tid >> 4;
-        if (b >= nb) return;
+        const bool active = (b < nb);
         const int j = tid & 15;
-        const block_iq4_nl* blk = reinterpret_cast<const block_iq4_nl*>(rp + static_cast<size_t>(b) * sizeof(block_iq4_nl));
-        const float d = d_fp16_to_f32(blk->d) * scale;
-        const uint8_t q = blk->qs[j];
-        dst[(b << 5) + j]      = d * static_cast<float>(d_kvalues_iq4nl[q & 0x0Fu]);
-        dst[(b << 5) + 16 + j] = d * static_cast<float>(d_kvalues_iq4nl[q >> 4]);
+        float d = 0.0f; uint8_t q = 0u;
+        if (active) {
+            const block_iq4_nl* blk = reinterpret_cast<const block_iq4_nl*>(rp + static_cast<size_t>(b) * sizeof(block_iq4_nl));
+            d = d_fp16_to_f32(blk->d) * scale;
+            q = blk->qs[j];
+        }
+        const int w0 = __shfl_sync(0xFFFFFFFFu, lut_i, q & 0x0Fu);
+        const int w1 = __shfl_sync(0xFFFFFFFFu, lut_i, q >> 4);
+        if (active) {
+            dst[(b << 5) + j]      = d * static_cast<float>(w0);
+            dst[(b << 5) + 16 + j] = d * static_cast<float>(w1);
+        }
     } else if (qtype == QuantType::Q5_1) {
         const int nb = K >> 5;
         const int b = tid >> 4;
@@ -811,12 +932,9 @@ __global__ void k_act_mul(float* __restrict__ gate, const float* __restrict__ up
 
 __global__ void k_softcap_inplace(float* __restrict__ x, int n, float cap) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        x[i] = cap * tanhf(x[i] / cap);
-    }
+    if (i < n) x[i] = cap * tanhf(x[i] / cap);
 }
 
-// RMSNorm across rows: [S, D] with optional 1D weight [D] and optional extra scalar multiplier
 __global__ void k_rms_norm_rows(float* __restrict__ out, const float* __restrict__ x,
                                 const float* __restrict__ w, int D, float eps, float extra_scale = 1.0f) {
     const int s = blockIdx.x;
@@ -847,8 +965,6 @@ __global__ void k_rms_norm_rows(float* __restrict__ out, const float* __restrict
     }
 }
 
-// Shared-Memory Normalized Orthogonal Block-FWHT (Gemma 4.5 Turbo: block_size = 64, 128, 256, 512, or 1024)
-// Grid = (total_elems / block_size), blockDim.x = block_size / 2
 __global__ void k_fwht_block_inplace(float* __restrict__ data, int block_size) {
     extern __shared__ float smem[];
     const int half = block_size >> 1;
@@ -876,10 +992,10 @@ __global__ void k_fwht_block_inplace(float* __restrict__ data, int block_size) {
     blk[tid + half] = smem[tid + half] * inv_s;
 }
 
-// Per-Head Half-Split RoPE on Q[S, H, HD] and optional K[S, Hkv, HD] + FP16 KV Cache Write!
+// Per-Head Half-Split RoPE + FP16 KV Cache Write (supports dynamic GPU d_pos for CUDA Graphs!)
 __global__ void k_rope_and_kv_write(float* __restrict__ Q, float* __restrict__ K, const float* __restrict__ V,
                                     __half* __restrict__ k_cache, __half* __restrict__ v_cache,
-                                    int S, int start_pos, int max_seq_len,
+                                    int S, const int* __restrict__ d_pos, int start_pos_val, int max_seq_len,
                                     int H, int Hkv, int HD,
                                     float freq_base, float freq_scale,
                                     const float* __restrict__ freq_factors, int freq_factors_len,
@@ -890,6 +1006,7 @@ __global__ void k_rope_and_kv_write(float* __restrict__ Q, float* __restrict__ K
     const int num_pairs = HD >> 1;
     if (s >= S || i >= num_pairs) return;
 
+    const int start_pos = d_pos ? (*d_pos) : start_pos_val;
     const int pos = start_pos + s;
     const float inv_rope_dim = -2.0f / static_cast<float>(HD);
     float theta = static_cast<float>(pos) * freq_scale * powf(freq_base, static_cast<float>(i) * inv_rope_dim);
@@ -924,21 +1041,21 @@ __global__ void k_rope_and_kv_write(float* __restrict__ Q, float* __restrict__ K
     }
 }
 
-// Exact Online-Softmax GQA Attention Kernel (works for both Decode S=1 and Causal Prefill S>1!)
-// Grid: (H, S, 1), Block: 256 threads (8 warps).
-// Each thread computes partial Q·K across HD, then parallelizes over KV positions t with exact online softmax!
+// Exact Online-Softmax GQA Attention Kernel (CUDA Graph compatible via d_pos!)
 __global__ void k_gqa_attention(const float* __restrict__ Q,
                                 const __half* __restrict__ k_cache,
                                 const __half* __restrict__ v_cache,
                                 float* __restrict__ attn_out,
-                                int S, int start_pos, int H, int Hkv, int HD,
+                                int S, const int* __restrict__ d_pos, int start_pos_val,
+                                int H, int Hkv, int HD,
                                 int swa_win, bool is_swa, float attn_scale, float attn_softcap) {
     const int h = blockIdx.x;
     const int s = blockIdx.y;
     if (h >= H || s >= S) return;
 
-    const int tid = threadIdx.x; // 0..255
-    const int wid = tid >> 5;    // 0..7
+    const int start_pos = d_pos ? (*d_pos) : start_pos_val;
+    const int tid = threadIdx.x;
+    const int wid = tid >> 5;
     const int lane = tid & 31;
     const int gqa_ratio = (Hkv > 0) ? (H / Hkv) : 1;
     const int kvh = min(h / max(1, gqa_ratio), max(1, Hkv) - 1);
@@ -948,7 +1065,6 @@ __global__ void k_gqa_attention(const float* __restrict__ Q,
     const float* qh = Q + (static_cast<size_t>(s) * static_cast<size_t>(H) + static_cast<size_t>(h)) * static_cast<size_t>(HD);
     float* oh = attn_out + (static_cast<size_t>(s) * static_cast<size_t>(H) + static_cast<size_t>(h)) * static_cast<size_t>(HD);
 
-    // Load Q head into shared memory (max HD=512 -> 2 KB)
     __shared__ float sq[512];
     for (int d = tid; d < HD; d += blockDim.x) {
         sq[d] = qh[d] * attn_scale;
@@ -960,9 +1076,6 @@ __global__ void k_gqa_attention(const float* __restrict__ Q,
     const bool use_sinks = (is_swa && s_start > 4);
     const int active_len = use_sinks ? (4 + (seq_len - s_start)) : (seq_len - s_start);
 
-    // Each of the 8 warps processes strided KV positions (t_idx = wid, wid+8, ...),
-    // keeping a local online-softmax state (m_w, l_w) and local output accumulator in registers!
-    // Max HD=512 across 32 lanes -> at most 16 floats/lane in registers!
     float acc[16];
     const int elems_per_lane = (HD + 31) >> 5;
     #pragma unroll
@@ -979,15 +1092,11 @@ __global__ void k_gqa_attention(const float* __restrict__ Q,
         float dot = 0.0f;
         for (int e = 0; e < elems_per_lane; ++e) {
             const int d = (e << 5) + lane;
-            if (d < HD) {
-                dot = fmaf(sq[d], __half2float(kt[d]), dot);
-            }
+            if (d < HD) dot = fmaf(sq[d], __half2float(kt[d]), dot);
         }
         dot = warp_reduce_sum(dot);
         dot = __shfl_sync(0xFFFFFFFFu, dot, 0);
-        if (attn_softcap > 0.0f) {
-            dot = attn_softcap * tanhf(dot / attn_softcap);
-        }
+        if (attn_softcap > 0.0f) dot = attn_softcap * tanhf(dot / attn_softcap);
 
         const float m_new = fmaxf(m_w, dot);
         const float alpha = expf(m_w - m_new);
@@ -997,16 +1106,13 @@ __global__ void k_gqa_attention(const float* __restrict__ Q,
 
         for (int e = 0; e < elems_per_lane; ++e) {
             const int d = (e << 5) + lane;
-            if (d < HD) {
-                acc[e] = fmaf(beta, __half2float(vt[d]), acc[e] * alpha);
-            }
+            if (d < HD) acc[e] = fmaf(beta, __half2float(vt[d]), acc[e] * alpha);
         }
     }
 
-    // Merge the 8 warps' exact online-softmax states via shared memory
     __shared__ float sm_m[8];
     __shared__ float sm_l[8];
-    __shared__ float sm_out[8 * 512]; // 16 KB shared memory -> high occupancy!
+    __shared__ float sm_out[8 * 512];
     if (lane == 0) {
         sm_m[wid] = m_w;
         sm_l[wid] = l_w;
@@ -1033,19 +1139,15 @@ __global__ void k_gqa_attention(const float* __restrict__ Q,
     for (int d = tid; d < HD; d += blockDim.x) {
         float val = 0.0f;
         #pragma unroll
-        for (int w = 0; w < 8; ++w) {
-            val = fmaf(sm_out[w * 512 + d], w_scale[w], val);
-        }
+        for (int w = 0; w < 8; ++w) val = fmaf(sm_out[w * 512 + d], w_scale[w], val);
         oh[d] = val * inv_l;
     }
 }
 
 // ============================================================================
-// Gemma 4.5 26B-A4B Sparse MoE Kernels (Zero Host-Device Sync!)
+// Gemma 4.5 26B-A4B Sparse MoE Kernels (Zero Host-Sync! B=1 + Grouped Prefill!)
 // ============================================================================
 
-// Softmax over E router logits + Top-K (K <= 16) selection & renormalization + optional down_s fold
-// Grid: (S, 1, 1), Block: 128 threads
 __global__ void k_moe_router_topk(const float* __restrict__ logits, const float* __restrict__ down_s,
                                   int* __restrict__ exp_idx_out, float* __restrict__ exp_w_out,
                                   int E, int K_used) {
@@ -1057,9 +1159,7 @@ __global__ void k_moe_router_topk(const float* __restrict__ logits, const float*
     __shared__ float probs[256];
     const int tid = threadIdx.x;
     float local_max = -1.0e30f;
-    for (int e = tid; e < E; e += blockDim.x) {
-        local_max = fmaxf(local_max, row[e]);
-    }
+    for (int e = tid; e < E; e += blockDim.x) local_max = fmaxf(local_max, row[e]);
     local_max = warp_reduce_max(local_max);
     __shared__ float sm_red[8];
     const int wid = tid >> 5, lane = tid & 31;
@@ -1089,27 +1189,21 @@ __global__ void k_moe_router_topk(const float* __restrict__ logits, const float*
     }
     __syncthreads();
     const float inv_sum = sm_red[0];
-    for (int e = tid; e < E; e += blockDim.x) {
-        probs[e] *= inv_sum;
-    }
+    for (int e = tid; e < E; e += blockDim.x) probs[e] *= inv_sum;
     __syncthreads();
 
-    // Thread 0 performs exact deterministic Top-K selection over E <= 256 in shared mem (<1 us!)
     if (tid == 0) {
         float w_sum = 0.0f;
         for (int k = 0; k < K_used; ++k) {
             int best_e = 0;
             float best_p = -1.0f;
             for (int e = 0; e < E; ++e) {
-                if (probs[e] > best_p) {
-                    best_p = probs[e];
-                    best_e = e;
-                }
+                if (probs[e] > best_p) { best_p = probs[e]; best_e = e; }
             }
             idx_o[k] = best_e;
             w_o[k]   = best_p;
             w_sum   += best_p;
-            probs[best_e] = -2.0f; // Mark selected
+            probs[best_e] = -2.0f;
         }
         if (w_sum < 6.103515625e-5f) w_sum = 6.103515625e-5f;
         for (int k = 0; k < K_used; ++k) {
@@ -1119,15 +1213,14 @@ __global__ void k_moe_router_topk(const float* __restrict__ logits, const float*
     }
 }
 
-// Fused MoE Active-K Gate+Up+GeGLU/SiLU Kernel (reads ONLY the K_used active experts!)
-// Grid: (ceil(K_used * F_exp / 4), S, 1), Block: 128 threads
-__global__ void k_moe_gu_act(const uint8_t* __restrict__ Wgu, QuantType qt_gu, size_t rb_gu,
-                             const uint8_t* __restrict__ Wg,  QuantType qt_g,  size_t rb_g,
-                             const uint8_t* __restrict__ Wu,  QuantType qt_u,  size_t rb_u,
-                             const float* __restrict__ x,
-                             const int* __restrict__ exp_idx,
-                             float* __restrict__ act_out,
-                             int K_used, int F_exp, int D, bool fused_gu, bool use_gelu) {
+// Single/small-batch MoE Gate+Up+Act using Q8_1 __dp4a
+__global__ void k_moe_gu_act_q8(const uint8_t* __restrict__ Wgu, QuantType qt_gu, size_t rb_gu,
+                                const uint8_t* __restrict__ Wg,  QuantType qt_g,  size_t rb_g,
+                                const uint8_t* __restrict__ Wu,  QuantType qt_u,  size_t rb_u,
+                                const block_q8_1_gpu* __restrict__ x_q8, const float* __restrict__ x_f32,
+                                const int* __restrict__ exp_idx,
+                                float* __restrict__ act_out,
+                                int K_used, int F_exp, int D, bool fused_gu, bool use_gelu) {
     const int s       = blockIdx.y;
     const int warp_id = threadIdx.x >> 5;
     const int lane    = threadIdx.x & 31;
@@ -1137,17 +1230,18 @@ __global__ void k_moe_gu_act(const uint8_t* __restrict__ Wgu, QuantType qt_gu, s
     const int k = idx / F_exp;
     const int r = idx - k * F_exp;
     const int e = exp_idx[s * K_used + k];
-    const float* xs = x + static_cast<size_t>(s) * static_cast<size_t>(D);
+    const block_q8_1_gpu* xq_s = x_q8 + static_cast<size_t>(s) * static_cast<size_t>(D >> 5);
+    const float* xf_s = x_f32 + static_cast<size_t>(s) * static_cast<size_t>(D);
 
     float g = 0.0f, u = 0.0f;
     if (fused_gu) {
         const size_t base_row = static_cast<size_t>(e) * static_cast<size_t>(2 * F_exp);
-        g = warp_dot_any(Wgu + (base_row + static_cast<size_t>(r)) * rb_gu, qt_gu, xs, D, lane);
-        u = warp_dot_any(Wgu + (base_row + static_cast<size_t>(F_exp + r)) * rb_gu, qt_gu, xs, D, lane);
+        g = warp_dot_any_q8(Wgu + (base_row + static_cast<size_t>(r)) * rb_gu, qt_gu, xq_s, xf_s, D, lane);
+        u = warp_dot_any_q8(Wgu + (base_row + static_cast<size_t>(F_exp + r)) * rb_gu, qt_gu, xq_s, xf_s, D, lane);
     } else {
         const size_t row = static_cast<size_t>(e) * static_cast<size_t>(F_exp) + static_cast<size_t>(r);
-        g = warp_dot_any(Wg + row * rb_g, qt_g, xs, D, lane);
-        u = warp_dot_any(Wu + row * rb_u, qt_u, xs, D, lane);
+        g = warp_dot_any_q8(Wg + row * rb_g, qt_g, xq_s, xf_s, D, lane);
+        u = warp_dot_any_q8(Wu + row * rb_u, qt_u, xq_s, xf_s, D, lane);
     }
     if (lane == 0) {
         const float act = use_gelu ? d_gelu_tanh(g) : d_silu(g);
@@ -1155,43 +1249,341 @@ __global__ void k_moe_gu_act(const uint8_t* __restrict__ Wgu, QuantType qt_gu, s
     }
 }
 
-// Fused MoE Active-K Weighted Down Projection Kernel: moe_out[s, d] = sum_{k=0..K-1} w[s,k] * dot(Wdn[e, d], act[s, k])
-// Grid: (ceil(D / 4), S, 1), Block: 128 threads
-__global__ void k_moe_down_accum(const uint8_t* __restrict__ Wdn, QuantType qt_dn, size_t rb_dn,
-                                 const float* __restrict__ act_in,
-                                 const int* __restrict__ exp_idx,
-                                 const float* __restrict__ exp_w,
-                                 float* __restrict__ out,
-                                 int K_used, int F_exp, int D) {
+// Single/small-batch MoE Weighted Down using Q8_1 __dp4a
+__global__ void k_moe_down_accum_q8(const uint8_t* __restrict__ Wdn, QuantType qt_dn, size_t rb_dn,
+                                    const block_q8_1_gpu* __restrict__ act_q8, const float* __restrict__ act_f32,
+                                    const int* __restrict__ exp_idx, const float* __restrict__ exp_w,
+                                    float* __restrict__ out, int K_used, int F_exp, int D) {
     const int s       = blockIdx.y;
     const int warp_id = threadIdx.x >> 5;
     const int lane    = threadIdx.x & 31;
     const int d       = (blockIdx.x << 2) + warp_id;
     if (d >= D) return;
 
+    const int nb_f = F_exp >> 5;
     float total = 0.0f;
     for (int k = 0; k < K_used; ++k) {
         const int e = exp_idx[s * K_used + k];
         const float w = exp_w[s * K_used + k];
-        const float* ak = act_in + (static_cast<size_t>(s) * static_cast<size_t>(K_used) + static_cast<size_t>(k)) * static_cast<size_t>(F_exp);
+        const size_t slot_idx = static_cast<size_t>(s) * static_cast<size_t>(K_used) + static_cast<size_t>(k);
+        const block_q8_1_gpu* aq = act_q8 + slot_idx * static_cast<size_t>(nb_f);
+        const float* af = act_f32 + slot_idx * static_cast<size_t>(F_exp);
         const size_t row = static_cast<size_t>(e) * static_cast<size_t>(D) + static_cast<size_t>(d);
-        const float dot = warp_dot_any(Wdn + row * rb_dn, qt_dn, ak, F_exp, lane);
+        const float dot = warp_dot_any_q8(Wdn + row * rb_dn, qt_dn, aq, af, F_exp, lane);
         if (lane == 0) total = fmaf(w, dot, total);
     }
-    if (lane == 0) {
-        out[static_cast<size_t>(s) * static_cast<size_t>(D) + static_cast<size_t>(d)] = total;
+    if (lane == 0) out[static_cast<size_t>(s) * static_cast<size_t>(D) + static_cast<size_t>(d)] = total;
+}
+
+// On-GPU CSR Expert Bucket Sort for Prefill (S >= 8, E <= 256, zero host sync, <4 us!)
+__global__ void k_moe_bucket_sort(const int* __restrict__ exp_idx, const float* __restrict__ exp_w,
+                                  int S, int K_used, int E,
+                                  int* __restrict__ exp_offsets,
+                                  int* __restrict__ sorted_tok,
+                                  int* __restrict__ sorted_slot,
+                                  float* __restrict__ sorted_w) {
+    __shared__ int sm_counts[256];
+    __shared__ int sm_cursor[256];
+    const int tid = threadIdx.x;
+    if (tid < E) sm_counts[tid] = 0;
+    __syncthreads();
+
+    const int total = S * K_used;
+    for (int i = tid; i < total; i += blockDim.x) {
+        const int e = exp_idx[i];
+        if (e >= 0 && e < E) atomicAdd(&sm_counts[e], 1);
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        int acc = 0;
+        for (int e = 0; e < E; ++e) {
+            exp_offsets[e] = acc;
+            sm_cursor[e] = acc;
+            acc += sm_counts[e];
+        }
+        exp_offsets[E] = acc;
+    }
+    __syncthreads();
+
+    for (int i = tid; i < total; i += blockDim.x) {
+        const int e = exp_idx[i];
+        if (e >= 0 && e < E) {
+            const int dst = atomicAdd(&sm_cursor[e], 1);
+            const int tok = i / K_used;
+            const int slot = i - tok * K_used;
+            sorted_tok[dst] = tok;
+            sorted_slot[dst] = slot;
+            sorted_w[dst] = exp_w[i];
+        }
     }
 }
 
-// Pleias post-proj combine: e[s, l, p] = (p_proj[s, l, p] + e[s, l, p]) * inv_sqrt2
+// Grouped-Expert 8-Token Register-Tiled MoE Gate+Up+Act (reads expert weights ONCE per 8 tokens!)
+// Grid: (ceil(F_exp / 4), E, 1), Block: 128 threads
+__global__ void k_moe_gu_act_grouped(const uint8_t* __restrict__ Wgu, QuantType qt_gu, size_t rb_gu,
+                                     const uint8_t* __restrict__ Wg,  QuantType qt_g,  size_t rb_g,
+                                     const uint8_t* __restrict__ Wu,  QuantType qt_u,  size_t rb_u,
+                                     const block_q8_1_gpu* __restrict__ x_q8, const float* __restrict__ x_f32,
+                                     const int* __restrict__ exp_offsets,
+                                     const int* __restrict__ sorted_tok,
+                                     const int* __restrict__ sorted_slot,
+                                     float* __restrict__ act_out,
+                                     int K_used, int F_exp, int D, bool fused_gu, bool use_gelu) {
+    const int e = blockIdx.y;
+    const int start = exp_offsets[e];
+    const int end   = exp_offsets[e + 1];
+    if (start >= end) return;
+
+    const int warp_id = threadIdx.x >> 5;
+    const int lane    = threadIdx.x & 31;
+    const int r       = (blockIdx.x << 2) + warp_id;
+    if (r >= F_exp) return;
+
+    const uint8_t* row_g = fused_gu
+        ? (Wgu + (static_cast<size_t>(e) * static_cast<size_t>(2 * F_exp) + static_cast<size_t>(r)) * rb_gu)
+        : (Wg  + (static_cast<size_t>(e) * static_cast<size_t>(F_exp)     + static_cast<size_t>(r)) * rb_g);
+    const uint8_t* row_u = fused_gu
+        ? (Wgu + (static_cast<size_t>(e) * static_cast<size_t>(2 * F_exp) + static_cast<size_t>(F_exp + r)) * rb_gu)
+        : (Wu  + (static_cast<size_t>(e) * static_cast<size_t>(F_exp)     + static_cast<size_t>(r)) * rb_u);
+    const QuantType qt_eff_g = fused_gu ? qt_gu : qt_g;
+    const QuantType qt_eff_u = fused_gu ? qt_gu : qt_u;
+    const int nb32_d = D >> 5;
+
+    if (qt_eff_g == QuantType::IQ4_XS && qt_eff_u == QuantType::IQ4_XS) {
+        const int lut_i = static_cast<int>(d_kvalues_iq4nl[lane & 15]);
+        const int nb = D >> 8;
+        const int ib = lane >> 2;
+        const int t  = lane & 3;
+
+        for (int m = start; m < end; m += 8) {
+            const int T = min(8, end - m);
+            int toks[8];
+            float acc_g[8], acc_u[8];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                toks[i] = (i < T) ? sorted_tok[m + i] : 0;
+                acc_g[i] = 0.0f;
+                acc_u[i] = 0.0f;
+            }
+
+            for (int b = 0; b < nb; ++b) {
+                // Gate block: decode ONCE, reuse across up to 8 tokens!
+                const block_iq4_xs* bg = reinterpret_cast<const block_iq4_xs*>(row_g + static_cast<size_t>(b) * sizeof(block_iq4_xs));
+                const float dg = d_fp16_to_f32(bg->d) * static_cast<float>((((bg->scales_l[ib >> 1] >> (4 * (ib & 1))) & 0x0F) | (((bg->scales_h >> (2 * ib)) & 3) << 4)) - 32);
+                const uint32_t qg = *reinterpret_cast<const uint32_t*>(bg->qs + (lane << 2));
+                const int32_t wg_lo = pack4_i8(
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (qg >>  0) & 0x0Fu),
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (qg >>  8) & 0x0Fu),
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (qg >> 16) & 0x0Fu),
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (qg >> 24) & 0x0Fu));
+                const int32_t wg_hi = pack4_i8(
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (qg >>  4) & 0x0Fu),
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (qg >> 12) & 0x0Fu),
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (qg >> 20) & 0x0Fu),
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (qg >> 28) & 0x0Fu));
+
+                // Up block: decode ONCE, reuse across up to 8 tokens!
+                const block_iq4_xs* bu = reinterpret_cast<const block_iq4_xs*>(row_u + static_cast<size_t>(b) * sizeof(block_iq4_xs));
+                const float du = d_fp16_to_f32(bu->d) * static_cast<float>((((bu->scales_l[ib >> 1] >> (4 * (ib & 1))) & 0x0F) | (((bu->scales_h >> (2 * ib)) & 3) << 4)) - 32);
+                const uint32_t qu = *reinterpret_cast<const uint32_t*>(bu->qs + (lane << 2));
+                const int32_t wu_lo = pack4_i8(
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (qu >>  0) & 0x0Fu),
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (qu >>  8) & 0x0Fu),
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (qu >> 16) & 0x0Fu),
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (qu >> 24) & 0x0Fu));
+                const int32_t wu_hi = pack4_i8(
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (qu >>  4) & 0x0Fu),
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (qu >> 12) & 0x0Fu),
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (qu >> 20) & 0x0Fu),
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (qu >> 28) & 0x0Fu));
+
+                const int x_sub = (b << 3) + ib;
+                for (int i = 0; i < T; ++i) {
+                    const block_q8_1_gpu& xb = x_q8[static_cast<size_t>(toks[i]) * static_cast<size_t>(nb32_d) + static_cast<size_t>(x_sub)];
+                    const int32_t* xq = reinterpret_cast<const int32_t*>(xb.qs);
+                    const int32_t xlo = xq[t], xhi = xq[t + 4];
+                    const int sg = __dp4a(wg_hi, xhi, __dp4a(wg_lo, xlo, 0));
+                    const int su = __dp4a(wu_hi, xhi, __dp4a(wu_lo, xlo, 0));
+                    acc_g[i] = fmaf(dg * xb.d, static_cast<float>(sg), acc_g[i]);
+                    acc_u[i] = fmaf(du * xb.d, static_cast<float>(su), acc_u[i]);
+                }
+            }
+
+            for (int i = 0; i < T; ++i) {
+                const float g = warp_reduce_sum(acc_g[i]);
+                const float u = warp_reduce_sum(acc_u[i]);
+                if (lane == 0) {
+                    const int tok = toks[i];
+                    const int slot = sorted_slot[m + i];
+                    const float act = use_gelu ? d_gelu_tanh(g) : d_silu(g);
+                    act_out[(static_cast<size_t>(tok) * static_cast<size_t>(K_used) + static_cast<size_t>(slot)) * static_cast<size_t>(F_exp) + static_cast<size_t>(r)] = act * u;
+                }
+            }
+        }
+    } else {
+        for (int m = start; m < end; ++m) {
+            const int tok = sorted_tok[m];
+            const int slot = sorted_slot[m];
+            const block_q8_1_gpu* xq_s = x_q8 + static_cast<size_t>(tok) * static_cast<size_t>(nb32_d);
+            const float* xf_s = x_f32 + static_cast<size_t>(tok) * static_cast<size_t>(D);
+            const float g = warp_dot_any_q8(row_g, qt_eff_g, xq_s, xf_s, D, lane);
+            const float u = warp_dot_any_q8(row_u, qt_eff_u, xq_s, xf_s, D, lane);
+            if (lane == 0) {
+                const float act = use_gelu ? d_gelu_tanh(g) : d_silu(g);
+                act_out[(static_cast<size_t>(tok) * static_cast<size_t>(K_used) + static_cast<size_t>(slot)) * static_cast<size_t>(F_exp) + static_cast<size_t>(r)] = act * u;
+            }
+        }
+    }
+}
+
+// Grouped-Expert 8-Token Register-Tiled MoE Weighted Down (reads expert weights ONCE per 8 tokens!)
+// Grid: (ceil(D / 4), E, 1), Block: 128 threads
+__global__ void k_moe_down_grouped(const uint8_t* __restrict__ Wdn, QuantType qt_dn, size_t rb_dn,
+                                   const block_q8_1_gpu* __restrict__ act_q8, const float* __restrict__ act_f32,
+                                   const int* __restrict__ exp_offsets,
+                                   const int* __restrict__ sorted_tok,
+                                   const int* __restrict__ sorted_slot,
+                                   const float* __restrict__ sorted_w,
+                                   float* __restrict__ out,
+                                   int K_used, int F_exp, int D) {
+    const int e = blockIdx.y;
+    const int start = exp_offsets[e];
+    const int end   = exp_offsets[e + 1];
+    if (start >= end) return;
+
+    const int warp_id = threadIdx.x >> 5;
+    const int lane    = threadIdx.x & 31;
+    const int d       = (blockIdx.x << 2) + warp_id;
+    if (d >= D) return;
+
+    const uint8_t* row_dn = Wdn + (static_cast<size_t>(e) * static_cast<size_t>(D) + static_cast<size_t>(d)) * rb_dn;
+    const int nb32_f = F_exp >> 5;
+
+    if (qt_dn == QuantType::IQ4_NL) {
+        const int lut_i = static_cast<int>(d_kvalues_iq4nl[lane & 15]);
+        const int nb = F_exp >> 5;
+        const int b_off = lane >> 2;
+        const int t = lane & 3;
+        const int n_iters = (nb + 7) >> 3;
+
+        for (int m = start; m < end; m += 8) {
+            const int T = min(8, end - m);
+            size_t slot_bases[8];
+            float acc[8];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                if (i < T) {
+                    slot_bases[i] = (static_cast<size_t>(sorted_tok[m + i]) * static_cast<size_t>(K_used) + static_cast<size_t>(sorted_slot[m + i])) * static_cast<size_t>(nb32_f);
+                } else {
+                    slot_bases[i] = 0;
+                }
+                acc[i] = 0.0f;
+            }
+
+            for (int it = 0; it < n_iters; ++it) {
+                const int b = (it << 3) + b_off;
+                const bool active = (b < nb);
+                uint32_t q4 = 0u;
+                float dw = 0.0f;
+                if (active) {
+                    const block_iq4_nl* blk = reinterpret_cast<const block_iq4_nl*>(row_dn + static_cast<size_t>(b) * sizeof(block_iq4_nl));
+                    dw = d_fp16_to_f32(blk->d);
+                    memcpy(&q4, blk->qs + (t << 2), sizeof(uint32_t));
+                }
+                const int32_t w_lo = pack4_i8(
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >>  0) & 0x0Fu),
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >>  8) & 0x0Fu),
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 16) & 0x0Fu),
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 24) & 0x0Fu));
+                const int32_t w_hi = pack4_i8(
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >>  4) & 0x0Fu),
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 12) & 0x0Fu),
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 20) & 0x0Fu),
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 28) & 0x0Fu));
+                if (active) {
+                    for (int i = 0; i < T; ++i) {
+                        const block_q8_1_gpu& xb = act_q8[slot_bases[i] + static_cast<size_t>(b)];
+                        const int32_t* xq = reinterpret_cast<const int32_t*>(xb.qs);
+                        const int sumi = __dp4a(w_hi, xq[t + 4], __dp4a(w_lo, xq[t], 0));
+                        acc[i] = fmaf(dw * xb.d, static_cast<float>(sumi), acc[i]);
+                    }
+                }
+            }
+
+            for (int i = 0; i < T; ++i) {
+                const float dot = warp_reduce_sum(acc[i]);
+                if (lane == 0) {
+                    const int tok = sorted_tok[m + i];
+                    atomicAdd(&out[static_cast<size_t>(tok) * static_cast<size_t>(D) + static_cast<size_t>(d)], sorted_w[m + i] * dot);
+                }
+            }
+        }
+    } else if (qt_dn == QuantType::IQ4_XS) {
+        const int lut_i = static_cast<int>(d_kvalues_iq4nl[lane & 15]);
+        const int nb = F_exp >> 8;
+        const int ib = lane >> 2;
+        const int t  = lane & 3;
+
+        for (int m = start; m < end; m += 8) {
+            const int T = min(8, end - m);
+            size_t slot_bases[8];
+            float acc[8];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                slot_bases[i] = (i < T)
+                    ? (static_cast<size_t>(sorted_tok[m + i]) * static_cast<size_t>(K_used) + static_cast<size_t>(sorted_slot[m + i])) * static_cast<size_t>(nb32_f)
+                    : 0;
+                acc[i] = 0.0f;
+            }
+            for (int b = 0; b < nb; ++b) {
+                const block_iq4_xs* blk = reinterpret_cast<const block_iq4_xs*>(row_dn + static_cast<size_t>(b) * sizeof(block_iq4_xs));
+                const float dl = d_fp16_to_f32(blk->d) * static_cast<float>((((blk->scales_l[ib >> 1] >> (4 * (ib & 1))) & 0x0F) | (((blk->scales_h >> (2 * ib)) & 3) << 4)) - 32);
+                const uint32_t q4 = *reinterpret_cast<const uint32_t*>(blk->qs + (lane << 2));
+                const int32_t w_lo = pack4_i8(
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >>  0) & 0x0Fu),
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >>  8) & 0x0Fu),
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 16) & 0x0Fu),
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 24) & 0x0Fu));
+                const int32_t w_hi = pack4_i8(
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >>  4) & 0x0Fu),
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 12) & 0x0Fu),
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 20) & 0x0Fu),
+                    __shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 28) & 0x0Fu));
+                const int x_sub = (b << 3) + ib;
+                for (int i = 0; i < T; ++i) {
+                    const block_q8_1_gpu& xb = act_q8[slot_bases[i] + static_cast<size_t>(x_sub)];
+                    const int32_t* xq = reinterpret_cast<const int32_t*>(xb.qs);
+                    const int sumi = __dp4a(w_hi, xq[t + 4], __dp4a(w_lo, xq[t], 0));
+                    acc[i] = fmaf(dl * xb.d, static_cast<float>(sumi), acc[i]);
+                }
+            }
+            for (int i = 0; i < T; ++i) {
+                const float dot = warp_reduce_sum(acc[i]);
+                if (lane == 0) {
+                    const int tok = sorted_tok[m + i];
+                    atomicAdd(&out[static_cast<size_t>(tok) * static_cast<size_t>(D) + static_cast<size_t>(d)], sorted_w[m + i] * dot);
+                }
+            }
+        }
+    } else {
+        for (int m = start; m < end; ++m) {
+            const int tok = sorted_tok[m];
+            const int slot = sorted_slot[m];
+            const size_t slot_idx = static_cast<size_t>(tok) * static_cast<size_t>(K_used) + static_cast<size_t>(slot);
+            const float dot = warp_dot_any_q8(row_dn, qt_dn, act_q8 + slot_idx * static_cast<size_t>(nb32_f), act_f32 + slot_idx * static_cast<size_t>(F_exp), F_exp, lane);
+            if (lane == 0) {
+                atomicAdd(&out[static_cast<size_t>(tok) * static_cast<size_t>(D) + static_cast<size_t>(d)], sorted_w[m] * dot);
+            }
+        }
+    }
+}
+
 __global__ void k_pleias_combine(float* __restrict__ pl_emb, const float* __restrict__ pl_proj, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        pl_emb[i] = (pl_proj[i] + pl_emb[i]) * 0.7071067811865475f;
-    }
+    if (i < n) pl_emb[i] = (pl_proj[i] + pl_emb[i]) * 0.7071067811865475f;
 }
 
-// Pleias gate activation & multiply with layer embedding slice: gate[s, p] = gelu(gate[s, p]) * pl_emb[s, l, p]
 __global__ void k_pleias_gate_mul(float* __restrict__ gate, const float* __restrict__ pl_emb,
                                   int S, int L, int l, int P_dim) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1202,7 +1594,6 @@ __global__ void k_pleias_gate_mul(float* __restrict__ gate, const float* __restr
     gate[i] = d_gelu_tanh(g) * pl_emb[(static_cast<size_t>(s) * static_cast<size_t>(L) + static_cast<size_t>(l)) * static_cast<size_t>(P_dim) + static_cast<size_t>(p)];
 }
 
-// Two-Stage Fast Parallel Argmax over [V] F32 logits -> 4-byte uint32_t on GPU
 __global__ void k_argmax_stage1(const float* __restrict__ logits, int V,
                                 float* __restrict__ blk_vals, uint32_t* __restrict__ blk_idx) {
     float best_v = -1.0e30f;
@@ -1286,7 +1677,6 @@ struct GpuLayer {
     float* d_ffn_norm = nullptr;
     float* d_post_ffn_norm = nullptr;
 
-    // Sparse MoE (Gemma 4.5 26B-A4B)
     bool has_moe = false;
     bool fused_moe_gu = false;
     GpuTensor moe_router;
@@ -1297,11 +1687,9 @@ struct GpuLayer {
     float* d_pre_ffn_norm_2 = nullptr;
     float* d_post_ffn_norm_2 = nullptr;
 
-    // Pleias per-layer injection (Gemma 4.5 E2B/E4B)
     GpuTensor inp_gate, proj;
     float* d_post_norm = nullptr;
 
-    // Per-layer FP16 KV Cache (allocated only if has_kv == true)
     __half* d_k_cache = nullptr;
     __half* d_v_cache = nullptr;
     size_t kv_bytes = 0;
@@ -1328,47 +1716,63 @@ struct HavenCudaEngine::Impl {
 
     bool has_pleias = false;
     bool tied_emb = true;
+    bool use_cuda_graph = true;
     int max_F = 0;
     int max_q_dim = 0;
     int max_kv_dim = 0;
-    int max_S = 256;
+    int max_S = 512;
+    int max_seq_len_runtime = 2048;
 
-    // Activation & GEMM scratch buffers
+    // Pinned host + device args for single-shot B=1 CUDA Graph decode
+    uint32_t* h_step_args = nullptr;   // [2]: {token, pos}
+    uint32_t* h_am_out = nullptr;      // [1]
+    uint32_t* d_step_args = nullptr;   // [2]: {token, pos} (d_step_args[0]=tok, d_step_args[1]=pos)
+    cudaGraph_t decode_graph = nullptr;
+    cudaGraphExec_t decode_graph_exec = nullptr;
+    bool decode_graph_captured = false;
+
+    // Activation & Q8_1 scratch buffers
     uint32_t* d_tok_ids = nullptr;
-    float* d_x = nullptr;           // [max_S, D]
-    float* d_norm = nullptr;        // [max_S, D]
-    float* d_q = nullptr;           // [max_S, max_q_dim]
-    float* d_k = nullptr;           // [max_S, max_kv_dim]
-    float* d_v = nullptr;           // [max_S, max_kv_dim]
-    float* d_attn_h = nullptr;      // [max_S, max_q_dim]
-    float* d_attn_o = nullptr;      // [max_S, D]
-    float* d_ffn_g = nullptr;       // [max_S, max_F]
-    float* d_ffn_u = nullptr;       // [max_S, max_F]
-    float* d_ffn_d = nullptr;       // [max_S, D]
+    float* d_x = nullptr;
+    float* d_norm = nullptr;
+    float* d_q = nullptr;
+    float* d_k = nullptr;
+    float* d_v = nullptr;
+    float* d_attn_h = nullptr;
+    float* d_attn_o = nullptr;
+    float* d_ffn_g = nullptr;
+    float* d_ffn_u = nullptr;
+    float* d_ffn_d = nullptr;
+    block_q8_1_gpu* d_x_q8 = nullptr;       // [max_S * (max_in_dim / 32)]
 
-    // MoE scratch
-    float* d_moe_norm = nullptr;    // [max_S, D]
-    float* d_moe_router = nullptr;  // [max_S, E]
-    int*   d_moe_idx = nullptr;     // [max_S, K_used]
-    float* d_moe_w = nullptr;       // [max_S, K_used]
-    float* d_moe_act = nullptr;     // [max_S, K_used * F_exp]
-    float* d_moe_out = nullptr;     // [max_S, D]
+    // MoE scratch (including GPU CSR bucket sort buffers for grouped prefill!)
+    float* d_moe_norm = nullptr;
+    float* d_moe_router = nullptr;
+    int*   d_moe_idx = nullptr;
+    float* d_moe_w = nullptr;
+    float* d_moe_act = nullptr;
+    block_q8_1_gpu* d_moe_act_q8 = nullptr; // [max_S * K_used * (F_exp / 32)]
+    float* d_moe_out = nullptr;
+    int*   d_moe_exp_offsets = nullptr;     // [257]
+    int*   d_moe_sorted_tok = nullptr;      // [max_S * K_used]
+    int*   d_moe_sorted_slot = nullptr;     // [max_S * K_used]
+    float* d_moe_sorted_w = nullptr;        // [max_S * K_used]
 
     // Pleias scratch
-    float* d_pl_emb = nullptr;      // [max_S, L * 256]
-    float* d_pl_proj = nullptr;     // [max_S, L * 256]
-    float* d_pl_gate = nullptr;     // [max_S, 256]
-    float* d_pl_out = nullptr;      // [max_S, D]
+    float* d_pl_emb = nullptr;
+    float* d_pl_proj = nullptr;
+    float* d_pl_gate = nullptr;
+    float* d_pl_out = nullptr;
 
     // Logits & Argmax scratch
-    float* d_logits = nullptr;      // [V]
-    float* d_am_vals = nullptr;     // [256]
-    uint32_t* d_am_idx = nullptr;   // [256]
-    uint32_t* d_am_out = nullptr;   // [1]
+    float* d_logits = nullptr;
+    float* d_am_vals = nullptr;
+    uint32_t* d_am_idx = nullptr;
+    uint32_t* d_am_out = nullptr;
 
     // FP16 cuBLAS Tensor Core prefill scratch
-    __half* d_x_f16 = nullptr;      // [max_S, max(D, max_F, max_q_dim)]
-    __half* d_w_f16 = nullptr;      // [max_w_elems] (single-matrix reusable tile)
+    __half* d_x_f16 = nullptr;
+    __half* d_w_f16 = nullptr;
     size_t w_f16_cap_elems = 0;
 
     void* alloc_gpu(size_t bytes, size_t& counter) {
@@ -1392,7 +1796,7 @@ struct HavenCudaEngine::Impl {
         }
         const size_t need_bytes = static_cast<size_t>(rows) * rb;
         if (td->size_bytes > 0 && need_bytes > td->size_bytes) {
-            err = "Tensor " + td->name + " byte size mismatch (need " + std::to_string(need_bytes) + ", have " + std::to_string(td->size_bytes) + ")";
+            err = "Tensor " + td->name + " byte size mismatch";
             return false;
         }
         void* dp = alloc_gpu(need_bytes, weight_bytes);
@@ -1435,22 +1839,32 @@ struct HavenCudaEngine::Impl {
         return static_cast<float*>(dp);
     }
 
-    // Dispatch linear projection: [S, K] x [N, K]^T -> [S, N] (F32)
-    // Uses direct warp-specialized GEMV for S < 8 (zero scratch, 90% GDDR6 BW!)
-    // Uses on-the-fly FP16 dequant + cuBLAS FP16 Tensor Core GEMM for S >= 8!
-    void linear_forward(const GpuTensor& W, const float* d_bias, const float* d_in, float* d_out, int S, float scale_out = 1.0f) {
+    void quantize_q8(const float* d_in, block_q8_1_gpu* d_out, int n_floats) {
+        const int nb = n_floats >> 5;
+        if (nb <= 0) return;
+        k_quantize_q8_1<<<(nb + 7) >> 3, 256, 0, stream>>>(d_in, d_out, nb);
+    }
+
+    void linear_forward(const GpuTensor& W, const float* d_bias, const float* d_in, float* d_out, int S,
+                        float scale_out = 1.0f, bool reuse_q8 = false) {
         const int N = W.rows;
         const int K = W.cols;
         if (S <= 1) {
-            const int blocks = (N + 3) >> 2;
-            k_gemv_quant<<<blocks, 128, 0, stream>>>(W.ptr, W.type, W.row_bytes, d_in, d_bias, d_out, N, K, scale_out);
+            if (!reuse_q8 && (K & 31) == 0 && W.type != QuantType::F32 && W.type != QuantType::BF16 && W.type != QuantType::F16) {
+                quantize_q8(d_in, d_x_q8, K);
+            }
+            k_gemv_quant_q8<<<(N + 3) >> 2, 128, 0, stream>>>(
+                W.ptr, W.type, W.row_bytes, d_x_q8, d_in, d_bias, d_out, N, K, scale_out);
             return;
         }
         if (S < 8 || static_cast<size_t>(N) * static_cast<size_t>(K) > w_f16_cap_elems) {
+            if (!reuse_q8 && (K & 31) == 0) quantize_q8(d_in, d_x_q8, S * K);
+            const int nb32 = K >> 5;
             const int blocks = (N + 3) >> 2;
             for (int s = 0; s < S; ++s) {
-                k_gemv_quant<<<blocks, 128, 0, stream>>>(
+                k_gemv_quant_q8<<<blocks, 128, 0, stream>>>(
                     W.ptr, W.type, W.row_bytes,
+                    d_x_q8 + static_cast<size_t>(s) * static_cast<size_t>(nb32),
                     d_in + static_cast<size_t>(s) * static_cast<size_t>(K),
                     d_bias,
                     d_out + static_cast<size_t>(s) * static_cast<size_t>(N),
@@ -1463,7 +1877,7 @@ struct HavenCudaEngine::Impl {
         const int x_n = S * K;
         k_f32_to_f16<<<(x_n + 255) / 256, 256, 0, stream>>>(d_in, d_x_f16, x_n);
 
-        // Dequantize W [N, K] raw blocks -> FP16 scratch
+        // Zero-stall __shfl_sync dequantize W [N, K] raw blocks -> FP16 scratch
         int threads_per_row = K;
         if (W.type == QuantType::IQ4_XS || W.type == QuantType::IQ4_NL ||
             W.type == QuantType::Q5_K || W.type == QuantType::Q4_K ||
@@ -1477,7 +1891,6 @@ struct HavenCudaEngine::Impl {
         dim3 dq_grid((threads_per_row + 255) / 256, static_cast<unsigned int>(N), 1);
         k_dequant_to_f16<<<dq_grid, 256, 0, stream>>>(W.ptr, W.type, W.row_bytes, d_w_f16, N, K);
 
-        // Row-major Y[S, N] = X[S, K] @ W[N, K]^T <=> Col-major Y^T[N, S] = (W^T)^T @ X^T
         const float alpha = scale_out;
         const float beta  = 0.0f;
         cublasGemmEx(
@@ -1520,8 +1933,10 @@ struct HavenCudaEngine::Impl {
         k_dequant_rows_f32<<<grid, 256, 0, stream>>>(tbl.ptr, tbl.type, tbl.row_bytes, d_ids, S, vocab_size, d_out, K, scale);
     }
 
-    bool run_forward_chunk(const uint32_t* h_tokens, int S, int start_pos,
-                           float* out_last_logits, uint32_t* out_next_token, std::string& err) {
+    // Core GPU Transformer Graph Body (100% stream-enqueueable & CUDA-Graph capturable for S==1!)
+    void enqueue_transformer_body(const uint32_t* d_ids_ptr, int S,
+                                  const int* d_pos_ptr, int start_pos_val,
+                                  bool compute_lm_head, bool compute_argmax) {
         const int D = static_cast<int>(mc.embedding_dim);
         const int L = static_cast<int>(mc.num_layers);
         const int H = static_cast<int>(mc.num_heads);
@@ -1529,14 +1944,13 @@ struct HavenCudaEngine::Impl {
         const bool use_gelu = (mc.ffn_activation == FfnActivation::GELU);
         const int swa_win = (mc.sliding_window > 0) ? static_cast<int>(mc.sliding_window) : 512;
 
-        // 1. Copy token IDs H2D (4 * S bytes!) & Gather Token Embeddings on GPU
-        cudaMemcpyAsync(d_tok_ids, h_tokens, static_cast<size_t>(S) * sizeof(uint32_t), cudaMemcpyHostToDevice, stream);
+        // 1. Gather Token Embeddings on GPU
         const float emb_scale = mc.is_gemma ? std::sqrt(static_cast<float>(D)) : 1.0f;
-        dequant_embed_rows(tok_emb, d_tok_ids, S, V, d_x, emb_scale);
+        dequant_embed_rows(tok_emb, d_ids_ptr, S, V, d_x, emb_scale);
 
         // 1b. Optional Pleias Per-Layer Embeddings (Gemma 4.5 E2B / E4B)
         if (has_pleias) {
-            dequant_embed_rows(pl_tok_emb, d_tok_ids, S, V, d_pl_emb, 16.0f);
+            dequant_embed_rows(pl_tok_emb, d_ids_ptr, S, V, d_pl_emb, 16.0f);
             if (pl_model_proj.valid()) {
                 linear_forward(pl_model_proj, nullptr, d_x, d_pl_proj, S, 1.0f / std::sqrt(static_cast<float>(D)));
                 k_rms_norm_rows<<<S * L, 128, 0, stream>>>(d_pl_proj, d_pl_proj, d_pl_proj_norm, 256, mc.rms_norm_eps);
@@ -1545,7 +1959,7 @@ struct HavenCudaEngine::Impl {
             }
         }
 
-        // 2. Transformer Layer Loop (100% GPU-resident, zero host synchronization!)
+        // 2. Transformer Layer Loop
         for (int l = 0; l < L; ++l) {
             const auto& gl = layers[static_cast<size_t>(l)];
             const int HD = gl.head_dim;
@@ -1563,14 +1977,15 @@ struct HavenCudaEngine::Impl {
 
             // 2b. Q, K, V Projections
             if (S == 1) {
+                quantize_q8(d_norm, d_x_q8, D);
                 const int k_n = gl.has_kv ? kv_dim : 0;
                 const int v_n = (gl.has_kv && !gl.k_eq_v && gl.attn_v.valid()) ? kv_dim : 0;
                 const int total_qkv = q_dim + k_n + v_n;
-                k_fused_qkv_gemv<<<(total_qkv + 3) >> 2, 128, 0, stream>>>(
+                k_fused_qkv_gemv_q8<<<(total_qkv + 3) >> 2, 128, 0, stream>>>(
                     gl.attn_q.ptr, gl.attn_q.type, gl.attn_q.row_bytes, gl.d_attn_q_bias,
                     gl.has_kv ? gl.attn_k.ptr : nullptr, gl.attn_k.type, gl.attn_k.row_bytes, gl.d_attn_k_bias,
                     (v_n > 0) ? gl.attn_v.ptr : nullptr, gl.attn_v.type, gl.attn_v.row_bytes, gl.d_attn_v_bias,
-                    d_norm, d_q, d_k, d_v, q_dim, k_n, v_n, D, gl.k_eq_v);
+                    d_x_q8, d_norm, d_q, d_k, d_v, q_dim, k_n, v_n, D, gl.k_eq_v);
             } else {
                 linear_forward(gl.attn_q, gl.d_attn_q_bias, d_norm, d_q, S);
                 if (gl.has_kv) {
@@ -1584,12 +1999,8 @@ struct HavenCudaEngine::Impl {
             }
 
             // 2c. Per-Head Q-Norm, K-Norm, Parameter-Free V-Norm
-            if (gl.d_attn_q_norm) {
-                k_rms_norm_rows<<<S * H, 128, 0, stream>>>(d_q, d_q, gl.d_attn_q_norm, HD, mc.rms_norm_eps);
-            }
-            if (gl.has_kv && gl.d_attn_k_norm) {
-                k_rms_norm_rows<<<S * Hkv, 128, 0, stream>>>(d_k, d_k, gl.d_attn_k_norm, HD, mc.rms_norm_eps);
-            }
+            if (gl.d_attn_q_norm) k_rms_norm_rows<<<S * H, 128, 0, stream>>>(d_q, d_q, gl.d_attn_q_norm, HD, mc.rms_norm_eps);
+            if (gl.has_kv && gl.d_attn_k_norm) k_rms_norm_rows<<<S * Hkv, 128, 0, stream>>>(d_k, d_k, gl.d_attn_k_norm, HD, mc.rms_norm_eps);
             if (gl.has_kv && mc.is_gemma && gl.d_attn_q_norm && gl.d_attn_k_norm) {
                 k_rms_norm_rows<<<S * Hkv, 128, 0, stream>>>(d_v, d_v, nullptr, HD, mc.rms_norm_eps);
             }
@@ -1605,20 +2016,18 @@ struct HavenCudaEngine::Impl {
                 d_q, d_k, d_v,
                 gl.has_kv ? gl.d_k_cache : nullptr,
                 gl.has_kv ? gl.d_v_cache : nullptr,
-                S, start_pos, static_cast<int>(max_seq_len_runtime),
+                S, d_pos_ptr, start_pos_val, static_cast<int>(max_seq_len_runtime),
                 H, Hkv, HD, freq_base, mc.rope_freq_scale, rf, rf_len, gl.has_kv);
 
-            // 2e. Online-Softmax GQA Attention (always match source layer KV head count for shared-KV layers!)
+            // 2e. Online-Softmax GQA Attention
             dim3 attn_grid(static_cast<unsigned int>(H), static_cast<unsigned int>(S), 1);
             k_gqa_attention<<<attn_grid, 256, 0, stream>>>(
                 d_q, kv_src.d_k_cache, kv_src.d_v_cache, d_attn_h,
-                S, start_pos, H, kv_src.n_kv_heads, HD, swa_win, gl.is_swa, attn_scale, mc.attn_logit_softcapping);
+                S, d_pos_ptr, start_pos_val, H, kv_src.n_kv_heads, HD, swa_win, gl.is_swa, attn_scale, mc.attn_logit_softcapping);
 
             // 2f. Attention Output Projection + Optional Post-Attn Norm + Residual 1
             linear_forward(gl.attn_output, nullptr, d_attn_h, d_attn_o, S);
-            if (gl.d_post_attn_norm) {
-                k_rms_norm_rows<<<S, 256, 0, stream>>>(d_attn_o, d_attn_o, gl.d_post_attn_norm, D, mc.rms_norm_eps);
-            }
+            if (gl.d_post_attn_norm) k_rms_norm_rows<<<S, 256, 0, stream>>>(d_attn_o, d_attn_o, gl.d_post_attn_norm, D, mc.rms_norm_eps);
             k_add_residual<<<(S * D + 255) / 256, 256, 0, stream>>>(d_x, d_attn_o, S * D);
 
             // 2g. Pre-FFN RMSNorm + Optional Gemma 4.5 Turbo Block-FWHT
@@ -1627,12 +2036,13 @@ struct HavenCudaEngine::Impl {
                 launch_fwht(d_norm, S * D, static_cast<int>(mc.turbo_hadamard_ffn));
             }
 
-            // 2h. Dense Shared FFN (Fused Gate+Up+Act for S=1, Tensor Core GEMM for S>=8) + Optional Turbo FWHT + Down
+            // 2h. Dense Shared FFN
             if (S == 1) {
-                k_fused_ffn_gu_act<<<(F_hid + 3) >> 2, 128, 0, stream>>>(
+                quantize_q8(d_norm, d_x_q8, D);
+                k_fused_ffn_gu_act_q8<<<(F_hid + 3) >> 2, 128, 0, stream>>>(
                     gl.ffn_gate.ptr, gl.ffn_gate.type, gl.ffn_gate.row_bytes,
                     gl.ffn_up.ptr,   gl.ffn_up.type,   gl.ffn_up.row_bytes,
-                    d_norm, d_ffn_g, F_hid, D, use_gelu);
+                    d_x_q8, d_norm, d_ffn_g, F_hid, D, use_gelu);
             } else {
                 linear_forward(gl.ffn_gate, nullptr, d_norm, d_ffn_g, S);
                 linear_forward(gl.ffn_up,   nullptr, d_norm, d_ffn_u, S);
@@ -1644,7 +2054,7 @@ struct HavenCudaEngine::Impl {
             }
             linear_forward(gl.ffn_down, nullptr, d_ffn_g, d_ffn_d, S);
 
-            // 2i. Optional Parallel Sparse MoE Branch (Gemma 4.5 26B-A4B MoE — 100% On-GPU!)
+            // 2i. Optional Parallel Sparse MoE Branch (100% GPU-resident, zero host sync!)
             if (gl.has_moe) {
                 const int E = static_cast<int>(mc.expert_count);
                 const int K_used = std::clamp(static_cast<int>(mc.expert_used_count > 0 ? mc.expert_used_count : 8u), 1, E);
@@ -1653,39 +2063,63 @@ struct HavenCudaEngine::Impl {
                 if (gl.d_post_ffn_norm_1) {
                     k_rms_norm_rows<<<S, 256, 0, stream>>>(d_ffn_d, d_ffn_d, gl.d_post_ffn_norm_1, D, mc.rms_norm_eps);
                 }
-                // Router input: parameter-free RMSNorm(x) * (1/sqrt(D)) * rscale
                 k_rms_norm_rows<<<S, 256, 0, stream>>>(
-                    d_moe_norm, d_x,
-                    mc.turbo_folded_scales ? nullptr : gl.d_moe_rscale,
+                    d_moe_norm, d_x, mc.turbo_folded_scales ? nullptr : gl.d_moe_rscale,
                     D, mc.rms_norm_eps, 1.0f / std::sqrt(static_cast<float>(D)));
                 linear_forward(gl.moe_router, nullptr, d_moe_norm, d_moe_router, S);
                 k_moe_router_topk<<<S, 128, 0, stream>>>(
                     d_moe_router, mc.turbo_folded_scales ? nullptr : gl.d_moe_down_scale,
                     d_moe_idx, d_moe_w, E, K_used);
 
-                // Pre-FFN Norm 2 + Optional Turbo Block-256 FWHT on MoE input
                 k_rms_norm_rows<<<S, 256, 0, stream>>>(
                     d_moe_norm, d_x, mc.turbo_folded_norms ? nullptr : gl.d_pre_ffn_norm_2, D, mc.rms_norm_eps);
                 if (mc.turbo_hadamard_moe_in > 0) {
                     launch_fwht(d_moe_norm, S * D, static_cast<int>(mc.turbo_hadamard_moe_in));
                 }
+                quantize_q8(d_moe_norm, d_x_q8, S * D);
 
-                // Active-K Experts Gate+Up+Act -> optional FWHT -> Active-K Weighted Down
-                dim3 gu_grid((K_used * F_exp + 3) >> 2, static_cast<unsigned int>(S), 1);
-                k_moe_gu_act<<<gu_grid, 128, 0, stream>>>(
-                    gl.moe_gu.ptr, gl.moe_gu.type, gl.moe_gu.row_bytes,
-                    gl.moe_g.ptr,  gl.moe_g.type,  gl.moe_g.row_bytes,
-                    gl.moe_u.ptr,  gl.moe_u.type,  gl.moe_u.row_bytes,
-                    d_moe_norm, d_moe_idx, d_moe_act,
-                    K_used, F_exp, D, gl.fused_moe_gu, use_gelu);
-                if (mc.turbo_hadamard_moe_down > 0 && (F_exp % static_cast<int>(mc.turbo_hadamard_moe_down)) == 0) {
-                    launch_fwht(d_moe_act, S * K_used * F_exp, static_cast<int>(mc.turbo_hadamard_moe_down));
+                if (S >= 8 && E <= 256) {
+                    // Grouped 8-token register-tiled MoE prefill (zero host sync, 8x weight & LUT reuse!)
+                    k_moe_bucket_sort<<<1, 256, 0, stream>>>(
+                        d_moe_idx, d_moe_w, S, K_used, E,
+                        d_moe_exp_offsets, d_moe_sorted_tok, d_moe_sorted_slot, d_moe_sorted_w);
+                    dim3 gu_grid((F_exp + 3) >> 2, static_cast<unsigned int>(E), 1);
+                    k_moe_gu_act_grouped<<<gu_grid, 128, 0, stream>>>(
+                        gl.moe_gu.ptr, gl.moe_gu.type, gl.moe_gu.row_bytes,
+                        gl.moe_g.ptr,  gl.moe_g.type,  gl.moe_g.row_bytes,
+                        gl.moe_u.ptr,  gl.moe_u.type,  gl.moe_u.row_bytes,
+                        d_x_q8, d_moe_norm,
+                        d_moe_exp_offsets, d_moe_sorted_tok, d_moe_sorted_slot,
+                        d_moe_act, K_used, F_exp, D, gl.fused_moe_gu, use_gelu);
+                    if (mc.turbo_hadamard_moe_down > 0 && (F_exp % static_cast<int>(mc.turbo_hadamard_moe_down)) == 0) {
+                        launch_fwht(d_moe_act, S * K_used * F_exp, static_cast<int>(mc.turbo_hadamard_moe_down));
+                    }
+                    quantize_q8(d_moe_act, d_moe_act_q8, S * K_used * F_exp);
+                    cudaMemsetAsync(d_moe_out, 0, static_cast<size_t>(S) * static_cast<size_t>(D) * sizeof(float), stream);
+                    dim3 dn_grid((D + 3) >> 2, static_cast<unsigned int>(E), 1);
+                    k_moe_down_grouped<<<dn_grid, 128, 0, stream>>>(
+                        gl.moe_dn.ptr, gl.moe_dn.type, gl.moe_dn.row_bytes,
+                        d_moe_act_q8, d_moe_act,
+                        d_moe_exp_offsets, d_moe_sorted_tok, d_moe_sorted_slot, d_moe_sorted_w,
+                        d_moe_out, K_used, F_exp, D);
+                } else {
+                    dim3 gu_grid((K_used * F_exp + 3) >> 2, static_cast<unsigned int>(S), 1);
+                    k_moe_gu_act_q8<<<gu_grid, 128, 0, stream>>>(
+                        gl.moe_gu.ptr, gl.moe_gu.type, gl.moe_gu.row_bytes,
+                        gl.moe_g.ptr,  gl.moe_g.type,  gl.moe_g.row_bytes,
+                        gl.moe_u.ptr,  gl.moe_u.type,  gl.moe_u.row_bytes,
+                        d_x_q8, d_moe_norm, d_moe_idx, d_moe_act,
+                        K_used, F_exp, D, gl.fused_moe_gu, use_gelu);
+                    if (mc.turbo_hadamard_moe_down > 0 && (F_exp % static_cast<int>(mc.turbo_hadamard_moe_down)) == 0) {
+                        launch_fwht(d_moe_act, S * K_used * F_exp, static_cast<int>(mc.turbo_hadamard_moe_down));
+                    }
+                    quantize_q8(d_moe_act, d_moe_act_q8, S * K_used * F_exp);
+                    dim3 dn_grid((D + 3) >> 2, static_cast<unsigned int>(S), 1);
+                    k_moe_down_accum_q8<<<dn_grid, 128, 0, stream>>>(
+                        gl.moe_dn.ptr, gl.moe_dn.type, gl.moe_dn.row_bytes,
+                        d_moe_act_q8, d_moe_act, d_moe_idx, d_moe_w, d_moe_out,
+                        K_used, F_exp, D);
                 }
-                dim3 dn_grid((D + 3) >> 2, static_cast<unsigned int>(S), 1);
-                k_moe_down_accum<<<dn_grid, 128, 0, stream>>>(
-                    gl.moe_dn.ptr, gl.moe_dn.type, gl.moe_dn.row_bytes,
-                    d_moe_act, d_moe_idx, d_moe_w, d_moe_out,
-                    K_used, F_exp, D);
 
                 if (gl.d_post_ffn_norm_2) {
                     k_rms_norm_rows<<<S, 256, 0, stream>>>(d_moe_out, d_moe_out, gl.d_post_ffn_norm_2, D, mc.rms_norm_eps);
@@ -1693,20 +2127,16 @@ struct HavenCudaEngine::Impl {
                 k_add_residual<<<(S * D + 255) / 256, 256, 0, stream>>>(d_ffn_d, d_moe_out, S * D);
             }
 
-            if (gl.d_post_ffn_norm) {
-                k_rms_norm_rows<<<S, 256, 0, stream>>>(d_ffn_d, d_ffn_d, gl.d_post_ffn_norm, D, mc.rms_norm_eps);
-            }
+            if (gl.d_post_ffn_norm) k_rms_norm_rows<<<S, 256, 0, stream>>>(d_ffn_d, d_ffn_d, gl.d_post_ffn_norm, D, mc.rms_norm_eps);
             k_add_residual<<<(S * D + 255) / 256, 256, 0, stream>>>(d_x, d_ffn_d, S * D);
 
-            // 2j. Optional Pleias Per-Layer Token Injection (Gemma 4.5 E2B / E4B)
+            // 2j. Optional Pleias Per-Layer Token Injection
             if (has_pleias && gl.inp_gate.valid() && gl.proj.valid()) {
                 linear_forward(gl.inp_gate, nullptr, d_x, d_pl_gate, S);
                 const int tot_p = S * 256;
                 k_pleias_gate_mul<<<(tot_p + 255) / 256, 256, 0, stream>>>(d_pl_gate, d_pl_emb, S, L, l, 256);
                 linear_forward(gl.proj, nullptr, d_pl_gate, d_pl_out, S);
-                if (gl.d_post_norm) {
-                    k_rms_norm_rows<<<S, 256, 0, stream>>>(d_pl_out, d_pl_out, gl.d_post_norm, D, mc.rms_norm_eps);
-                }
+                if (gl.d_post_norm) k_rms_norm_rows<<<S, 256, 0, stream>>>(d_pl_out, d_pl_out, gl.d_post_norm, D, mc.rms_norm_eps);
                 k_add_residual<<<(S * D + 255) / 256, 256, 0, stream>>>(d_x, d_pl_out, S * D);
             } else if (gl.d_post_norm) {
                 k_rms_norm_rows<<<S, 256, 0, stream>>>(d_x, d_x, gl.d_post_norm, D, mc.rms_norm_eps);
@@ -1717,36 +2147,102 @@ struct HavenCudaEngine::Impl {
             }
         }
 
-        // 3. Final Output RMSNorm + 262k LM Head ONLY for the last token in chunk (if requested!)
-        if (out_last_logits || out_next_token) {
+        // 3. Final Output RMSNorm + 262k LM Head + Softcap + Optional On-GPU Argmax
+        if (compute_lm_head) {
             const float* d_x_last = d_x + static_cast<size_t>(S - 1) * static_cast<size_t>(D);
             k_rms_norm_rows<<<1, 256, 0, stream>>>(d_norm, d_x_last, d_out_norm, D, mc.rms_norm_eps);
             linear_forward(lm_head, nullptr, d_norm, d_logits, 1);
             if (mc.final_logit_softcapping > 0.0f) {
                 k_softcap_inplace<<<(V + 255) / 256, 256, 0, stream>>>(d_logits, V, mc.final_logit_softcapping);
             }
-            if (out_next_token) {
+            if (compute_argmax) {
                 k_argmax_stage1<<<256, 256, 0, stream>>>(d_logits, V, d_am_vals, d_am_idx);
                 k_argmax_stage2<<<1, 256, 0, stream>>>(d_am_vals, d_am_idx, 256, d_am_out);
-                cudaMemcpyAsync(out_next_token, d_am_out, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
             }
-            if (out_last_logits) {
-                cudaMemcpyAsync(out_last_logits, d_logits, static_cast<size_t>(V) * sizeof(float), cudaMemcpyDeviceToHost, stream);
+        }
+    }
+
+    bool run_decode_step(uint32_t token, int pos, float* out_logits, uint32_t* out_next_token, std::string& err) {
+        const int V = static_cast<int>(mc.vocab_size);
+        h_step_args[0] = token;
+        h_step_args[1] = static_cast<uint32_t>(pos);
+        cudaMemcpyAsync(d_step_args, h_step_args, 2 * sizeof(uint32_t), cudaMemcpyHostToDevice, stream);
+
+        if (use_cuda_graph) {
+            if (!decode_graph_captured) {
+                cudaError_t ce = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
+                if (ce == cudaSuccess) {
+                    enqueue_transformer_body(d_step_args, 1, reinterpret_cast<const int*>(d_step_args + 1), 0, true, true);
+                    ce = cudaStreamEndCapture(stream, &decode_graph);
+                    if (ce == cudaSuccess && decode_graph != nullptr) {
+                        ce = cudaGraphInstantiate(&decode_graph_exec, decode_graph, nullptr, nullptr, 0);
+                        if (ce == cudaSuccess && decode_graph_exec != nullptr) {
+                            decode_graph_captured = true;
+                        } else {
+                            if (decode_graph) { cudaGraphDestroy(decode_graph); decode_graph = nullptr; }
+                            use_cuda_graph = false;
+                        }
+                    } else {
+                        use_cuda_graph = false;
+                    }
+                } else {
+                    use_cuda_graph = false;
+                }
             }
+            if (decode_graph_captured) {
+                cudaGraphLaunch(decode_graph_exec, stream);
+            } else {
+                enqueue_transformer_body(d_step_args, 1, reinterpret_cast<const int*>(d_step_args + 1), 0,
+                                         (out_logits || out_next_token), (out_next_token != nullptr));
+            }
+        } else {
+            enqueue_transformer_body(d_step_args, 1, reinterpret_cast<const int*>(d_step_args + 1), 0,
+                                     (out_logits || out_next_token), (out_next_token != nullptr));
         }
 
+        if (out_next_token) {
+            cudaMemcpyAsync(h_am_out, d_am_out, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
+        }
+        if (out_logits) {
+            cudaMemcpyAsync(out_logits, d_logits, static_cast<size_t>(V) * sizeof(float), cudaMemcpyDeviceToHost, stream);
+        }
         cudaError_t sync_err = cudaStreamSynchronize(stream);
         if (sync_err != cudaSuccess) {
-            err = std::string("CUDA execution error: ") + cudaGetErrorString(sync_err);
+            err = std::string("CUDA decode error: ") + cudaGetErrorString(sync_err);
             return false;
         }
+        if (out_next_token) *out_next_token = *h_am_out;
         return true;
     }
 
-    int max_seq_len_runtime = 2048;
+    bool run_prefill_chunk(const uint32_t* h_tokens, int S, int start_pos,
+                           float* out_last_logits, uint32_t* out_next_token, std::string& err) {
+        const int V = static_cast<int>(mc.vocab_size);
+        cudaMemcpyAsync(d_tok_ids, h_tokens, static_cast<size_t>(S) * sizeof(uint32_t), cudaMemcpyHostToDevice, stream);
+        enqueue_transformer_body(d_tok_ids, S, nullptr, start_pos, (out_last_logits || out_next_token), (out_next_token != nullptr));
+
+        if (out_next_token) {
+            cudaMemcpyAsync(h_am_out, d_am_out, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
+        }
+        if (out_last_logits) {
+            cudaMemcpyAsync(out_last_logits, d_logits, static_cast<size_t>(V) * sizeof(float), cudaMemcpyDeviceToHost, stream);
+        }
+        cudaError_t sync_err = cudaStreamSynchronize(stream);
+        if (sync_err != cudaSuccess) {
+            err = std::string("CUDA prefill error: ") + cudaGetErrorString(sync_err);
+            return false;
+        }
+        if (out_next_token) *out_next_token = *h_am_out;
+        return true;
+    }
 
     void free_all() {
         if (stream) { cudaStreamSynchronize(stream); }
+        if (decode_graph_exec) { cudaGraphExecDestroy(decode_graph_exec); decode_graph_exec = nullptr; }
+        if (decode_graph) { cudaGraphDestroy(decode_graph); decode_graph = nullptr; }
+        decode_graph_captured = false;
+        if (h_step_args) { cudaFreeHost(h_step_args); h_step_args = nullptr; }
+        if (h_am_out) { cudaFreeHost(h_am_out); h_am_out = nullptr; }
         for (void* p : all_allocs) {
             if (p) cudaFree(p);
         }
@@ -1819,11 +2315,14 @@ bool HavenCudaEngine::initialize(const HavenEngine& host_engine, const CudaEngin
     impl_->mc = host_engine.get_config();
     impl_->max_seq_len_runtime = std::max(64, cfg.max_seq_len);
     impl_->max_S = std::clamp(cfg.max_prefill_chunk, 1, 512);
+    impl_->use_cuda_graph = cfg.use_cuda_graph;
 
     if (cudaStreamCreate(&impl_->stream) != cudaSuccess ||
         cublasCreate(&impl_->cublas) != CUBLAS_STATUS_SUCCESS ||
-        cublasSetStream(impl_->cublas, impl_->stream) != CUBLAS_STATUS_SUCCESS) {
-        last_error_ = "Failed to create CUDA stream or cuBLAS handle.";
+        cublasSetStream(impl_->cublas, impl_->stream) != CUBLAS_STATUS_SUCCESS ||
+        cudaHostAlloc(&impl_->h_step_args, 2 * sizeof(uint32_t), cudaHostAllocDefault) != cudaSuccess ||
+        cudaHostAlloc(&impl_->h_am_out, sizeof(uint32_t), cudaHostAllocDefault) != cudaSuccess) {
+        last_error_ = "Failed to create CUDA stream, cuBLAS handle, or pinned host staging.";
         shutdown();
         return false;
     }
@@ -1871,7 +2370,7 @@ bool HavenCudaEngine::initialize(const HavenEngine& host_engine, const CudaEngin
         impl_->d_pl_proj_norm = impl_->upload_f32_1d(host_engine.get_per_layer_proj_norm_tensor(), 256, 1.0f, weight_bytes, last_error_);
     }
 
-    // 2. Upload All L Transformer Layers (Raw GGUF Blocks -> VRAM, Zero Dequant Blowup!)
+    // 2. Upload All L Transformer Layers (Raw GGUF Blocks -> VRAM)
     impl_->layers.resize(static_cast<size_t>(L));
     size_t max_w_elems = static_cast<size_t>(D) * static_cast<size_t>(D);
     if (impl_->has_pleias) max_w_elems = std::max(max_w_elems, static_cast<size_t>(L * 256) * static_cast<size_t>(D));
@@ -1946,7 +2445,6 @@ bool HavenCudaEngine::initialize(const HavenEngine& host_engine, const CudaEngin
         if (!mc.turbo_folded_norms) gl.d_ffn_norm = impl_->upload_f32_1d(lt.ffn_norm, D, 1.0f, weight_bytes, last_error_);
         if (lt.post_ffw_norm) gl.d_post_ffn_norm = impl_->upload_f32_1d(lt.post_ffw_norm, D, 1.0f, weight_bytes, last_error_);
 
-        // Sparse MoE (Gemma 4.5 26B-A4B)
         if (mc.expert_count > 0 && lt.ffn_gate_inp && lt.ffn_down_exps &&
             (lt.ffn_gate_up_exps || (lt.ffn_gate_exps && lt.ffn_up_exps))) {
             gl.has_moe = true;
@@ -1973,7 +2471,6 @@ bool HavenCudaEngine::initialize(const HavenEngine& host_engine, const CudaEngin
             if (lt.post_ffw_norm_2) gl.d_post_ffn_norm_2 = impl_->upload_f32_1d(lt.post_ffw_norm_2, D, 1.0f, weight_bytes, last_error_);
         }
 
-        // Pleias
         if (impl_->has_pleias && lt.inp_gate && lt.proj) {
             if (!impl_->upload_raw_tensor(lt.inp_gate, 256, D, gl.inp_gate, weight_bytes, last_error_)) { shutdown(); return false; }
             if (!impl_->upload_raw_tensor(lt.proj,     D, 256, gl.proj,     weight_bytes, last_error_)) { shutdown(); return false; }
@@ -1983,7 +2480,6 @@ bool HavenCudaEngine::initialize(const HavenEngine& host_engine, const CudaEngin
             gl.layer_output_scale = *reinterpret_cast<const float*>(lt.layer_output_scale->data);
         }
 
-        // Allocate FP16 KV cache only for KV-owning layers
         if (gl.has_kv) {
             gl.kv_bytes = static_cast<size_t>(impl_->max_seq_len_runtime) * static_cast<size_t>(gl.kv_dim) * sizeof(__half);
             gl.d_k_cache = static_cast<__half*>(impl_->alloc_gpu(gl.kv_bytes, kv_bytes));
@@ -1998,12 +2494,13 @@ bool HavenCudaEngine::initialize(const HavenEngine& host_engine, const CudaEngin
         }
     }
 
-    // 3. Allocate Activation & FP16 Prefill Scratch Buffers
+    // 3. Allocate Activation, Q8_1, Grouped MoE & FP16 Prefill Scratch Buffers
     const size_t Smax = static_cast<size_t>(impl_->max_S);
     auto alloc_f32 = [&](size_t elems) -> float* {
         return static_cast<float*>(impl_->alloc_gpu(elems * sizeof(float), scratch_bytes));
     };
-    impl_->d_tok_ids = static_cast<uint32_t*>(impl_->alloc_gpu(Smax * sizeof(uint32_t), scratch_bytes));
+    impl_->d_step_args = static_cast<uint32_t*>(impl_->alloc_gpu(2 * sizeof(uint32_t), scratch_bytes));
+    impl_->d_tok_ids   = static_cast<uint32_t*>(impl_->alloc_gpu(Smax * sizeof(uint32_t), scratch_bytes));
     impl_->d_x       = alloc_f32(Smax * static_cast<size_t>(D));
     impl_->d_norm    = alloc_f32(Smax * static_cast<size_t>(D));
     impl_->d_q       = alloc_f32(Smax * static_cast<size_t>(impl_->max_q_dim));
@@ -2019,6 +2516,10 @@ bool HavenCudaEngine::initialize(const HavenEngine& host_engine, const CudaEngin
     impl_->d_am_idx  = static_cast<uint32_t*>(impl_->alloc_gpu(256 * sizeof(uint32_t), scratch_bytes));
     impl_->d_am_out  = static_cast<uint32_t*>(impl_->alloc_gpu(sizeof(uint32_t), scratch_bytes));
 
+    const size_t max_in_dim = static_cast<size_t>(std::max({D, impl_->max_F, impl_->max_q_dim}));
+    const size_t q8_blocks = std::max(Smax * static_cast<size_t>(D >> 5), (max_in_dim >> 5) * 8ULL);
+    impl_->d_x_q8 = static_cast<block_q8_1_gpu*>(impl_->alloc_gpu(q8_blocks * sizeof(block_q8_1_gpu), scratch_bytes));
+
     if (mc.expert_count > 0) {
         const int E = static_cast<int>(mc.expert_count);
         const int K_used = std::clamp(static_cast<int>(mc.expert_used_count > 0 ? mc.expert_used_count : 8u), 1, E);
@@ -2028,7 +2529,13 @@ bool HavenCudaEngine::initialize(const HavenEngine& host_engine, const CudaEngin
         impl_->d_moe_idx    = static_cast<int*>(impl_->alloc_gpu(Smax * static_cast<size_t>(K_used) * sizeof(int), scratch_bytes));
         impl_->d_moe_w      = alloc_f32(Smax * static_cast<size_t>(K_used));
         impl_->d_moe_act    = alloc_f32(Smax * static_cast<size_t>(K_used) * static_cast<size_t>(F_exp));
+        impl_->d_moe_act_q8 = static_cast<block_q8_1_gpu*>(impl_->alloc_gpu(
+            Smax * static_cast<size_t>(K_used) * static_cast<size_t>(F_exp >> 5) * sizeof(block_q8_1_gpu), scratch_bytes));
         impl_->d_moe_out    = alloc_f32(Smax * static_cast<size_t>(D));
+        impl_->d_moe_exp_offsets = static_cast<int*>(impl_->alloc_gpu(257 * sizeof(int), scratch_bytes));
+        impl_->d_moe_sorted_tok  = static_cast<int*>(impl_->alloc_gpu(Smax * static_cast<size_t>(K_used) * sizeof(int), scratch_bytes));
+        impl_->d_moe_sorted_slot = static_cast<int*>(impl_->alloc_gpu(Smax * static_cast<size_t>(K_used) * sizeof(int), scratch_bytes));
+        impl_->d_moe_sorted_w    = alloc_f32(Smax * static_cast<size_t>(K_used));
     }
     if (impl_->has_pleias) {
         impl_->d_pl_emb  = alloc_f32(Smax * static_cast<size_t>(L) * 256ULL);
@@ -2037,13 +2544,11 @@ bool HavenCudaEngine::initialize(const HavenEngine& host_engine, const CudaEngin
         impl_->d_pl_out  = alloc_f32(Smax * static_cast<size_t>(D));
     }
 
-    const size_t max_in_dim = static_cast<size_t>(std::max({D, impl_->max_F, impl_->max_q_dim}));
     impl_->d_x_f16 = static_cast<__half*>(impl_->alloc_gpu(Smax * max_in_dim * sizeof(__half), scratch_bytes));
-    // Cap reusable FP16 dequant tile to 256M elements (512 MB) so even 31B Dense fits easily in 24 GB VRAM
     impl_->w_f16_cap_elems = std::min(max_w_elems, static_cast<size_t>(256ULL * 1024ULL * 1024ULL));
     impl_->d_w_f16 = static_cast<__half*>(impl_->alloc_gpu(impl_->w_f16_cap_elems * sizeof(__half), scratch_bytes));
 
-    if (!impl_->d_x || !impl_->d_logits || !impl_->d_w_f16) {
+    if (!impl_->d_x || !impl_->d_logits || !impl_->d_w_f16 || !impl_->d_x_q8) {
         last_error_ = "cudaMalloc failed allocating CUDA scratch buffers.";
         shutdown();
         return false;
@@ -2077,7 +2582,7 @@ bool HavenCudaEngine::forward_decode(uint32_t token, int pos, float* out_logits,
         return false;
     }
     auto t0 = std::chrono::high_resolution_clock::now();
-    bool ok = impl_->run_forward_chunk(&token, 1, pos, out_logits, out_next_token, last_error_);
+    bool ok = impl_->run_decode_step(token, pos, out_logits, out_next_token, last_error_);
     auto t1 = std::chrono::high_resolution_clock::now();
     metrics_.last_decode_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     return ok;
@@ -2097,7 +2602,7 @@ bool HavenCudaEngine::forward_prefill(const std::vector<uint32_t>& tokens,
     while (offset < total) {
         const int chunk = std::min(impl_->max_S, total - offset);
         const bool is_last = (offset + chunk == total);
-        if (!impl_->run_forward_chunk(tokens.data() + offset, chunk, start_pos + offset,
+        if (!impl_->run_prefill_chunk(tokens.data() + offset, chunk, start_pos + offset,
                                       is_last ? out_last_logits : nullptr,
                                       is_last ? out_next_token : nullptr,
                                       last_error_)) {

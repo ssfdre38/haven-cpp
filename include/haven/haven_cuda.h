@@ -12,7 +12,8 @@ namespace haven {
 struct CudaEngineConfig {
     int device_id = 0;
     int max_seq_len = 2048;        // Static FP16 KV cache capacity per KV-owning layer
-    int max_prefill_chunk = 256;   // Max tokens per cuBLAS FP16 Tensor Core prefill chunk
+    int max_prefill_chunk = 512;   // Max tokens per cuBLAS FP16 Tensor Core / grouped MoE prefill chunk
+    bool use_cuda_graph = true;    // Single-shot CUDA Graph capture for zero-launch-overhead B=1 decode
     bool verbose = false;
 };
 
