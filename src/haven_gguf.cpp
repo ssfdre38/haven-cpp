@@ -1,4 +1,5 @@
 #include "haven/haven_gguf.h"
+#include "haven/haven_quant_spec.h"
 #include <iostream>
 #include <cstring>
 #include <limits>
@@ -578,52 +579,9 @@ bool GgufLoader::parse_header() {
         return false;
     }
 
-    auto get_tensor_data_size = [](QuantType type, const std::vector<uint64_t>& shape) -> uint64_t {
-        if (shape.empty()) return 0;
-        uint64_t n_elems = 1;
-        for (uint64_t dim : shape) {
-            if (dim == 0) return 0;
-            if (dim > std::numeric_limits<uint64_t>::max() / n_elems) return 0;
-            n_elems *= dim;
-        }
-
-        auto safe_block_bytes = [](uint64_t elems, uint64_t block_elems, uint64_t block_bytes) -> uint64_t {
-            if (elems > std::numeric_limits<uint64_t>::max() - (block_elems - 1)) return 0;
-            uint64_t blocks = (elems + block_elems - 1) / block_elems;
-            if (blocks > std::numeric_limits<uint64_t>::max() / block_bytes) return 0;
-            return blocks * block_bytes;
-        };
-
-        switch (type) {
-            case QuantType::F32:  return safe_block_bytes(n_elems, 1, 4);
-            case QuantType::F16:
-            case QuantType::BF16: return safe_block_bytes(n_elems, 1, 2);
-            case QuantType::Q4_0: return safe_block_bytes(n_elems, 32, sizeof(block_q4_0));
-            case QuantType::Q4_1: return safe_block_bytes(n_elems, 32, 20);
-            case QuantType::Q5_0: return safe_block_bytes(n_elems, 32, sizeof(block_q5_0));
-            case QuantType::Q5_1: return safe_block_bytes(n_elems, 32, sizeof(block_q5_1));
-            case QuantType::Q8_0: return safe_block_bytes(n_elems, 32, sizeof(block_q8_0));
-            case QuantType::Q8_1: return safe_block_bytes(n_elems, 32, 36);
-            case QuantType::Q2_K: return safe_block_bytes(n_elems, 256, 84);
-            case QuantType::Q3_K: return safe_block_bytes(n_elems, 256, sizeof(block_q3_K));
-            case QuantType::Q4_K: return safe_block_bytes(n_elems, 256, sizeof(block_q4_K));
-            case QuantType::Q5_K: return safe_block_bytes(n_elems, 256, sizeof(block_q5_K));
-            case QuantType::Q6_K: return safe_block_bytes(n_elems, 256, sizeof(block_q6_K));
-            case QuantType::Q8_K: return safe_block_bytes(n_elems, 256, 292);
-            case QuantType::IQ4_NL: return safe_block_bytes(n_elems, 32, sizeof(block_iq4_nl));
-            case QuantType::IQ4_XS: return safe_block_bytes(n_elems, 256, sizeof(block_iq4_xs));
-            case QuantType::I8:   return safe_block_bytes(n_elems, 1, 1);
-            case QuantType::I16:  return safe_block_bytes(n_elems, 1, 2);
-            case QuantType::I32:  return safe_block_bytes(n_elems, 1, 4);
-            case QuantType::I64:
-            case QuantType::F64:  return safe_block_bytes(n_elems, 1, 8);
-            default: return safe_block_bytes(n_elems, 1, 1);
-        }
-    };
-
     for (auto& item : parsed_tensors) {
         TensorDesc& desc = item.second;
-        uint64_t expected_bytes = get_tensor_data_size(desc.type, desc.shape);
+        uint64_t expected_bytes = quant_tensor_byte_size(desc.type, desc.shape);
         if (expected_bytes == 0 ||
             desc.offset > file_size_ ||
             data_start > file_size_ - desc.offset ||

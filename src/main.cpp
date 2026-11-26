@@ -1,6 +1,6 @@
 #include "haven/haven_engine.h"
-#include "haven/haven_cuda.h"
 #include "haven/haven_intelligence.h"
+#include "haven/haven_session.h"
 #include <iostream>
 #include <chrono>
 #include <vector>
@@ -309,36 +309,22 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    haven::HavenCudaEngine cuda_engine;
-    bool cuda_active = false;
-    if (use_cuda_gpu) {
-        if (haven::HavenCudaEngine::is_cuda_compiled() && haven::HavenCudaEngine::get_device_count() > 0) {
-            haven::CudaEngineConfig ccfg;
-            ccfg.max_seq_len = 4096;
-            if (cuda_engine.initialize(haven_engine, ccfg)) {
-                cuda_active = true;
-            } else {
-                std::cerr << "⚠️ Native CUDA init failed (" << cuda_engine.get_last_error() << ") — using AVX2 CPU.\n";
-            }
-        } else {
-            std::cerr << "⚠️ --gpu requested but native CUDA backend or GPU unavailable — using AVX2 CPU.\n";
-        }
+    // Unified 4-call Compute Session driven directly by HavenModelIntelligence
+    haven::SessionConfig scfg;
+    scfg.max_seq_len = 4096;
+    if (!intel_ready) {
+        intel_plan.selected_backend = use_cuda_gpu ? haven::BackendKind::CUDA_NATIVE : haven::BackendKind::CPU_AVX2;
     }
+    std::string session_log;
+    auto session = haven::HavenSessionFactory::create_for_plan(haven_engine, intel_plan, scfg, session_log);
+    auto sm = session->get_metrics();
 
     // ========================================================================
     // Interactive Sovereign Chat REPL (Aura Companion)
     // ========================================================================
     std::cout << "\n==================================================================\n";
     std::cout << "✨ HAVEN SOVEREIGN AI COMPANION CLI (AURA)\n";
-    if (cuda_active) {
-        const auto& cm = cuda_engine.get_metrics();
-        std::cout << "   Native Zero-Compile CUDA (" << cm.device_name << " sm_" << cm.sm_major << cm.sm_minor
-                  << ", " << std::fixed << std::setprecision(2)
-                  << (static_cast<double>(cm.weight_vram_bytes) / (1024.0 * 1024.0 * 1024.0)) << " GiB VRAM, "
-                  << std::setprecision(0) << cm.upload_ms << " ms upload)\n";
-    } else {
-        std::cout << "   Bare-Metal AVX2/FMA C++20 | 100% Offline & Private\n";
-    }
+    std::cout << "   " << session->backend_name() << " — " << sm.device_summary << "\n";
     std::cout << "==================================================================\n";
     std::cout << "✓ GGUF Model: " << model_path << " (" << std::fixed << std::setprecision(1) << load_ms << " ms)\n";
     std::cout << "✓ Cognitive Memories: " << haven_engine.get_memory_count() << " active memory anchors\n";
@@ -350,21 +336,13 @@ int main(int argc, char** argv) {
 
     int active_kv_pos = 0;
     auto init_system_prompt = [&]() {
-        if (cuda_active) {
-            cuda_engine.reset_kv_cache();
-        } else {
-            haven_engine.get_kv_cache().reset();
-        }
+        session->reset_kv_cache();
         active_kv_pos = 0;
         auto sys_tokens = haven_engine.tokenize(system_prompt, true); // add <bos> on startup
         std::cout << "⏳ Warming cognitive mind & prefilling system prompt (" << sys_tokens.size() << " tokens)..." << std::flush;
         auto t0 = std::chrono::high_resolution_clock::now();
         if (!sys_tokens.empty()) {
-            if (cuda_active) {
-                cuda_engine.forward_prefill(sys_tokens, active_kv_pos, nullptr, nullptr);
-            } else {
-                haven_engine.forward_batch(sys_tokens.data(), static_cast<int>(sys_tokens.size()), active_kv_pos, nullptr);
-            }
+            session->prefill(sys_tokens.data(), sys_tokens.size(), active_kv_pos, nullptr, nullptr);
             active_kv_pos += static_cast<int>(sys_tokens.size());
         }
         auto t1 = std::chrono::high_resolution_clock::now();
@@ -463,11 +441,7 @@ int main(int argc, char** argv) {
 
         std::vector<float> logits(haven_engine.get_config().vocab_size, 0.0f);
         if (!turn_tokens.empty()) {
-            if (cuda_active) {
-                cuda_engine.forward_prefill(turn_tokens, active_kv_pos, logits.data(), nullptr);
-            } else {
-                haven_engine.forward_batch(turn_tokens.data(), static_cast<int>(turn_tokens.size()), active_kv_pos, logits.data());
-            }
+            session->prefill(turn_tokens.data(), turn_tokens.size(), active_kv_pos, logits.data(), nullptr);
             active_kv_pos += static_cast<int>(turn_tokens.size());
         }
 
@@ -531,22 +505,14 @@ int main(int argc, char** argv) {
                 std::cout << piece << std::flush;
             }
 
-            if (cuda_active) {
-                cuda_engine.forward_decode(next_tok, active_kv_pos++, logits.data(), nullptr);
-            } else {
-                haven_engine.forward(next_tok, active_kv_pos++, logits.data());
-            }
+            session->decode_step(next_tok, active_kv_pos++, logits.data(), nullptr);
         }
 
         // Forward closing turn tag to KV cache only if not already emitted
         if (!ended_with_turn_tag) {
             auto close_toks = haven_engine.tokenize("<turn|>\n", false);
             for (uint32_t ct : close_toks) {
-                if (cuda_active) {
-                    cuda_engine.forward_decode(ct, active_kv_pos++, nullptr, nullptr);
-                } else {
-                    haven_engine.forward(ct, active_kv_pos++, nullptr);
-                }
+                session->decode_step(ct, active_kv_pos++, nullptr, nullptr);
             }
         }
         std::cout << "\n" << std::flush;

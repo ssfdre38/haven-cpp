@@ -1,5 +1,6 @@
 #include "haven/haven_intelligence.h"
 #include "haven/haven_cuda.h"
+#include "haven/haven_quant_spec.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -200,46 +201,6 @@ static std::string to_lower_copy(std::string s) {
         if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
     }
     return s;
-}
-
-static uint64_t calc_tensor_bytes(QuantType type, const std::vector<uint64_t>& shape) {
-    if (shape.empty()) return 0;
-    uint64_t n_elems = 1;
-    for (uint64_t d : shape) {
-        if (d == 0 || d > std::numeric_limits<uint64_t>::max() / n_elems) return 0;
-        n_elems *= d;
-    }
-    auto blk = [&](uint64_t be, uint64_t bb) -> uint64_t {
-        if (n_elems > std::numeric_limits<uint64_t>::max() - (be - 1)) return 0;
-        uint64_t nb = (n_elems + be - 1) / be;
-        if (nb > std::numeric_limits<uint64_t>::max() / bb) return 0;
-        return nb * bb;
-    };
-    switch (type) {
-        case QuantType::F32:    return blk(1, 4);
-        case QuantType::F16:
-        case QuantType::BF16:   return blk(1, 2);
-        case QuantType::Q4_0:   return blk(32, sizeof(block_q4_0));
-        case QuantType::Q4_1:   return blk(32, 20);
-        case QuantType::Q5_0:   return blk(32, sizeof(block_q5_0));
-        case QuantType::Q5_1:   return blk(32, sizeof(block_q5_1));
-        case QuantType::Q8_0:   return blk(32, sizeof(block_q8_0));
-        case QuantType::Q8_1:   return blk(32, 36);
-        case QuantType::Q2_K:   return blk(256, 84);
-        case QuantType::Q3_K:   return blk(256, sizeof(block_q3_K));
-        case QuantType::Q4_K:   return blk(256, sizeof(block_q4_K));
-        case QuantType::Q5_K:   return blk(256, sizeof(block_q5_K));
-        case QuantType::Q6_K:   return blk(256, sizeof(block_q6_K));
-        case QuantType::Q8_K:   return blk(256, 292);
-        case QuantType::IQ4_NL: return blk(32, sizeof(block_iq4_nl));
-        case QuantType::IQ4_XS: return blk(256, sizeof(block_iq4_xs));
-        case QuantType::I8:     return blk(1, 1);
-        case QuantType::I16:    return blk(1, 2);
-        case QuantType::I32:    return blk(1, 4);
-        case QuantType::I64:
-        case QuantType::F64:    return blk(1, 8);
-        default:                return blk(1, 1);
-    }
 }
 
 static ArchFamily classify_arch(const std::string& arch_raw) {
@@ -547,7 +508,7 @@ bool HavenModelIntelligence::probe_gguf_header(const std::string& filepath,
         }
         (void)raw_offset;
         QuantType qt = static_cast<QuantType>(raw_type);
-        uint64_t nbytes = calc_tensor_bytes(qt, shape);
+        uint64_t nbytes = quant_tensor_byte_size(qt, shape);
 
         // Classify multimodal vs LLM tensors
         const bool is_vision = starts_with(tname, "v.") || starts_with(tname, "mm.");

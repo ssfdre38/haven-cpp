@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(HAVEN_ENABLE_CUDA "Build native NVIDIA CUDA GPU backend (IQ4_XS/Q-block GEMV + cuBLAS Tensor Core prefill)" OFF)
+option(HAVEN_ENABLE_TPU  "Build Cloud TPU PJRT + StableHLO MLIR compiler & scheduler (OFF = ultra-lean desktop/edge build)" ON)
 if (HAVEN_ENABLE_CUDA)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
@@ -60,8 +61,23 @@ else()
     include_directories(include)
 endif()
 
-set(HAVEN_CORE_SRCS
+# ============================================================================
+# Layered Zero-Bloat Core Libraries:
+#   1. haven_math      : Pure bare-metal AVX2 + FMA + FWHT kernels (for haven-bake)
+#   2. haven_infer     : Embeddable inference core (GGUF, Intelligence, Tokenizer,
+#                        Sampler, KV/Paged/Flash/YaRN, HMB, CUDA/stub — zero sockets/TPU!)
+#   3. haven_tpu       : Optional Cloud TPU PJRT + StableHLO + Scheduler (5,729 LOC
+#                        or 90-line stub when -DHAVEN_ENABLE_TPU=OFF)
+#   4. haven_companion : Full Sovereign Runtime (HavenEngine, Session, Plugins,
+#                        MCP, Topology, Pathways, Cluster SHCP, MLX)
+#   5. haven_core      : Backwards-compatible umbrella INTERFACE target
+# ============================================================================
+
+set(HAVEN_MATH_SRCS
     src/haven_avx2.cpp
+)
+
+set(HAVEN_INFER_SRCS
     src/haven_memory.cpp
     src/haven_sampler.cpp
     src/haven_gguf.cpp
@@ -76,43 +92,76 @@ set(HAVEN_CORE_SRCS
     src/haven_flash_attention.cpp
     src/haven_chunked_prefill.cpp
     src/haven_tokenizer.cpp
+)
+
+if (HAVEN_ENABLE_CUDA)
+    list(APPEND HAVEN_INFER_SRCS src/haven_cuda.cu)
+else()
+    list(APPEND HAVEN_INFER_SRCS src/haven_cuda_stub.cpp)
+endif()
+
+if (HAVEN_ENABLE_TPU)
+    set(HAVEN_TPU_SRCS
+        src/haven_tpu_pjrt.cpp
+        src/haven_tpu_gemma4.cpp
+        src/haven_tpu_scheduler.cpp
+    )
+    add_compile_definitions(HAVEN_HAS_TPU)
+else()
+    set(HAVEN_TPU_SRCS
+        src/haven_tpu_stub.cpp
+    )
+endif()
+
+set(HAVEN_COMPANION_SRCS
     src/haven_engine.cpp
+    src/haven_session.cpp
     src/haven_plugin_manager.cpp
     src/haven_topology.cpp
     src/haven_pathways.cpp
-    src/haven_tpu_pjrt.cpp
-    src/haven_tpu_gemma4.cpp
-    src/haven_tpu_scheduler.cpp
     src/haven_mlx.cpp
     src/haven_mcp.cpp
     src/haven_cluster.cpp
 )
 
-if (HAVEN_ENABLE_CUDA)
-    list(APPEND HAVEN_CORE_SRCS src/haven_cuda.cu)
-else()
-    list(APPEND HAVEN_CORE_SRCS src/haven_cuda_stub.cpp)
-endif()
-
-# Core Static Engine Library (builds all core sources once for fast compilation)
-add_library(haven_core STATIC
-    ${HAVEN_CORE_SRCS}
+set(HAVEN_CORE_SRCS
+    ${HAVEN_MATH_SRCS}
+    ${HAVEN_INFER_SRCS}
+    ${HAVEN_TPU_SRCS}
+    ${HAVEN_COMPANION_SRCS}
 )
 
-if (WIN32)
-    if (MLX_INCLUDE_DIR)
-        target_link_libraries(haven_core PUBLIC ws2_32 psapi mlxc mlx openblas)
-    else()
-        target_link_libraries(haven_core PUBLIC ws2_32 psapi)
-    endif()
-else()
-    target_link_libraries(haven_core PUBLIC pthread dl)
+add_library(haven_math STATIC ${HAVEN_MATH_SRCS})
+
+add_library(haven_infer STATIC ${HAVEN_INFER_SRCS})
+target_link_libraries(haven_infer PUBLIC haven_math)
+if (NOT WIN32)
+    target_link_libraries(haven_infer PUBLIC pthread dl)
 endif()
 if (HAVEN_ENABLE_CUDA)
-    target_link_libraries(haven_core PUBLIC CUDA::cudart CUDA::cublas)
+    target_link_libraries(haven_infer PUBLIC CUDA::cudart CUDA::cublas)
 endif()
 
-# Shared Library (haven_engine.dll / libhaven.so) for C# Gemmi & Android JNI
+add_library(haven_tpu STATIC ${HAVEN_TPU_SRCS})
+target_link_libraries(haven_tpu PUBLIC haven_infer)
+
+add_library(haven_companion STATIC ${HAVEN_COMPANION_SRCS})
+target_link_libraries(haven_companion PUBLIC haven_infer haven_tpu)
+if (WIN32)
+    if (MLX_INCLUDE_DIR)
+        target_link_libraries(haven_companion PUBLIC ws2_32 psapi mlxc mlx openblas)
+    else()
+        target_link_libraries(haven_companion PUBLIC ws2_32 psapi)
+    endif()
+else()
+    target_link_libraries(haven_companion PUBLIC pthread dl)
+endif()
+
+# Backwards-compatible umbrella core library
+add_library(haven_core INTERFACE)
+target_link_libraries(haven_core INTERFACE haven_companion)
+
+# Shared Library (haven_engine.dll / libhaven_engine.so) for C# Gemmi & Android JNI
 add_library(haven_engine SHARED
     ${HAVEN_CORE_SRCS}
 )
@@ -137,9 +186,9 @@ target_link_libraries(haven-cli PRIVATE haven_core)
 add_executable(haven-server src/haven_server.cpp)
 target_link_libraries(haven-server PRIVATE haven_core)
 
-# Native Gemma 4.5 GGUF Architecture Optimizer (Scale/Norm Folding + QuaRot R2 + Block-FWHT)
+# Native Gemma 4.5 GGUF Architecture Optimizer (links ONLY haven_math — zero sockets/TPU/plugins!)
 add_executable(haven-bake src/haven_bake.cpp)
-target_link_libraries(haven-bake PRIVATE haven_core)
+target_link_libraries(haven-bake PRIVATE haven_math)
 
 # Gemma 4.5 Turbo Bake & AVX2 FWHT Verification Test Suite
 add_executable(test-turbo-bake tests/test_turbo_bake.cpp)
@@ -205,9 +254,13 @@ target_link_libraries(test-tpu-gemma4-onchip PRIVATE haven_core)
 add_executable(test-cuda-gemma4 tests/test_cuda_gemma4.cpp)
 target_link_libraries(test-cuda-gemma4 PRIVATE haven_core)
 
-# Model Intelligence Header DNA Router & Dynamic Microkernel Module Suite
+# Model Intelligence Header DNA Router & Dynamic Microkernel Module Suite (links ONLY haven_infer — zero TPU/Cluster/MCP!)
 add_executable(test-model-intelligence tests/test_model_intelligence.cpp)
-target_link_libraries(test-model-intelligence PRIVATE haven_core)
+target_link_libraries(test-model-intelligence PRIVATE haven_infer)
+
+# Single-Source Quant Spec & Unified 4-Call IHavenSession Verification Suite
+add_executable(test-lean-session tests/test_lean_session.cpp)
+target_link_libraries(test-lean-session PRIVATE haven_core)
 
 # Dynamic Zero-Bloat Microkernel Modules (Arch / Backend / Capability)
 function(haven_add_microkernel_module target_name subdir source_file)
