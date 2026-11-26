@@ -174,11 +174,11 @@ public:
         return memory_engine_.search_top_k(query_embedding.data(), (int)query_embedding.size(), k);
     }
     bool save_memories(const std::string& path) const { 
-        if (path.ends_with(".hmb")) return memory_engine_.save_to_hmb(path);
+        if (path.size() >= 4 && path.compare(path.size() - 4, 4, ".hmb") == 0) return memory_engine_.save_to_hmb(path);
         return memory_engine_.save_to_json(path); 
     }
     bool load_memories(const std::string& path) { 
-        if (path.ends_with(".hmb")) return memory_engine_.load_from_hmb(path);
+        if (path.size() >= 4 && path.compare(path.size() - 4, 4, ".hmb") == 0) return memory_engine_.load_from_hmb(path);
         return memory_engine_.load_from_json(path); 
     }
     bool save_to_hmb(const std::string& path) const { return memory_engine_.save_to_hmb(path); }
