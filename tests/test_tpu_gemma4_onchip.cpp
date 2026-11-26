@@ -27,7 +27,8 @@ static bool validate_mlir_module(const std::string& ir, const std::string& label
                                  bool expect_scatter, bool expect_slot_id,
                                  bool expect_silu, bool expect_all_reduce,
                                  bool expect_untied_tok_emb,
-                                 bool expect_moe_sort = false) {
+                                 bool expect_moe_sort = false,
+                                 bool expect_int4_unpack = false) {
     if (ir.empty()) {
         std::cerr << "  [FAIL] Empty MLIR for " << label << "\n";
         return false;
@@ -72,6 +73,10 @@ static bool validate_mlir_module(const std::string& ir, const std::string& label
     }
     if (expect_moe_sort && (ir.find("\"stablehlo.sort\"") == std::string::npos || ir.find("%w_moe_gu_0") == std::string::npos)) {
         std::cerr << "  [FAIL] Expected stablehlo.sort + %w_moe_gu_0 for Sparse MoE in " << label << "\n";
+        return false;
+    }
+    if (expect_int4_unpack && (ir.find("stablehlo.shift_right_arithmetic") == std::string::npos || ir.find("stablehlo.shift_left") == std::string::npos)) {
+        std::cerr << "  [FAIL] Expected stablehlo.shift_left + shift_right_arithmetic nibble unpack for W4A16 in " << label << "\n";
         return false;
     }
     if (ir.find("%kv_ks_0") == std::string::npos && ir.find("%kv_kg_0") == std::string::npos) {
@@ -236,43 +241,46 @@ static int run_synthetic_multi_arch_ir_suite() {
         std::vector<int> replicas = test_r8 ? std::vector<int>{1, 4, 8} : std::vector<int>{1, 4};
         for (int R : replicas) {
             for (int B : {1, 16, 128}) {
-                for (bool i8 : {false, true}) {
-                    for (bool kv_fp8 : {false, true}) {
-                        if (kv_fp8 && !i8) continue; // Test BF16+BF16KV, INT8+BF16KV, and INT8+FP8KV
-                        TpuGemma4Config cfg;
-                        cfg.batch_size = B;
-                        cfg.max_seq_len = 2048;
-                        cfg.prefill_chunk_size = 128;
-                        cfg.num_replicas = R;
-                        cfg.use_int8_weights = i8;
-                        cfg.use_fp8_kv = kv_fp8;
-                        cfg.use_onchip_embeddings = true;
-                        cfg.return_full_logits = (B == 1);
+                // Precision modes: 0=BF16, 1=INT8, 2=INT8+FP8KV, 3=W4A16-INT4
+                for (int mode = 0; mode < 4; ++mode) {
+                    const bool i8     = (mode == 1 || mode == 2);
+                    const bool i4     = (mode == 3);
+                    const bool kv_fp8 = (mode == 2);
+                    TpuGemma4Config cfg;
+                    cfg.batch_size = B;
+                    cfg.max_seq_len = 2048;
+                    cfg.prefill_chunk_size = 128;
+                    cfg.num_replicas = R;
+                    cfg.use_int8_weights = i8;
+                    cfg.use_int4_weights = i4;
+                    cfg.use_fp8_kv = kv_fp8;
+                    cfg.use_onchip_embeddings = true;
+                    cfg.return_full_logits = (B == 1);
 
-                        // 1. Decode graph (per-slot scatter when B > 1)
-                        std::string dec_ir = HavenTpuGemma4Engine::emit_stablehlo_mlir(ac.mc, cfg, 1, false);
-                        std::string tag = ac.name + " R=" + std::to_string(R) + " B=" + std::to_string(B)
-                                        + (i8 ? " INT8" : " BF16") + (kv_fp8 ? "+FP8KV" : "");
-                        if (!validate_mlir_module(dec_ir, tag + " decode", (B > 1), false, ac.expect_silu, (R > 1), ac.expect_untied, is_moe) ||
-                            (kv_fp8 && dec_ir.find("f8E4M3FN") == std::string::npos)) {
+                    const char* mstr = i4 ? " W4A16" : (i8 ? (kv_fp8 ? " INT8+FP8KV" : " INT8") : " BF16");
+
+                    // 1. Decode graph (per-slot scatter when B > 1)
+                    std::string dec_ir = HavenTpuGemma4Engine::emit_stablehlo_mlir(ac.mc, cfg, 1, false);
+                    std::string tag = ac.name + " R=" + std::to_string(R) + " B=" + std::to_string(B) + mstr;
+                    if (!validate_mlir_module(dec_ir, tag + " decode", (B > 1), false, ac.expect_silu, (R > 1), ac.expect_untied, is_moe, i4) ||
+                        (kv_fp8 && dec_ir.find("f8E4M3FN") == std::string::npos)) {
+                        return 1;
+                    }
+                    total_checks++;
+
+                    // 2. Slot-targeted multi-bucket prefill graphs (S = 8, 16, 32, 128)
+                    for (int S : {8, 16, 32, 128}) {
+                        std::string pre_ir = HavenTpuGemma4Engine::emit_stablehlo_mlir(ac.mc, cfg, S, true);
+                        if (!validate_mlir_module(pre_ir, tag + " prefill_S=" + std::to_string(S), false, true, ac.expect_silu, (R > 1), ac.expect_untied, is_moe, i4) ||
+                            (kv_fp8 && pre_ir.find("f8E4M3FN") == std::string::npos)) {
                             return 1;
                         }
                         total_checks++;
-
-                        // 2. Slot-targeted multi-bucket prefill graphs (S = 8, 16, 32, 128)
-                        for (int S : {8, 16, 32, 128}) {
-                            std::string pre_ir = HavenTpuGemma4Engine::emit_stablehlo_mlir(ac.mc, cfg, S, true);
-                            if (!validate_mlir_module(pre_ir, tag + " prefill_S=" + std::to_string(S), false, true, ac.expect_silu, (R > 1), ac.expect_untied, is_moe) ||
-                                (kv_fp8 && pre_ir.find("f8E4M3FN") == std::string::npos)) {
-                                return 1;
-                            }
-                            total_checks++;
-                        }
                     }
                 }
             }
         }
-        std::cout << "  [PASS] " << ac.name << " (R=" << (test_r8 ? "1,4,8" : "1,4") << " | B=1,16,128 | BF16,INT8 | Decode + Slot-Prefill S=8,16,32,128)\n";
+        std::cout << "  [PASS] " << ac.name << " (R=" << (test_r8 ? "1,4,8" : "1,4") << " | B=1,16,128 | BF16,INT8,INT8+FP8KV,W4A16 | Decode + Slot-Prefill S=8,16,32,128)\n";
     }
 
     std::cout << "ALL " << total_checks << " SYNTHETIC MULTI-ARCH STABLEHLO GRAPHS VERIFIED!\n";
@@ -283,19 +291,24 @@ int main(int argc, char** argv) {
     std::cout << std::unitbuf;
     std::string model_path = "";
     std::string libtpu_path = "";
+    std::string pjrt_cache_dir = "";
     bool emit_only = false;
     bool emit_only_synthetic = false;
     bool onchip_emb_only = false;
     bool async_slots_only = false;
+    bool int4_only = false;
     bool cpu_smoke = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if (a == "--libtpu" && i + 1 < argc) libtpu_path = argv[++i];
+        if ((a == "--libtpu" || a == "--pjrt") && i + 1 < argc) libtpu_path = argv[++i];
+        else if (a == "--gpu" || a == "--cuda") libtpu_path = "cuda";
+        else if (a == "--pjrt-cache" && i + 1 < argc) pjrt_cache_dir = argv[++i];
         else if (a == "--emit-only") emit_only = true;
         else if (a == "--emit-only-synthetic") emit_only_synthetic = true;
         else if (a == "--onchip-emb-only") onchip_emb_only = true;
         else if (a == "--async-slots-only") async_slots_only = true;
+        else if (a == "--int4-only" || a == "--w4a16-only") int4_only = true;
         else if (a == "--cpu-smoke") cpu_smoke = true;
         else if (!a.starts_with("-")) model_path = a;
     }
@@ -370,7 +383,9 @@ int main(int argc, char** argv) {
                             (spec.vocab_size % 8 == 0) && (!spec.is_moe || (spec.expert_ffn_dim % 8 == 0));
         std::vector<int> reps = can_r8 ? std::vector<int>{1, 4, 8} : std::vector<int>{1, 4};
         for (int R : reps) {
-            for (bool i8 : {false, true}) {
+            for (int mode = 0; mode < 3; ++mode) { // 0=BF16, 1=INT8, 2=W4A16
+                const bool i8 = (mode == 1);
+                const bool i4 = (mode == 2);
                 for (bool onchip_emb : {false, true}) {
                     TpuGemma4Config cfg;
                     cfg.batch_size = onchip_emb ? 16 : 1;
@@ -378,15 +393,16 @@ int main(int argc, char** argv) {
                     cfg.prefill_chunk_size = 128;
                     cfg.num_replicas = R;
                     cfg.use_int8_weights = i8;
+                    cfg.use_int4_weights = i4;
                     cfg.use_onchip_embeddings = onchip_emb;
                     cfg.return_full_logits = false;
                     std::string dec_ir = HavenTpuGemma4Engine::emit_stablehlo_mlir(spec, cfg, 1, false);
                     std::string pre_ir = HavenTpuGemma4Engine::emit_stablehlo_mlir(spec, cfg, 128, true);
-                    if (!validate_mlir_module(dec_ir, "real_decode", (cfg.batch_size > 1), false, (spec.ffn_activation == FfnActivation::SILU), (R > 1), (!spec.has_tied_embeddings && onchip_emb), spec.is_moe) ||
-                        !validate_mlir_module(pre_ir, "real_prefill", false, true, (spec.ffn_activation == FfnActivation::SILU), (R > 1), (!spec.has_tied_embeddings && onchip_emb), spec.is_moe)) {
+                    if (!validate_mlir_module(dec_ir, "real_decode", (cfg.batch_size > 1), false, (spec.ffn_activation == FfnActivation::SILU), (R > 1), (!spec.has_tied_embeddings && onchip_emb), spec.is_moe, i4) ||
+                        !validate_mlir_module(pre_ir, "real_prefill", false, true, (spec.ffn_activation == FfnActivation::SILU), (R > 1), (!spec.has_tied_embeddings && onchip_emb), spec.is_moe, i4)) {
                         return 1;
                     }
-                    std::cout << "  [IR OK] R=" << R << " " << (i8 ? "INT8" : "BF16")
+                    std::cout << "  [IR OK] R=" << R << " " << (i4 ? "W4A16" : (i8 ? "INT8" : "BF16"))
                               << " " << (onchip_emb ? "OnChipEmb(B=16)" : "HostEmb(B=1)")
                               << " | decode_mlir=" << (dec_ir.size() / 1024) << " KB"
                               << " | slot_prefill_128_mlir=" << (pre_ir.size() / 1024) << " KB\n";
@@ -397,13 +413,18 @@ int main(int argc, char** argv) {
     }
 
     HavenTpuPjrtBackend tpu;
+    if (!pjrt_cache_dir.empty()) {
+        tpu.set_cache_dir(pjrt_cache_dir);
+    }
     if (!tpu.initialize(libtpu_path)) {
         std::cerr << "[TPU PJRT] Init failed: " << tpu.get_last_error() << "\n";
         return 1;
     }
     const int n_devs = static_cast<int>(tpu.get_device_count());
-    std::cout << "TPU Platform: " << tpu.get_platform_name() << " (" << n_devs << " addressable chips, PJRT "
-              << tpu.get_pjrt_major() << "." << tpu.get_pjrt_minor() << ")\n";
+    std::cout << "PJRT Platform: " << tpu.get_platform_name() << " (" << n_devs << " addressable chips, PJRT "
+              << tpu.get_pjrt_major() << "." << tpu.get_pjrt_minor()
+              << ", plugin=" << tpu.get_loaded_plugin_path()
+              << ", cache=" << (tpu.get_cache_dir().empty() ? "off" : tpu.get_cache_dir()) << ")\n";
 
     // Prepare exact reference prompt & compute CPU Ground-Truth Logits for parity check!
     const std::string ava_sys = "<|turn>system\nYou are Ava, Daniel's sovereign AI companion built on Gemma 4.5 Turbo. Speak naturally, directly, intelligently, and concisely without corporate filler.<turn|>\n";
@@ -431,7 +452,7 @@ int main(int argc, char** argv) {
               << " ms | Top1 Token=" << cpu_top1 << " (\"" << host_engine.detokenize(cpu_top1) << "\")\n";
 
     // Live Async Per-Slot pos_vec[B] & Slot-Targeted Multi-Bucket Prefill Parity Verification!
-    {
+    if (!int4_only) {
         const bool can_r8 = (n_devs >= 8) && (spec.hidden_dim % 8 == 0) && (spec.num_heads % 8 == 0) &&
                             (spec.vocab_size % 8 == 0) && (!spec.is_moe || (spec.expert_ffn_dim % 8 == 0));
         const int R_test = can_r8 ? 8 : ((n_devs >= 4) ? 4 : 1);
@@ -546,12 +567,14 @@ int main(int argc, char** argv) {
         if (async_slots_only) return 0;
     }
 
-    // Helper to benchmark any (R, B, use_int8, return_logits, onchip_emb, use_fp8_kv) configuration end-to-end!
-    auto run_config_bench = [&](const std::string& label, int R, int B, bool use_int8, bool full_logits, int gen_steps, int prefill_chunk, bool onchip_emb = false, bool use_fp8_kv = false) {
+    // Helper to benchmark any (R, B, use_int8, return_logits, onchip_emb, use_fp8_kv, use_int4) configuration end-to-end!
+    auto run_config_bench = [&](const std::string& label, int R, int B, bool use_int8, bool full_logits, int gen_steps, int prefill_chunk, bool onchip_emb = false, bool use_fp8_kv = false, bool use_int4 = false) {
         if (R > n_devs) return;
+        const size_t hits_before = tpu.get_cache_hits();
+        const size_t misses_before = tpu.get_cache_misses();
         std::cout << "\n----------------------------------------------------------------------\n";
         std::cout << "[BENCH] " << label << " (R=" << R << ", B=" << B
-                  << ", " << (use_int8 ? "HadW8-INT8" : "BF16")
+                  << ", " << (use_int4 ? "W4A16-INT4" : (use_int8 ? "HadW8-INT8" : "BF16"))
                   << ", KV=" << (use_fp8_kv ? "FP8-E4M3FN" : "BF16")
                   << ", " << (full_logits ? "FullLogits" : "OnChipArgmax")
                   << ", " << (onchip_emb ? "OnChipEmb" : "HostEmb") << ")\n";
@@ -562,7 +585,8 @@ int main(int argc, char** argv) {
         cfg.max_seq_len = 2048;
         cfg.prefill_chunk_size = prefill_chunk;
         cfg.num_replicas = R;
-        cfg.use_int8_weights = use_int8;
+        cfg.use_int8_weights = (!use_int4 && use_int8);
+        cfg.use_int4_weights = use_int4;
         cfg.use_fp8_kv = use_fp8_kv;
         cfg.return_full_logits = full_logits;
         cfg.use_onchip_embeddings = onchip_emb;
@@ -574,11 +598,14 @@ int main(int argc, char** argv) {
             return;
         }
         const auto& m = gemma_tpu.get_metrics();
+        const size_t hits_delta = tpu.get_cache_hits() - hits_before;
+        const size_t misses_delta = tpu.get_cache_misses() - misses_before;
         std::cout << "  HBM3 Footprint : Weights=" << std::setprecision(2)
                   << (static_cast<double>(m.total_hbm_weight_bytes) / (1024.0 * 1024.0 * 1024.0)) << " GB"
                   << " | KV=" << (static_cast<double>(m.total_hbm_kv_bytes) / (1024.0 * 1024.0)) << " MB"
                   << " | Upload=" << std::setprecision(1) << m.weight_upload_ms << " ms"
-                  << " | Compile(dec/pre)=" << m.decode_compile_ms << "/" << m.prefill_compile_ms << " ms\n";
+                  << " | Compile(dec/pre)=" << m.decode_compile_ms << "/" << m.prefill_compile_ms << " ms"
+                  << " | Cache(hit/miss)=" << hits_delta << "/" << misses_delta << "\n";
 
         std::vector<uint32_t> warm_out;
         if (!gemma_tpu.decode_step(std::vector<uint32_t>(static_cast<size_t>(B), prompt_toks[0]), 0, nullptr, warm_out)) {
@@ -690,8 +717,24 @@ int main(int argc, char** argv) {
 
     const bool can_r8 = (n_devs >= 8) && (spec.hidden_dim % 8 == 0) && (spec.num_heads % 8 == 0) &&
                         (spec.vocab_size % 8 == 0) && (!spec.is_moe || (spec.expert_ffn_dim % 8 == 0));
-    // Large dense models (e.g. Gemma 4.5 31B Dense, ~62 GB BF16) exceed a single 32 GB v6e chip
+    // Large dense models (e.g. Gemma 4.5 31B Dense, ~62 GB BF16) fit 1-chip ONLY in W4A16 (~16.1 GB)!
     const bool is_large_dense = (!spec.is_moe && (static_cast<uint64_t>(spec.num_layers) * static_cast<uint64_t>(spec.embedding_dim) * static_cast<uint64_t>(spec.hidden_dim) * 3ULL > 4000000000ULL));
+
+    if (int4_only) {
+        // Focused W4A16 Group-128 INT4 Silicon Proof + PJRT Disk Cache Cold->Warm Reload Verification!
+        const int R_main = (n_devs >= 4) ? 4 : 1;
+        run_config_bench("W4-P. W4A16 Group-128 Parity Check (FullLogits, COLD Compile)",        R_main, 1, false, true,  32,  128, true, false, true);
+        run_config_bench("W4-CACHE. W4A16 Group-128 PJRT Disk Cache Reload (WARM <1s!)",       R_main, 1, false, true,  16,  128, true, false, true);
+        run_config_bench("W4-I. W4A16 Group-128 Interactive Peak (OnChipArgmax)",              R_main, 1, false, false, 128, 128, true, false, true);
+        if (R_main >= 4) {
+            run_config_bench("W4-1CHIP. W4A16 Single-Chip Fit Proof (1-Chip R=1!!)",           1,      1, false, true,  32,  128, true, false, true);
+            run_config_bench("W4-B64. W4A16 Batch B=64 Continuous Batching",                   R_main, 64, false, false, 64, 0,   true, false, true);
+        }
+        std::cout << "\n======================================================================\n";
+        std::cout << "  W4A16 + PJRT DISK CACHE SILICON PROOF COMPLETE\n";
+        std::cout << "======================================================================\n";
+        return 0;
+    }
 
     if (spec.is_moe) {
         // MoE 26B-A4B Suite: 8-chip (v6e-8) pod and 4-chip (v6e-4) scaling!

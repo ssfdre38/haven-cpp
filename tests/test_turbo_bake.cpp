@@ -1,5 +1,7 @@
 #include "haven/haven_avx2.h"
 #include "haven/haven_engine.h"
+#include "haven/haven_tpu_gemma4.h"
+#include "haven/haven_tpu_pjrt.h"
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -427,16 +429,125 @@ static void test_gemma4_tokenizer_bos_eos_and_space_prefix() {
     std::cout << "  ✓ PASS: Gemma 4 BOS=2, EOS=1, stop_tokens, and exact add_space_prefix=false tokenization!\n";
 }
 
+static void test_w4a16_group128_pack_unpack_and_hadamard() {
+    std::cout << "[5/6] Testing W4A16 Group-128 nibble pack/unpack exactness & Hadamard-smoothed 662x spike...\n";
+    // Verify adaptive group sizing across all real Gemma 4.5 / Ava / Llama shapes
+    assert(HavenTpuGemma4Engine::compute_w4_group_size(5376) == 128);
+    assert(HavenTpuGemma4Engine::compute_w4_group_size(2816) == 128);
+    assert(HavenTpuGemma4Engine::compute_w4_group_size(2560) == 128);
+    assert(HavenTpuGemma4Engine::compute_w4_group_size(528)  == 16);
+    assert(HavenTpuGemma4Engine::compute_w4_group_size(264)  == 8);
+
+    // Exhaustive nibble sign-extension check covering all 15x15 signed pairs [-7, +7] x [-7, +7]
+    constexpr int R = 32;
+    constexpr int K = 256;
+    const int G = HavenTpuGemma4Engine::compute_w4_group_size(K);
+    assert(G == 128);
+    std::vector<float> exact_grid(R * K, 0.0f);
+    for (int r = 0; r < R; ++r) {
+        for (int c = 0; c < K; ++c) {
+            int q = ((r * 7 + c * 4) % 15) - 7; // Coprime stride hits all 15 exact integers in [-7, +7] per group!
+            exact_grid[r * K + c] = static_cast<float>(q) * 0.25f;
+        }
+    }
+    std::vector<int8_t> packed(R * (K / 2));
+    std::vector<float> scales(R * (K / G));
+    std::vector<float> recon(R * K);
+    HavenTpuGemma4Engine::quantize_f32_to_s4_packed_group(exact_grid.data(), R, K, G, packed.data(), scales.data());
+    HavenTpuGemma4Engine::dequantize_s4_packed_group_to_f32(packed.data(), scales.data(), R, K, G, recon.data());
+
+    float max_err = 0.0f;
+    for (int i = 0; i < R * K; ++i) max_err = std::max(max_err, std::fabs(exact_grid[i] - recon[i]));
+    if (max_err > 1e-5f) {
+        std::cerr << "FAIL: W4A16 exact integer grid round-trip max_err=" << max_err << "\n";
+        std::exit(1);
+    }
+
+    // Verify Hadamard Block-256 smoothing dramatically improves W4A16 Group-128 matvec cosine on 10x weight outliers!
+    // Realistic uncorrelated transformer weights + 10x outlier on channel 47 destroys raw W4 group scale;
+    // Block-256 FWHT spreads the outlier evenly into the Gaussian bulk, tightening W4 scale ~5x!
+    std::vector<float> W(R * K), x(K), W_h(R * K), x_h(K);
+    uint32_t rng = 0x13579BDFu;
+    auto next_u = [&]() -> float {
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        return (static_cast<float>(rng & 0xFFFFu) / 32768.0f) - 1.0f;
+    };
+    for (int c = 0; c < K; ++c) {
+        x[c] = (c == 47) ? 0.05f : next_u();
+    }
+    for (int r = 0; r < R; ++r) {
+        for (int c = 0; c < K; ++c) {
+            float v = 0.08f * (next_u() + next_u()) * 0.5f; // Pseudo-Gaussian bulk
+            if (c == 47) v = (r % 2 == 0 ? 0.85f : -0.85f); // Realistic 10.6x weight outlier spike
+            W[r * K + c] = v;
+        }
+    }
+    x_h = x;
+    Avx2Math::fwht_block_inplace(x_h.data(), K, 256);
+    W_h = W;
+    for (int r = 0; r < R; ++r) Avx2Math::fwht_block_inplace(W_h.data() + r * K, K, 256);
+
+    std::vector<float> y_ref(R, 0.0f), y_raw_w4(R, 0.0f), y_had_w4(R, 0.0f);
+    for (int r = 0; r < R; ++r) y_ref[r] = Avx2Math::vec_dot_f32(K, W.data() + r * K, x.data());
+
+    HavenTpuGemma4Engine::quantize_f32_to_s4_packed_group(W.data(), R, K, G, packed.data(), scales.data());
+    HavenTpuGemma4Engine::dequantize_s4_packed_group_to_f32(packed.data(), scales.data(), R, K, G, recon.data());
+    for (int r = 0; r < R; ++r) y_raw_w4[r] = Avx2Math::vec_dot_f32(K, recon.data() + r * K, x.data());
+
+    HavenTpuGemma4Engine::quantize_f32_to_s4_packed_group(W_h.data(), R, K, G, packed.data(), scales.data());
+    HavenTpuGemma4Engine::dequantize_s4_packed_group_to_f32(packed.data(), scales.data(), R, K, G, recon.data());
+    for (int r = 0; r < R; ++r) y_had_w4[r] = Avx2Math::vec_dot_f32(K, recon.data() + r * K, x_h.data());
+
+    float cos_raw = Avx2Math::cosine_similarity(y_ref.data(), y_raw_w4.data(), R);
+    float cos_had = Avx2Math::cosine_similarity(y_ref.data(), y_had_w4.data(), R);
+    std::cout << "  - W4A16-G128 matvec cosine under 10.6x weight outlier: raw=" << cos_raw
+              << " -> H256-smoothed=" << cos_had << "\n";
+    if (cos_had < 0.985f || cos_had <= cos_raw) {
+        std::cerr << "FAIL: Expected Hadamard-smoothed W4A16-G128 cosine >= 0.985 and > raw!\n";
+        std::exit(1);
+    }
+    std::cout << "  ✓ PASS: W4A16 Group-128 nibble pack/unpack exact (max_err=" << max_err << ") & H256 cosine=" << cos_had << "!\n";
+}
+
+static void test_pjrt_disk_cache_key_determinism() {
+    std::cout << "[6/6] Testing PJRT compiled-executable disk cache key determinism & collision sensitivity...\n";
+    const std::string mlir_a = "module @t { func.func @main(%x: tensor<1x4xf32>) -> tensor<1x4xf32> { return %x : tensor<1x4xf32> } }";
+    const std::string mlir_b = "module @t { func.func @main(%x: tensor<1x8xf32>) -> tensor<1x8xf32> { return %x : tensor<1x8xf32> } }";
+
+    std::string k1     = HavenTpuPjrtBackend::compute_stablehlo_cache_key("tpu",  "pjrt 0.75", "TPU v6e",   4, 0, false, mlir_a);
+    std::string k2     = HavenTpuPjrtBackend::compute_stablehlo_cache_key("tpu",  "pjrt 0.75", "TPU v6e",   4, 0, false, mlir_a);
+    std::string k_plat = HavenTpuPjrtBackend::compute_stablehlo_cache_key("cuda", "pjrt 0.75", "TPU v6e",   4, 0, false, mlir_a);
+    std::string k_ver  = HavenTpuPjrtBackend::compute_stablehlo_cache_key("tpu",  "pjrt 0.70", "TPU v6e",   4, 0, false, mlir_a);
+    std::string k_dev  = HavenTpuPjrtBackend::compute_stablehlo_cache_key("tpu",  "pjrt 0.75", "NVIDIA L4", 4, 0, false, mlir_a);
+    std::string k_rep  = HavenTpuPjrtBackend::compute_stablehlo_cache_key("tpu",  "pjrt 0.75", "TPU v6e",   1, 0, false, mlir_a);
+    std::string k_ord  = HavenTpuPjrtBackend::compute_stablehlo_cache_key("tpu",  "pjrt 0.75", "TPU v6e",   4, 1, false, mlir_a);
+    std::string k_port = HavenTpuPjrtBackend::compute_stablehlo_cache_key("tpu",  "pjrt 0.75", "TPU v6e",   4, 0, true,  mlir_a);
+    std::string k_ir   = HavenTpuPjrtBackend::compute_stablehlo_cache_key("tpu",  "pjrt 0.75", "TPU v6e",   4, 0, false, mlir_b);
+
+    if (k1.size() != 32 || k1 != k2) {
+        std::cerr << "FAIL: Cache key non-deterministic or wrong length: " << k1 << " vs " << k2 << "\n";
+        std::exit(1);
+    }
+    if (k1 == k_plat || k1 == k_ver || k1 == k_dev || k1 == k_rep || k1 == k_ord || k1 == k_port || k1 == k_ir) {
+        std::cerr << "FAIL: Cache key failed to distinguish platform/version/device/replicas/ordinal/portable/MLIR!\n";
+        std::exit(1);
+    }
+    std::cout << "  - Deterministic 128-bit key sample: " << k1 << " (all 7 sensitivity dimensions distinct)\n";
+    std::cout << "  ✓ PASS: PJRT disk cache key determinism & collision sensitivity verified!\n";
+}
+
 int main() {
     std::cout << "==================================================================\n";
-    std::cout << "  HAVEN-CPP GEMMA 4.5 TURBO BAKE & FWHT VERIFICATION SUITE\n";
+    std::cout << "  HAVEN-CPP GEMMA 4.5 TURBO BAKE, W4A16 & PJRT VERIFICATION SUITE\n";
     std::cout << "==================================================================\n";
     test_fwht_exactness();
     test_norm_fold_hadamard_and_r2_math();
     test_engine_e2e_turbo_parity();
     test_gemma4_tokenizer_bos_eos_and_space_prefix();
+    test_w4a16_group128_pack_unpack_and_hadamard();
+    test_pjrt_disk_cache_key_determinism();
     std::cout << "==================================================================\n";
-    std::cout << "  ALL GEMMA 4.5 TURBO BAKE TESTS PASSED 100%!\n";
+    std::cout << "  ALL 6 GEMMA 4.5 TURBO BAKE, W4A16 & PJRT TESTS PASSED 100%!\n";
     std::cout << "==================================================================\n";
     return 0;
 }

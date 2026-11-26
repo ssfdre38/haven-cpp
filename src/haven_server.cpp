@@ -45,13 +45,15 @@ namespace haven {
 struct TpuServerOptions {
     bool enable_onchip = false;
     bool use_int8 = true;
+    bool use_int4 = false;
     bool use_fp8_kv = false;
     bool use_onchip_embeddings = true;
     bool use_onchip_argmax = false; // true = 4B/slot on-chip argmax for max multi-tenant throughput
-    int num_replicas = 0; // 0 = auto (max power-of-2 <= addressable TPU chips, capped at 8)
+    int num_replicas = 0; // 0 = auto (max power-of-2 <= addressable TPU/GPU chips, capped at 8)
     int batch_size = 1;   // 1 = interactive w/ prefix cache; 2..256 = multi-tenant continuous batching
     int max_seq_len = 2048;
     std::string libtpu_path = "";
+    std::string pjrt_cache_dir = "";
 };
 
 class HavenMicroServer {
@@ -367,14 +369,17 @@ private:
             }
         }
 
-        // Optional Model-General Full On-Chip Cloud TPU HBM3 Acceleration (--tpu / HAVEN_TPU_ONCHIP=1)
+        // Optional Model-General Full On-Chip Cloud TPU / NVIDIA GPU PJRT Acceleration (--tpu / --gpu / HAVEN_TPU_ONCHIP=1)
         if (tpu_opts_.enable_onchip) {
             const auto& mc = haven_engine_.get_config();
             std::string support_err;
             if (HavenTpuGemma4Engine::is_model_supported(haven_engine_, support_err)) {
                 if (!tpu_backend_.is_initialized()) {
+                    if (!tpu_opts_.pjrt_cache_dir.empty()) {
+                        tpu_backend_.set_cache_dir(tpu_opts_.pjrt_cache_dir);
+                    }
                     if (!tpu_backend_.initialize(tpu_opts_.libtpu_path)) {
-                        std::cout << "[HavenServer] TPU requested but unavailable (" << tpu_backend_.get_last_error()
+                        std::cout << "[HavenServer] PJRT accelerator requested but unavailable (" << tpu_backend_.get_last_error()
                                   << ") — falling back to AVX2 CPU.\n" << std::flush;
                     }
                 }
@@ -393,30 +398,37 @@ private:
                     TpuGemma4Config tcfg;
                     tcfg.batch_size = std::clamp(tpu_opts_.batch_size, 1, 256);
                     tcfg.max_seq_len = std::clamp(tpu_opts_.max_seq_len, 256, 8192);
-                    tcfg.prefill_chunk_size = 128; // Auto-compiles slot-targeted {128, 64, 32} (+ 1 when B>1)
+                    tcfg.prefill_chunk_size = 128; // Auto-compiles slot-targeted {128, 64, 32} on TPU or {128, 32} on CUDA (+ 1 when B>1)
                     tcfg.num_replicas = R;
-                    tcfg.use_int8_weights = tpu_opts_.use_int8;
+                    tcfg.use_int8_weights = (!tpu_opts_.use_int4 && tpu_opts_.use_int8);
+                    tcfg.use_int4_weights = tpu_opts_.use_int4;
                     tcfg.use_fp8_kv = tpu_opts_.use_fp8_kv;
                     tcfg.return_full_logits = !tpu_opts_.use_onchip_argmax;
                     tcfg.use_onchip_embeddings = tpu_opts_.use_onchip_embeddings;
                     tcfg.donate_kv_cache = true;
 
-                    std::cout << "[HavenServer] Initializing Model-General On-Chip TPU Engine (" << mc.architecture
-                              << ", " << mc.num_layers << "L, R=" << R
+                    const char* prec_label = tcfg.use_int4_weights ? "W4A16-INT4"
+                                           : (tcfg.use_int8_weights ? "HadW8-INT8" : "BF16");
+                    std::cout << "[HavenServer] Initializing Model-General On-Chip PJRT Engine (" << mc.architecture
+                              << ", " << mc.num_layers << "L, platform=" << tpu_backend_.get_platform_name()
+                              << ", R=" << R
                               << ", B=" << tcfg.batch_size
-                              << ", " << (tcfg.use_int8_weights ? "HadW8-INT8" : "BF16")
+                              << ", " << prec_label
                               << ", KV=" << (tcfg.use_fp8_kv ? "FP8-E4M3FN" : "BF16")
                               << ", " << (tcfg.return_full_logits ? "FullSampler" : "OnChipArgmax")
                               << ", max_seq=" << tcfg.max_seq_len
-                              << ", onchip_emb=" << (tcfg.use_onchip_embeddings ? "true" : "false") << ")...\n" << std::flush;
+                              << ", onchip_emb=" << (tcfg.use_onchip_embeddings ? "true" : "false")
+                              << ", cache=" << (tpu_backend_.get_cache_dir().empty() ? "off" : tpu_backend_.get_cache_dir()) << ")...\n" << std::flush;
                     if (tpu_gemma4_.initialize(&tpu_backend_, haven_engine_, tcfg)) {
                         tpu_onchip_active_ = true;
                         const auto& tm = tpu_gemma4_.get_metrics();
-                        std::cout << "[HavenServer] ✓ TPU On-Chip Engine ACTIVE ("
+                        std::cout << "[HavenServer] ✓ On-Chip PJRT Engine ACTIVE ("
                                   << tpu_backend_.get_platform_name() << ", " << R << " chip(s), B=" << tcfg.batch_size
                                   << ", Weights=" << (static_cast<double>(tm.total_hbm_weight_bytes) / (1024.0 * 1024.0 * 1024.0))
                                   << " GB, KV=" << (static_cast<double>(tm.total_hbm_kv_bytes) / (1024.0 * 1024.0))
-                                  << " MB HBM3, Compile=" << tm.decode_compile_ms << "/" << tm.prefill_compile_ms << " ms).\n"
+                                  << " MB, Compile=" << tm.decode_compile_ms << "/" << tm.prefill_compile_ms
+                                  << " ms, Cache hits/misses=" << tpu_backend_.get_cache_hits()
+                                  << "/" << tpu_backend_.get_cache_misses() << ").\n"
                                   << std::flush;
 
                         if (tcfg.batch_size > 1) {
@@ -2995,12 +3007,19 @@ int main(int argc, char** argv) {
     if (const char* env_tpu = std::getenv("HAVEN_TPU_ONCHIP"); env_tpu && (std::string(env_tpu) == "1" || std::string(env_tpu) == "true")) {
         tpu_opts.enable_onchip = true;
     }
-    if (const char* env_prec = std::getenv("HAVEN_TPU_PRECISION"); env_prec && std::string(env_prec) == "bf16") {
+    if (const char* env_prec = std::getenv("HAVEN_TPU_PRECISION"); env_prec && *env_prec) {
+        std::string p(env_prec);
+        if (p == "bf16") { tpu_opts.use_int8 = false; tpu_opts.use_int4 = false; }
+        else if (p == "int4" || p == "w4a16") { tpu_opts.use_int4 = true; tpu_opts.use_int8 = false; }
+    }
+    if (const char* env_int4 = std::getenv("HAVEN_TPU_INT4"); env_int4 && std::string(env_int4) == "1") {
+        tpu_opts.enable_onchip = true;
+        tpu_opts.use_int4 = true;
         tpu_opts.use_int8 = false;
     }
     if (const char* env_rep = std::getenv("HAVEN_TPU_REPLICAS"); env_rep && *env_rep) {
         uint32_t r = 0;
-        if (parse_u32_range(env_rep, 1, 4, r)) tpu_opts.num_replicas = static_cast<int>(r);
+        if (parse_u32_range(env_rep, 1, 8, r)) tpu_opts.num_replicas = static_cast<int>(r);
     }
     if (const char* env_batch = std::getenv("HAVEN_TPU_BATCH"); env_batch && *env_batch) {
         uint32_t b = 1;
@@ -3009,8 +3028,13 @@ int main(int argc, char** argv) {
     if (const char* env_kvfp8 = std::getenv("HAVEN_TPU_KV_FP8"); env_kvfp8 && std::string(env_kvfp8) == "1") {
         tpu_opts.use_fp8_kv = true;
     }
-    if (const char* env_lib = std::getenv("HAVEN_LIBTPU_PATH"); env_lib && *env_lib) {
+    if (const char* env_lib = std::getenv("HAVEN_PJRT_PLUGIN_PATH"); env_lib && *env_lib) {
         tpu_opts.libtpu_path = env_lib;
+    } else if (const char* env_lib2 = std::getenv("HAVEN_LIBTPU_PATH"); env_lib2 && *env_lib2) {
+        tpu_opts.libtpu_path = env_lib2;
+    }
+    if (const char* env_cache = std::getenv("HAVEN_PJRT_CACHE_DIR"); env_cache && *env_cache) {
+        tpu_opts.pjrt_cache_dir = env_cache;
     }
 
     for (int i = 1; i < argc; ++i) {
@@ -3023,15 +3047,18 @@ int main(int argc, char** argv) {
                       << "  --port <port>             HTTP server port (default: 11436)\n"
                       << "  --api-key <key>           Require Authorization: Bearer <key> on API routes (or HAVEN_API_KEY)\n"
                       << "  --model <path>            GGUF or MLX model path to load\n"
-                      << "  --tpu, --tpu-onchip       Serve dense/MoE transformers directly on Cloud TPU HBM3 via libtpu.so\n"
-                      << "  --tpu-replicas <1|2|4|8>  Tensor-parallel TPU chips over Optical ICI (default: auto)\n"
-                      << "  --tpu-batch <1..256>      Multi-tenant HBM3 KV slots (1=interactive, 16..256=continuous batching)\n"
-                      << "  --tpu-bf16 / --tpu-int8   HBM3 weight precision (default: --tpu-int8 Hadamard W8)\n"
+                      << "  --tpu, --tpu-onchip       Serve dense/MoE transformers on Cloud TPU (libtpu.so) or auto-fallback CUDA\n"
+                      << "  --gpu, --cuda             Serve dense/MoE transformers directly on NVIDIA CUDA GPU via xla_cuda_plugin.so\n"
+                      << "  --tpu-replicas <1|2|4|8>  Tensor-parallel chips over Optical ICI / NVLink (default: auto)\n"
+                      << "  --tpu-batch <1..256>      Multi-tenant HBM3/VRAM KV slots (1=interactive, 16..256=continuous batching)\n"
+                      << "  --tpu-bf16 / --tpu-int8   Weight precision (BF16 or Hadamard W8-INT8, default: --tpu-int8)\n"
+                      << "  --tpu-int4 / --gpu-int4   Native packed W4A16 Group-128 INT4 (4.25 bpw, fits 31B in 17GB VRAM/HBM!)\n"
                       << "  --tpu-kv-fp8              Scale-free FP8 E4M3FN coalesced 3D KV cache (50% HBM3 footprint & BW)\n"
-                      << "  --tpu-argmax              Use on-chip TPU argmax (4B/slot D2H) for peak multi-tenant tok/s\n"
-                      << "  --tpu-max-seq <N>         Static HBM3 KV cache length (default: 2048)\n"
-                      << "  --tpu-host-emb            Use host-side embedding lookup instead of on-chip HBM3 gather\n"
-                      << "  --libtpu <path>           Explicit path to libtpu.so (optional)\n"
+                      << "  --tpu-argmax              Use on-chip argmax (4B/slot D2H) for peak multi-tenant tok/s\n"
+                      << "  --tpu-max-seq <N>         Static HBM3/VRAM KV cache length (default: 2048)\n"
+                      << "  --tpu-host-emb            Use host-side embedding lookup instead of on-chip gather\n"
+                      << "  --pjrt, --libtpu <path>   Explicit path to libtpu.so or xla_cuda_plugin.so (optional)\n"
+                      << "  --pjrt-cache <dir>        Persistent compiled PJRT disk cache dir (\"off\" disables; default ~/.cache/haven-cpp/pjrt)\n"
                       << "  --cluster-host [port]     Run as cluster coordinator on [port] (default: HTTP_PORT + 2)\n"
                       << "  --cluster-join <invite>   Join remote cluster using haven://cluster URI or IP\n"
                       << "  --cluster-port <port>     Coordinator port to join (default: 11438)\n"
@@ -3045,12 +3072,21 @@ int main(int argc, char** argv) {
             api_key = argv[++i];
         } else if (arg == "--tpu" || arg == "--tpu-onchip") {
             tpu_opts.enable_onchip = true;
+        } else if (arg == "--gpu" || arg == "--cuda") {
+            tpu_opts.enable_onchip = true;
+            if (tpu_opts.libtpu_path.empty()) tpu_opts.libtpu_path = "cuda";
         } else if (arg == "--tpu-bf16") {
             tpu_opts.enable_onchip = true;
             tpu_opts.use_int8 = false;
+            tpu_opts.use_int4 = false;
         } else if (arg == "--tpu-int8") {
             tpu_opts.enable_onchip = true;
             tpu_opts.use_int8 = true;
+            tpu_opts.use_int4 = false;
+        } else if (arg == "--tpu-int4" || arg == "--gpu-int4" || arg == "--w4a16") {
+            tpu_opts.enable_onchip = true;
+            tpu_opts.use_int4 = true;
+            tpu_opts.use_int8 = false;
         } else if (arg == "--tpu-kv-fp8") {
             tpu_opts.enable_onchip = true;
             tpu_opts.use_fp8_kv = true;
@@ -3082,8 +3118,10 @@ int main(int argc, char** argv) {
                 return 1;
             }
             tpu_opts.max_seq_len = static_cast<int>(ms);
-        } else if (arg == "--libtpu" && i + 1 < argc) {
+        } else if ((arg == "--libtpu" || arg == "--pjrt") && i + 1 < argc) {
             tpu_opts.libtpu_path = argv[++i];
+        } else if (arg == "--pjrt-cache" && i + 1 < argc) {
+            tpu_opts.pjrt_cache_dir = argv[++i];
         } else if (arg == "--port" && i + 1 < argc) {
             uint32_t p = 0;
             if (!parse_u32_range(argv[++i], 1, 65535, p)) {

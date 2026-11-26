@@ -6,16 +6,78 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <thread>
 
 #ifndef _WIN32
 #include <dlfcn.h>
+#include <unistd.h>
 #include "haven/third_party/pjrt_c_api.h"
 #endif
 
 namespace haven {
+
+static void fnv1a_feed(uint64_t& h1, uint64_t& h2, const void* data, size_t len) {
+    const auto* p = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < len; ++i) {
+        h1 ^= p[i];
+        h1 *= 1099511628211ULL;
+        h2 ^= static_cast<uint64_t>(p[i]) ^ (static_cast<uint64_t>(i) & 0xFFULL);
+        h2 *= 0x9E3779B185EBCA87ULL;
+    }
+}
+
+std::string HavenTpuPjrtBackend::compute_stablehlo_cache_key(const std::string& platform_name,
+                                                             const std::string& platform_version,
+                                                             const std::string& device_kind,
+                                                             int num_replicas,
+                                                             int device_ordinal,
+                                                             bool portable,
+                                                             const std::string& mlir_code) {
+    uint64_t h1 = 14695981039346656037ULL;
+    uint64_t h2 = 0xCBF29CE484222325ULL ^ 0xA5A5A5A55A5A5A5AULL;
+    std::ostringstream hdr;
+    hdr << "haven_pjrt_v1|" << platform_name << "|" << platform_version << "|" << device_kind
+        << "|r=" << num_replicas << "|d=" << device_ordinal << "|p=" << (portable ? 1 : 0)
+        << "|sz=" << mlir_code.size() << "|";
+    const std::string hstr = hdr.str();
+    fnv1a_feed(h1, h2, hstr.data(), hstr.size());
+    fnv1a_feed(h1, h2, mlir_code.data(), mlir_code.size());
+
+    std::ostringstream out;
+    out << std::hex << std::setfill('0') << std::setw(16) << h1 << std::setw(16) << h2;
+    return out.str();
+}
+
+std::string HavenTpuPjrtBackend::resolve_default_cache_dir() {
+    if (const char* env_dir = std::getenv("HAVEN_PJRT_CACHE_DIR")) {
+        std::string s(env_dir);
+        if (s.empty() || s == "0" || s == "off" || s == "OFF" || s == "none" || s == "NONE") {
+            return "";
+        }
+        return s;
+    }
+    if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg && xdg[0] != '\0') {
+        return (std::filesystem::path(xdg) / "haven-cpp" / "pjrt").string();
+    }
+#ifdef _WIN32
+    if (const char* local = std::getenv("LOCALAPPDATA"); local && local[0] != '\0') {
+        return (std::filesystem::path(local) / "haven-cpp" / "pjrt").string();
+    }
+#endif
+    if (const char* home = std::getenv("HOME"); home && home[0] != '\0') {
+        return (std::filesystem::path(home) / ".cache" / "haven-cpp" / "pjrt").string();
+    }
+    return (std::filesystem::temp_directory_path() / "haven-cpp-pjrt-cache").string();
+}
+
+void HavenTpuPjrtBackend::set_cache_dir(const std::string& dir) {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    disk_cache_dir_ = dir;
+}
 
 uint16_t HavenTpuPjrtBackend::fp32_to_bf16(float f) {
     uint32_t bits = 0;
@@ -50,7 +112,8 @@ void HavenTpuPjrtBackend::convert_bf16_to_f32(const uint16_t* src, float* dst, s
     }
 }
 
-HavenTpuPjrtBackend::HavenTpuPjrtBackend() = default;
+HavenTpuPjrtBackend::HavenTpuPjrtBackend()
+    : disk_cache_dir_(resolve_default_cache_dir()) {}
 
 HavenTpuPjrtBackend::~HavenTpuPjrtBackend() {
     shutdown();
@@ -59,13 +122,16 @@ HavenTpuPjrtBackend::~HavenTpuPjrtBackend() {
 #ifdef _WIN32
 
 bool HavenTpuPjrtBackend::initialize(const std::string&) {
-    last_error_ = "Native Cloud TPU PJRT (libtpu.so) is only available on Linux Cloud TPU hosts.";
+    last_error_ = "Native PJRT (libtpu.so / xla_cuda_plugin.so) is only available on Linux accelerator hosts.";
     return false;
 }
 
 void HavenTpuPjrtBackend::shutdown() {
     initialized_ = false;
 }
+
+PJRT_LoadedExecutable* HavenTpuPjrtBackend::try_load_cached_executable(const std::string&, const std::string&) { return nullptr; }
+void HavenTpuPjrtBackend::try_save_cached_executable(const std::string&, PJRT_LoadedExecutable*) {}
 
 PJRT_Buffer* HavenTpuPjrtBackend::upload_bf16_2d(const uint16_t*, int64_t, int64_t, int) { return nullptr; }
 PJRT_Buffer* HavenTpuPjrtBackend::upload_f32_2d(const float*, int64_t, int64_t, int) { return nullptr; }
@@ -145,40 +211,85 @@ static std::string encode_compile_options_proto(int device_ordinal, int num_repl
     return compile_opts;
 }
 
-static std::vector<std::string> discover_libtpu_candidates(const std::string& override_path) {
+static std::vector<std::string> discover_pjrt_candidates(const std::string& override_path) {
     std::vector<std::string> paths;
-    if (!override_path.empty()) paths.push_back(override_path);
+    const bool prefer_cuda =
+        (override_path == "cuda" || override_path == "gpu" || override_path == "CUDA" || override_path == "GPU" ||
+         (std::getenv("HAVEN_PJRT_PREFER_CUDA") && std::string(std::getenv("HAVEN_PJRT_PREFER_CUDA")) == "1"));
+
+    if (!override_path.empty() && !prefer_cuda) {
+        paths.push_back(override_path);
+    }
+    if (const char* env_p = std::getenv("HAVEN_PJRT_PLUGIN_PATH"); env_p && env_p[0] != '\0') {
+        paths.emplace_back(env_p);
+    }
     if (const char* env_p = std::getenv("HAVEN_LIBTPU_PATH"); env_p && env_p[0] != '\0') {
         paths.emplace_back(env_p);
     }
     if (const char* env_p = std::getenv("TPU_LIBRARY_PATH"); env_p && env_p[0] != '\0') {
         paths.emplace_back(env_p);
     }
-    paths.emplace_back("libtpu.so");
-    paths.emplace_back("/lib/libtpu.so");
-    paths.emplace_back("/usr/lib/libtpu.so");
-    paths.emplace_back("/usr/local/lib/libtpu.so");
 
-    // Probe standard Python site-packages / dist-packages locations on GCP TPU VMs
     const std::vector<std::string> py_roots = {
         "/usr/local/lib",
         "/usr/lib",
         std::string(std::getenv("HOME") ? std::getenv("HOME") : "/root") + "/.local/lib"
     };
-    std::error_code ec;
-    for (const auto& root : py_roots) {
-        if (!std::filesystem::exists(root, ec)) continue;
-        for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
-            if (!entry.is_directory(ec)) continue;
-            const std::string name = entry.path().filename().string();
-            if (name.rfind("python3", 0) != 0) continue;
-            for (const char* sub : {"dist-packages/libtpu/libtpu.so", "site-packages/libtpu/libtpu.so"}) {
-                auto cand = entry.path() / sub;
-                if (std::filesystem::exists(cand, ec)) {
-                    paths.push_back(cand.string());
+
+    auto append_tpu_paths = [&]() {
+        paths.emplace_back("libtpu.so");
+        paths.emplace_back("/lib/libtpu.so");
+        paths.emplace_back("/usr/lib/libtpu.so");
+        paths.emplace_back("/usr/local/lib/libtpu.so");
+        std::error_code ec;
+        for (const auto& root : py_roots) {
+            if (!std::filesystem::exists(root, ec)) continue;
+            for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
+                if (!entry.is_directory(ec)) continue;
+                const std::string name = entry.path().filename().string();
+                if (name.rfind("python3", 0) != 0) continue;
+                for (const char* sub : {"dist-packages/libtpu/libtpu.so", "site-packages/libtpu/libtpu.so"}) {
+                    auto cand = entry.path() / sub;
+                    if (std::filesystem::exists(cand, ec)) {
+                        paths.push_back(cand.string());
+                    }
                 }
             }
         }
+    };
+
+    auto append_cuda_paths = [&]() {
+        paths.emplace_back("xla_cuda_plugin.so");
+        paths.emplace_back("/usr/local/lib/xla_cuda_plugin.so");
+        paths.emplace_back("/usr/lib/xla_cuda_plugin.so");
+        std::error_code ec;
+        for (const auto& root : py_roots) {
+            if (!std::filesystem::exists(root, ec)) continue;
+            for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
+                if (!entry.is_directory(ec)) continue;
+                const std::string name = entry.path().filename().string();
+                if (name.rfind("python3", 0) != 0) continue;
+                for (const char* sub : {
+                    "dist-packages/jax_plugins/xla_cuda12/xla_cuda_plugin.so",
+                    "site-packages/jax_plugins/xla_cuda12/xla_cuda_plugin.so",
+                    "dist-packages/jax_plugins/xla_cuda13/xla_cuda_plugin.so",
+                    "site-packages/jax_plugins/xla_cuda13/xla_cuda_plugin.so"
+                }) {
+                    auto cand = entry.path() / sub;
+                    if (std::filesystem::exists(cand, ec)) {
+                        paths.push_back(cand.string());
+                    }
+                }
+            }
+        }
+    };
+
+    if (prefer_cuda) {
+        append_cuda_paths();
+        append_tpu_paths();
+    } else {
+        append_tpu_paths();
+        append_cuda_paths();
     }
     return paths;
 }
@@ -228,7 +339,7 @@ bool HavenTpuPjrtBackend::initialize(const std::string& libtpu_path_override) {
     if (initialized_) return true;
     last_error_.clear();
 
-    auto candidates = discover_libtpu_candidates(libtpu_path_override);
+    auto candidates = discover_pjrt_candidates(libtpu_path_override);
     std::string loaded_path;
     for (const auto& p : candidates) {
         void* h = dlopen(p.c_str(), RTLD_NOW | RTLD_LOCAL);
@@ -239,9 +350,10 @@ bool HavenTpuPjrtBackend::initialize(const std::string& libtpu_path_override) {
         }
     }
     if (!dl_handle_) {
-        last_error_ = "Failed to dlopen libtpu.so from default search paths.";
+        last_error_ = "Failed to dlopen PJRT plugin (libtpu.so / xla_cuda_plugin.so) from default search paths.";
         return false;
     }
+    loaded_plugin_path_ = loaded_path;
 
     auto get_api = reinterpret_cast<GetPjrtApiFn>(dlsym(dl_handle_, "GetPjrtApi"));
     if (!get_api) {
@@ -592,8 +704,125 @@ void HavenTpuPjrtBackend::destroy_buffer(PJRT_Buffer* buf) {
     }
 }
 
+PJRT_LoadedExecutable* HavenTpuPjrtBackend::try_load_cached_executable(const std::string& cache_key,
+                                                                       const std::string& compile_opts) {
+    if (!initialized_ || !api_ || !api_->PJRT_Executable_DeserializeAndLoad) return nullptr;
+    std::string dir;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        dir = disk_cache_dir_;
+    }
+    if (dir.empty() || cache_key.empty()) return nullptr;
+
+    std::error_code ec;
+    const auto path = std::filesystem::path(dir) / (cache_key + ".pjrtbin");
+    if (!std::filesystem::exists(path, ec)) return nullptr;
+    const auto fsize = std::filesystem::file_size(path, ec);
+    if (ec || fsize == 0 || fsize > (512ULL * 1024ULL * 1024ULL)) return nullptr;
+
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs) return nullptr;
+    std::string bytes(static_cast<size_t>(fsize), '\0');
+    ifs.read(bytes.data(), static_cast<std::streamsize>(fsize));
+    if (!ifs) return nullptr;
+
+    PJRT_Executable_DeserializeAndLoad_Args dargs{};
+    // Compatible with both PJRT 0.70 (CUDA) and PJRT 0.75+ (TPU)
+    dargs.struct_size = PJRT_STRUCT_SIZE(PJRT_Executable_DeserializeAndLoad_Args,
+                                         overridden_serialized_compile_options_size);
+    dargs.client = client_;
+    dargs.serialized_executable = bytes.data();
+    dargs.serialized_executable_size = bytes.size();
+    dargs.overridden_serialized_compile_options = compile_opts.empty() ? nullptr : compile_opts.data();
+    dargs.overridden_serialized_compile_options_size = compile_opts.size();
+
+    if (PJRT_Error* err = api_->PJRT_Executable_DeserializeAndLoad(&dargs)) {
+        (void)consume_error(err);
+        // Stale or incompatible plugin version cache — evict quietly and recompile fresh
+        std::filesystem::remove(path, ec);
+        return nullptr;
+    }
+    if (dargs.loaded_executable) {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        cache_hits_++;
+    }
+    return dargs.loaded_executable;
+}
+
+void HavenTpuPjrtBackend::try_save_cached_executable(const std::string& cache_key,
+                                                     PJRT_LoadedExecutable* exec) {
+    if (!initialized_ || !exec || !api_ ||
+        !api_->PJRT_LoadedExecutable_GetExecutable ||
+        !api_->PJRT_Executable_Serialize ||
+        !api_->PJRT_Executable_Destroy) {
+        return;
+    }
+    std::string dir;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        dir = disk_cache_dir_;
+    }
+    if (dir.empty() || cache_key.empty()) return;
+
+    PJRT_LoadedExecutable_GetExecutable_Args gargs{};
+    gargs.struct_size = PJRT_LoadedExecutable_GetExecutable_Args_STRUCT_SIZE;
+    gargs.loaded_executable = exec;
+    if (PJRT_Error* err = api_->PJRT_LoadedExecutable_GetExecutable(&gargs)) {
+        (void)consume_error(err);
+        return;
+    }
+    if (!gargs.executable) return;
+
+    PJRT_Executable_Serialize_Args sargs{};
+    sargs.struct_size = PJRT_Executable_Serialize_Args_STRUCT_SIZE;
+    sargs.executable = gargs.executable;
+    PJRT_Error* serr = api_->PJRT_Executable_Serialize(&sargs);
+    if (!serr && sargs.serialized_bytes && sargs.serialized_bytes_size > 0) {
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        if (!ec) {
+            const auto final_path = std::filesystem::path(dir) / (cache_key + ".pjrtbin");
+            const auto tmp_path = std::filesystem::path(dir) / (cache_key + ".pjrtbin.tmp." + std::to_string(::getpid()));
+            std::ofstream ofs(tmp_path, std::ios::binary | std::ios::trunc);
+            if (ofs) {
+                ofs.write(sargs.serialized_bytes, static_cast<std::streamsize>(sargs.serialized_bytes_size));
+                ofs.close();
+                if (ofs) {
+                    std::filesystem::rename(tmp_path, final_path, ec);
+                }
+                if (ec) std::filesystem::remove(tmp_path, ec);
+            }
+        }
+    } else if (serr) {
+        (void)consume_error(serr);
+    }
+
+    if (sargs.serialized_executable && sargs.serialized_executable_deleter) {
+        sargs.serialized_executable_deleter(sargs.serialized_executable);
+    }
+    PJRT_Executable_Destroy_Args dargs{};
+    dargs.struct_size = PJRT_Executable_Destroy_Args_STRUCT_SIZE;
+    dargs.executable = gargs.executable;
+    if (PJRT_Error* derr = api_->PJRT_Executable_Destroy(&dargs)) {
+        (void)consume_error(derr);
+    }
+}
+
 PJRT_LoadedExecutable* HavenTpuPjrtBackend::compile_stablehlo(const std::string& mlir_code, int device_ordinal) {
     if (!initialized_ || mlir_code.empty()) return nullptr;
+
+    const bool portable = (device_ordinal < 0);
+    // When device_ordinal == -1, compile a portable executable usable on ANY addressable chip!
+    std::string compile_opts = portable
+        ? encode_compile_options_proto(-1, 1, 1, /*portable=*/true)
+        : encode_compile_options_proto(device_ordinal, 1, 1, /*portable=*/false);
+
+    const std::string dev_kind = device_infos_.empty() ? "" : device_infos_[0].kind;
+    const std::string ckey = compute_stablehlo_cache_key(
+        platform_name_, platform_version_, dev_kind, 1, device_ordinal, portable, mlir_code);
+    if (PJRT_LoadedExecutable* cached = try_load_cached_executable(ckey, compile_opts)) {
+        return cached;
+    }
 
     std::string code_copy = mlir_code;
     static constexpr const char kFormat[] = "mlir";
@@ -603,11 +832,6 @@ PJRT_LoadedExecutable* HavenTpuPjrtBackend::compile_stablehlo(const std::string&
     prog.code_size = code_copy.size();
     prog.format = kFormat;
     prog.format_size = 4;
-
-    // When device_ordinal == -1, compile a portable executable usable on ANY addressable TPU chip!
-    std::string compile_opts = (device_ordinal < 0)
-        ? encode_compile_options_proto(-1, 1, 1, /*portable=*/true)
-        : encode_compile_options_proto(device_ordinal, 1, 1, /*portable=*/false);
 
     PJRT_Client_Compile_Args cargs{};
     cargs.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
@@ -620,6 +844,11 @@ PJRT_LoadedExecutable* HavenTpuPjrtBackend::compile_stablehlo(const std::string&
         last_error_ = "PJRT_Client_Compile failed: " + consume_error(err);
         return nullptr;
     }
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        cache_misses_++;
+    }
+    try_save_cached_executable(ckey, cargs.executable);
     return cargs.executable;
 }
 
@@ -630,6 +859,15 @@ PJRT_LoadedExecutable* HavenTpuPjrtBackend::compile_stablehlo_replicated(const s
         return nullptr;
     }
 
+    std::string compile_opts = encode_compile_options_proto(-1, num_replicas, 1, /*portable=*/false);
+
+    const std::string dev_kind = device_infos_.empty() ? "" : device_infos_[0].kind;
+    const std::string ckey = compute_stablehlo_cache_key(
+        platform_name_, platform_version_, dev_kind, num_replicas, -1, false, mlir_code);
+    if (PJRT_LoadedExecutable* cached = try_load_cached_executable(ckey, compile_opts)) {
+        return cached;
+    }
+
     std::string code_copy = mlir_code;
     static constexpr const char kFormat[] = "mlir";
     PJRT_Program prog{};
@@ -638,8 +876,6 @@ PJRT_LoadedExecutable* HavenTpuPjrtBackend::compile_stablehlo_replicated(const s
     prog.code_size = code_copy.size();
     prog.format = kFormat;
     prog.format_size = 4;
-
-    std::string compile_opts = encode_compile_options_proto(-1, num_replicas, 1, /*portable=*/false);
 
     PJRT_Client_Compile_Args cargs{};
     cargs.struct_size = PJRT_Client_Compile_Args_STRUCT_SIZE;
@@ -652,6 +888,11 @@ PJRT_LoadedExecutable* HavenTpuPjrtBackend::compile_stablehlo_replicated(const s
         last_error_ = "PJRT_Client_Compile(replicated) failed: " + consume_error(err);
         return nullptr;
     }
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        cache_misses_++;
+    }
+    try_save_cached_executable(ckey, cargs.executable);
     return cargs.executable;
 }
 

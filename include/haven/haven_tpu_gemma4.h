@@ -82,8 +82,9 @@ struct TpuGemma4Config {
     int max_seq_len = 2048;        // Static on-chip HBM3 KV cache capacity per sequence slot
     int prefill_chunk_size = 128;  // Max batched prefill bucket (0 = skip prefill graph compilation)
     std::vector<int> prefill_buckets; // Explicit bucket list (empty = auto {128, 32, 16} when prefill_chunk_size >= 128)
-    int num_replicas = 1;          // 1 = single Trillium chip, 2/4/8 = Megatron Tensor-Parallel over Optical ICI
+    int num_replicas = 1;          // 1 = single chip, 2/4/8 = Megatron Tensor-Parallel over Optical ICI / NVLink
     bool use_int8_weights = false; // false = BF16, true = W8A16/W8A8 INT8 + Block-256 Hadamard MoE (~2x HBM3 BW)
+    bool use_int4_weights = false; // true = Native Packed W4A16 Group-128 INT4 (4.25 bpw projections + W8 vocab; overrides use_int8_weights)
     bool use_fp8_kv = false;       // false = BF16 KV cache, true = Scale-Free FP8 E4M3FN KV cache (50% KV HBM3 BW, zero scales, unlocks B=256!)
     bool return_full_logits = false; // true = return [B, vocab] F32 logits, false = on-chip argmax [B] i32 (4B/slot PCIe)
     bool use_onchip_embeddings = false; // true = upload only [B, S] i32 token IDs & gather embeddings on-chip in HBM3
@@ -114,8 +115,15 @@ public:
     HavenTpuGemma4Engine(const HavenTpuGemma4Engine&) = delete;
     HavenTpuGemma4Engine& operator=(const HavenTpuGemma4Engine&) = delete;
 
-    // Check whether a loaded GGUF model is supported by the on-chip TPU StableHLO compiler.
+    // Check whether a loaded GGUF model is supported by the on-chip TPU/GPU StableHLO compiler.
     static bool is_model_supported(const HavenEngine& host_engine, std::string& reason_out);
+
+    // Native W4A16 group-quantized signed INT4 helpers (2 symmetric [-7,+7] nibbles packed per int8_t byte)
+    static int compute_w4_group_size(int cols);
+    static void quantize_f32_to_s4_packed_group(const float* src, int rows, int cols, int group_size,
+                                                int8_t* dst_packed, float* dst_scale);
+    static void dequantize_s4_packed_group_to_f32(const int8_t* src_packed, const float* src_scale,
+                                                  int rows, int cols, int group_size, float* dst);
 
     // Emit textual StableHLO MLIR for any dense transformer graph (decode or slot-targeted prefill).
     static std::string emit_stablehlo_mlir(const TpuModelSpec& spec,

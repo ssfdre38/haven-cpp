@@ -50,9 +50,10 @@ struct TpuMatrixHandle {
     size_t bytes = 0;
 };
 
-// Native C++20 OpenXLA PJRT C API backend dynamically loading Google's libtpu.so.
-// Zero Python runtime dependency; compiles textual StableHLO MLIR directly onto
-// Cloud TPU MXU systolic arrays and manages persistent HBM3 weight buffers.
+// Native C++20 OpenXLA PJRT C API backend dynamically loading Google's libtpu.so
+// or NVIDIA OpenXLA xla_cuda_plugin.so (zero Python runtime dependency).
+// Compiles textual StableHLO MLIR directly onto Cloud TPU MXU systolic arrays
+// or NVIDIA CUDA TensorCores with persistent disk executable caching.
 class HavenTpuPjrtBackend {
 public:
     HavenTpuPjrtBackend();
@@ -61,19 +62,42 @@ public:
     HavenTpuPjrtBackend(const HavenTpuPjrtBackend&) = delete;
     HavenTpuPjrtBackend& operator=(const HavenTpuPjrtBackend&) = delete;
 
-    // Dynamically loads libtpu.so via dlopen and creates a PJRT TPU client.
-    // Returns false cleanly on non-TPU / Windows hosts.
-    bool initialize(const std::string& libtpu_path_override = "");
+    // Dynamically loads libtpu.so or xla_cuda_plugin.so via dlopen and creates a PJRT client.
+    // Pass "cuda" / "gpu" to prefer NVIDIA xla_cuda_plugin.so, or an explicit .so path.
+    // Returns false cleanly on unsupported / Windows hosts.
+    bool initialize(const std::string& plugin_path_override = "");
     void shutdown();
 
     bool is_initialized() const { return initialized_; }
     std::string get_last_error() const { return last_error_; }
     std::string get_platform_name() const { return platform_name_; }
     std::string get_platform_version() const { return platform_version_; }
+    std::string get_loaded_plugin_path() const { return loaded_plugin_path_; }
+    bool is_cuda_platform() const {
+        return platform_name_ == "cuda" || platform_name_ == "gpu" || platform_name_ == "rocm";
+    }
     int get_pjrt_major() const { return pjrt_major_; }
     int get_pjrt_minor() const { return pjrt_minor_; }
     size_t get_device_count() const { return devices_.size(); }
     const std::vector<TpuDeviceInfo>& get_device_infos() const { return device_infos_; }
+
+    // Compiled-executable disk cache (PJRT_Executable_Serialize / DeserializeAndLoad).
+    // Cuts cold CUDA ptxas & TPU XLA startup from 20-310s down to <1s on repeat runs.
+    // Pass "" to disable disk caching, or leave default (~/.cache/haven-cpp/pjrt or HAVEN_PJRT_CACHE_DIR).
+    void set_cache_dir(const std::string& dir);
+    std::string get_cache_dir() const { return disk_cache_dir_; }
+    size_t get_cache_hits() const { return cache_hits_; }
+    size_t get_cache_misses() const { return cache_misses_; }
+
+    // Deterministic 128-bit hex cache key for a StableHLO compilation target (cross-platform testable)
+    static std::string compute_stablehlo_cache_key(const std::string& platform_name,
+                                                   const std::string& platform_version,
+                                                   const std::string& device_kind,
+                                                   int num_replicas,
+                                                   int device_ordinal,
+                                                   bool portable,
+                                                   const std::string& mlir_code);
+    static std::string resolve_default_cache_dir();
 
     // IEEE-754 FP32 <-> BF16 round-to-nearest-even converters (strict-aliasing safe)
     static uint16_t fp32_to_bf16(float f);
@@ -151,15 +175,23 @@ private:
     std::vector<TpuDeviceInfo> device_infos_;
     std::string platform_name_;
     std::string platform_version_;
+    std::string loaded_plugin_path_;
+    std::string disk_cache_dir_;
     std::string last_error_;
     int pjrt_major_ = 0;
     int pjrt_minor_ = 0;
+    size_t cache_hits_ = 0;
+    size_t cache_misses_ = 0;
 
     std::mutex cache_mutex_;
     std::unordered_map<std::string, PJRT_LoadedExecutable*> exec_cache_;
 
     std::string consume_error(void* pjrt_error_ptr);
     bool await_and_destroy_event(PJRT_Event* ev);
+    PJRT_LoadedExecutable* try_load_cached_executable(const std::string& cache_key,
+                                                      const std::string& compile_opts);
+    void try_save_cached_executable(const std::string& cache_key,
+                                    PJRT_LoadedExecutable* exec);
     PJRT_LoadedExecutable* get_or_compile_matmul_nt(int batch_m, int N, int K, int device_index);
     PJRT_LoadedExecutable* get_or_compile_geglu_ffn(int batch_m, int hidden_dim, int emb_dim, int device_index);
 };
