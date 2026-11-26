@@ -2517,7 +2517,7 @@ bool HavenCudaEngine::initialize(const HavenEngine& host_engine, const CudaEngin
     impl_->d_am_out  = static_cast<uint32_t*>(impl_->alloc_gpu(sizeof(uint32_t), scratch_bytes));
 
     const size_t max_in_dim = static_cast<size_t>(std::max({D, impl_->max_F, impl_->max_q_dim}));
-    const size_t q8_blocks = std::max(Smax * static_cast<size_t>(D >> 5), (max_in_dim >> 5) * 8ULL);
+    const size_t q8_blocks = std::max<size_t>(Smax * static_cast<size_t>(D >> 5), (max_in_dim >> 5) * static_cast<size_t>(8));
     impl_->d_x_q8 = static_cast<block_q8_1_gpu*>(impl_->alloc_gpu(q8_blocks * sizeof(block_q8_1_gpu), scratch_bytes));
 
     if (mc.expert_count > 0) {
