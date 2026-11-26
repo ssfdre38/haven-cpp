@@ -5,6 +5,7 @@
 #include "haven/haven_tpu_pjrt.h"
 #include "haven/haven_tpu_gemma4.h"
 #include "haven/haven_tpu_scheduler.h"
+#include "haven/haven_cuda.h"
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -44,6 +45,8 @@ namespace haven {
 
 struct TpuServerOptions {
     bool enable_onchip = false;
+    bool enable_cuda_native = false;
+    bool force_cuda_pjrt = false;
     bool use_int8 = true;
     bool use_int4 = false;
     bool use_fp8_kv = false;
@@ -124,6 +127,7 @@ public:
         tpu_scheduler_.stop();
         tpu_gemma4_.shutdown();
         tpu_backend_.shutdown();
+        cuda_engine_.shutdown();
 #ifdef _WIN32
         WSACleanup();
 #endif
@@ -171,8 +175,10 @@ private:
     HavenTpuPjrtBackend tpu_backend_;
     HavenTpuGemma4Engine tpu_gemma4_;
     TpuContinuousBatchScheduler tpu_scheduler_;
+    HavenCudaEngine cuda_engine_;
     bool is_mlx_active_ = false;
     bool tpu_onchip_active_ = false;
+    bool cuda_native_active_ = false;
     std::atomic<bool> tpu_scheduler_active_{false};
     std::mutex engine_mutex_;
     std::vector<uint32_t> cached_tokens_;
@@ -340,6 +346,8 @@ private:
         tpu_scheduler_.stop();
         tpu_onchip_active_ = false;
         tpu_gemma4_.shutdown();
+        cuda_native_active_ = false;
+        cuda_engine_.shutdown();
         mlx_engine_.unload();
 
         if (!haven_engine_.load_model(target_path)) {
@@ -369,8 +377,29 @@ private:
             }
         }
 
+        // Optional Zero-Compile-Time Native NVIDIA CUDA Backend (--gpu / --cuda, preferred over XLA PJRT when compiled!)
+        if (tpu_opts_.enable_cuda_native && !tpu_opts_.force_cuda_pjrt &&
+            HavenCudaEngine::is_cuda_compiled() && HavenCudaEngine::get_device_count() > 0) {
+            CudaEngineConfig ccfg;
+            ccfg.max_seq_len = std::clamp(tpu_opts_.max_seq_len, 256, 8192);
+            std::cout << "[HavenServer] Initializing Native Zero-Compile-Time CUDA Engine ("
+                      << HavenCudaEngine::get_device_summary(ccfg.device_id)
+                      << ", max_seq=" << ccfg.max_seq_len << ")...\n" << std::flush;
+            if (cuda_engine_.initialize(haven_engine_, ccfg)) {
+                cuda_native_active_ = true;
+                const auto& cm = cuda_engine_.get_metrics();
+                std::cout << "[HavenServer] ✓ Native CUDA Engine ACTIVE (" << cm.device_name
+                          << ", Weights=" << (static_cast<double>(cm.weight_vram_bytes) / (1024.0 * 1024.0 * 1024.0))
+                          << " GiB, KV=" << (static_cast<double>(cm.kv_vram_bytes) / (1024.0 * 1024.0))
+                          << " MiB, Upload=" << cm.upload_ms << " ms, Compile=0.0 ms).\n" << std::flush;
+            } else {
+                std::cerr << "[HavenServer] Native CUDA init failed (" << cuda_engine_.get_last_error()
+                          << ") — falling back to PJRT / AVX2 CPU.\n" << std::flush;
+            }
+        }
+
         // Optional Model-General Full On-Chip Cloud TPU / NVIDIA GPU PJRT Acceleration (--tpu / --gpu / HAVEN_TPU_ONCHIP=1)
-        if (tpu_opts_.enable_onchip) {
+        if (!cuda_native_active_ && tpu_opts_.enable_onchip) {
             const auto& mc = haven_engine_.get_config();
             std::string support_err;
             if (HavenTpuGemma4Engine::is_model_supported(haven_engine_, support_err)) {
@@ -1505,9 +1534,11 @@ private:
             }
         }
 
-        const int max_ctx = tpu_onchip_active_
-            ? std::min<int>(static_cast<int>(cfg.max_context_length), tpu_gemma4_.get_config().max_seq_len)
-            : static_cast<int>(cfg.max_context_length);
+        const int max_ctx = cuda_native_active_
+            ? std::min<int>(static_cast<int>(cfg.max_context_length), cuda_engine_.get_config().max_seq_len)
+            : (tpu_onchip_active_
+                ? std::min<int>(static_cast<int>(cfg.max_context_length), tpu_gemma4_.get_config().max_seq_len)
+                : static_cast<int>(cfg.max_context_length));
         const size_t max_prompt_tokens = std::min<size_t>(4096, static_cast<size_t>(max_ctx > 1 ? max_ctx - 1 : 1));
         auto tokens = haven_engine_.tokenize(prompt, true);
         if (tokens.size() > max_prompt_tokens) {
@@ -1530,7 +1561,7 @@ private:
         }
 
         int active_pos = static_cast<int>(common_prefix);
-        if (!tpu_onchip_active_) {
+        if (!tpu_onchip_active_ && !cuda_native_active_) {
             if (common_prefix == 0) {
                 haven_engine_.get_kv_cache().reset();
             } else {
@@ -1541,6 +1572,13 @@ private:
         std::vector<float> logits(cfg.vocab_size, 0.0f);
 
         auto forward_one_step = [&](uint32_t tok, int pos, bool want_logits) -> bool {
+            if (cuda_native_active_) {
+                if (!cuda_engine_.forward_decode(tok, pos, want_logits ? logits.data() : nullptr, nullptr)) {
+                    std::cerr << "[HavenServer] Native CUDA forward_decode failed: " << cuda_engine_.get_last_error() << "\n" << std::flush;
+                    return false;
+                }
+                return true;
+            }
             if (tpu_onchip_active_) {
                 std::vector<uint32_t> nxt;
                 if (!tpu_gemma4_.decode_step({tok}, pos, want_logits ? &logits : nullptr, nxt)) {
@@ -1555,7 +1593,23 @@ private:
 
         bool aborted_during_prefill = false;
         size_t prefilled_count = common_prefix;
-        if (tpu_onchip_active_) {
+        if (cuda_native_active_) {
+            if (is_client_disconnected(client_sock)) {
+                aborted_during_prefill = true;
+            } else if (common_prefix < tokens.size() && active_pos < max_ctx) {
+                size_t max_new = static_cast<size_t>(max_ctx - active_pos);
+                size_t count = std::min(tokens.size() - common_prefix, max_new);
+                std::vector<uint32_t> suffix(tokens.begin() + common_prefix, tokens.begin() + common_prefix + count);
+                if (!cuda_engine_.forward_prefill(suffix, active_pos, logits.data(), nullptr)) {
+                    std::string err_body = "{\"error\":{\"message\":\"Native CUDA prefill failed: " + escape_json_string(cuda_engine_.get_last_error()) + "\",\"type\":\"cuda_engine_error\"}}";
+                    send_http_response(client_sock, "500 Internal Server Error", "application/json; charset=utf-8", err_body, cors_hdr);
+                    cached_tokens_.clear();
+                    return;
+                }
+                active_pos += static_cast<int>(count);
+                prefilled_count = common_prefix + count;
+            }
+        } else if (tpu_onchip_active_) {
             if (is_client_disconnected(client_sock)) {
                 aborted_during_prefill = true;
             } else if (common_prefix < tokens.size() && active_pos < max_ctx) {
@@ -1592,7 +1646,7 @@ private:
 
         if (aborted_during_prefill) {
             cached_tokens_.assign(tokens.begin(), tokens.begin() + prefilled_count);
-            if (!tpu_onchip_active_) haven_engine_.get_kv_cache().truncate(active_pos);
+            if (!tpu_onchip_active_ && !cuda_native_active_) haven_engine_.get_kv_cache().truncate(active_pos);
             return;
         }
 
@@ -1785,7 +1839,20 @@ private:
                         // Feed tool output back into KV Cache
                         std::string tool_turn = "<turn|>\n<|turn>tool\n" + tool_output + "<turn|>\n<|turn>model\n";
                         auto tool_tokens = haven_engine_.tokenize(tool_turn, false);
-                        if (tpu_onchip_active_) {
+                        if (cuda_native_active_) {
+                            size_t avail = static_cast<size_t>(std::max(0, max_ctx - active_pos));
+                            size_t cnt = std::min(tool_tokens.size(), avail);
+                            if (cnt > 0) {
+                                std::vector<uint32_t> chunk(tool_tokens.begin(), tool_tokens.begin() + cnt);
+                                if (cuda_engine_.forward_prefill(chunk, active_pos, logits.data(), nullptr)) {
+                                    active_pos += static_cast<int>(cnt);
+                                    for (uint32_t tk : chunk) {
+                                        cached_tokens_.push_back(tk);
+                                        context_history.push_back(tk);
+                                    }
+                                }
+                            }
+                        } else if (tpu_onchip_active_) {
                             size_t avail = static_cast<size_t>(std::max(0, max_ctx - active_pos));
                             size_t cnt = std::min(tool_tokens.size(), avail);
                             if (cnt > 0) {
@@ -1940,7 +2007,20 @@ private:
 
                         std::string tool_turn = "<turn|>\n<|turn>tool\n" + tool_output + "<turn|>\n<|turn>model\n";
                         auto tool_tokens = haven_engine_.tokenize(tool_turn, false);
-                        if (tpu_onchip_active_) {
+                        if (cuda_native_active_) {
+                            size_t avail = static_cast<size_t>(std::max(0, max_ctx - active_pos));
+                            size_t cnt = std::min(tool_tokens.size(), avail);
+                            if (cnt > 0) {
+                                std::vector<uint32_t> chunk(tool_tokens.begin(), tool_tokens.begin() + cnt);
+                                if (cuda_engine_.forward_prefill(chunk, active_pos, logits.data(), nullptr)) {
+                                    active_pos += static_cast<int>(cnt);
+                                    for (uint32_t tk : chunk) {
+                                        cached_tokens_.push_back(tk);
+                                        context_history.push_back(tk);
+                                    }
+                                }
+                            }
+                        } else if (tpu_onchip_active_) {
                             size_t avail = static_cast<size_t>(std::max(0, max_ctx - active_pos));
                             size_t cnt = std::min(tool_tokens.size(), avail);
                             if (cnt > 0) {
@@ -2364,9 +2444,11 @@ private:
                 }
             } catch (...) {}
 
-            std::string active_backend = tpu_active
-                ? (tpu_scheduler_active_.load(std::memory_order_relaxed) ? "tpu_onchip_batched" : "tpu_onchip")
-                : (is_mlx_active_ ? "apple_mlx" : "cpu_avx2");
+            std::string active_backend = cuda_native_active_
+                ? "cuda_native"
+                : (tpu_active
+                    ? (tpu_scheduler_active_.load(std::memory_order_relaxed) ? "tpu_onchip_batched" : "tpu_onchip")
+                    : (is_mlx_active_ ? "apple_mlx" : "cpu_avx2"));
             TpuSchedulerStats sstats = tpu_scheduler_active_.load(std::memory_order_relaxed)
                 ? tpu_scheduler_.get_stats() : TpuSchedulerStats{};
             int tpu_batch_cap = tpu_active ? tpu_gemma4_.get_config().batch_size : 0;
@@ -2513,12 +2595,15 @@ private:
             send_http_response(sock, "200 OK", "application/json; charset=utf-8", json_body, cors_hdr);
         }
         else if (path == "/health") {
-            std::string backend_name = tpu_onchip_active_
-                ? (tpu_scheduler_active_.load(std::memory_order_relaxed) ? "tpu_onchip_batched" : "tpu_onchip")
-                : (is_mlx_active_ ? "apple_mlx" : "cpu_avx2");
+            std::string backend_name = cuda_native_active_
+                ? "cuda_native"
+                : (tpu_onchip_active_
+                    ? (tpu_scheduler_active_.load(std::memory_order_relaxed) ? "tpu_onchip_batched" : "tpu_onchip")
+                    : (is_mlx_active_ ? "apple_mlx" : "cpu_avx2"));
             int tpu_slots = tpu_onchip_active_ ? tpu_gemma4_.get_config().batch_size : 1;
             std::string resp_body = "{\"status\":\"sovereign_online\",\"engine\":\"haven-cpp-v2.0\",\"backend\":\"" + backend_name
-                                  + "\",\"tpu_onchip\":" + std::string(tpu_onchip_active_ ? "true" : "false")
+                                  + "\",\"cuda_native\":" + std::string(cuda_native_active_ ? "true" : "false")
+                                  + ",\"tpu_onchip\":" + std::string(tpu_onchip_active_ ? "true" : "false")
                                   + ",\"tpu_batch_capacity\":" + std::to_string(tpu_slots) + ",\"gateway\":true}";
             send_http_response(sock, "200 OK", "application/json; charset=utf-8", resp_body, cors_hdr);
         }
@@ -2700,6 +2785,9 @@ private:
             const bool restart_sched = tpu_scheduler_active_.exchange(false, std::memory_order_acq_rel);
             if (restart_sched) tpu_scheduler_.stop();
             haven_engine_.get_kv_cache().reset();
+            if (cuda_native_active_) {
+                cuda_engine_.reset_kv_cache();
+            }
             if (tpu_onchip_active_) {
                 tpu_gemma4_.reset_kv_cache();
                 if (restart_sched && tpu_scheduler_.start(&tpu_gemma4_, &haven_engine_.get_tokenizer(), haven_engine_.get_sampler())) {
@@ -3048,7 +3136,8 @@ int main(int argc, char** argv) {
                       << "  --api-key <key>           Require Authorization: Bearer <key> on API routes (or HAVEN_API_KEY)\n"
                       << "  --model <path>            GGUF or MLX model path to load\n"
                       << "  --tpu, --tpu-onchip       Serve dense/MoE transformers on Cloud TPU (libtpu.so) or auto-fallback CUDA\n"
-                      << "  --gpu, --cuda             Serve dense/MoE transformers directly on NVIDIA CUDA GPU via xla_cuda_plugin.so\n"
+                      << "  --gpu, --cuda             Serve on NVIDIA CUDA GPU (native zero-compile CUDA if compiled, else PJRT)\n"
+                      << "  --cuda-pjrt               Force OpenXLA PJRT CUDA plugin (xla_cuda_plugin.so) instead of native CUDA\n"
                       << "  --tpu-replicas <1|2|4|8>  Tensor-parallel chips over Optical ICI / NVLink (default: auto)\n"
                       << "  --tpu-batch <1..256>      Multi-tenant HBM3/VRAM KV slots (1=interactive, 16..256=continuous batching)\n"
                       << "  --tpu-bf16 / --tpu-int8   Weight precision (BF16 or Hadamard W8-INT8, default: --tpu-int8)\n"
@@ -3073,6 +3162,12 @@ int main(int argc, char** argv) {
         } else if (arg == "--tpu" || arg == "--tpu-onchip") {
             tpu_opts.enable_onchip = true;
         } else if (arg == "--gpu" || arg == "--cuda") {
+            tpu_opts.enable_cuda_native = true;
+            tpu_opts.enable_onchip = true;
+            if (tpu_opts.libtpu_path.empty()) tpu_opts.libtpu_path = "cuda";
+        } else if (arg == "--cuda-pjrt") {
+            tpu_opts.enable_cuda_native = false;
+            tpu_opts.force_cuda_pjrt = true;
             tpu_opts.enable_onchip = true;
             if (tpu_opts.libtpu_path.empty()) tpu_opts.libtpu_path = "cuda";
         } else if (arg == "--tpu-bf16") {

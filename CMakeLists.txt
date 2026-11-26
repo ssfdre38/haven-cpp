@@ -4,12 +4,27 @@ project(haven_cpp CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+option(HAVEN_ENABLE_CUDA "Build native NVIDIA CUDA GPU backend (IQ4_XS/Q-block GEMV + cuBLAS Tensor Core prefill)" OFF)
+if (HAVEN_ENABLE_CUDA)
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90")
+    endif()
+    add_compile_definitions(HAVEN_HAS_CUDA)
+endif()
+
 # Enable AVX2, FMA, F16C, OpenMP and Aggressive Optimization
 if (MSVC)
-    add_compile_options(/O2 /arch:AVX2 /W4 /openmp /utf-8)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/O2> $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2> $<$<COMPILE_LANGUAGE:CXX>:/W4> $<$<COMPILE_LANGUAGE:CXX>:/openmp> $<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
     add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS)
 else()
-    add_compile_options(-O3 -march=native -mavx2 -mfma -mf16c -fopenmp -Wall -Wextra)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-O3> $<$<COMPILE_LANGUAGE:CXX>:-march=native> $<$<COMPILE_LANGUAGE:CXX>:-mavx2> $<$<COMPILE_LANGUAGE:CXX>:-mfma> $<$<COMPILE_LANGUAGE:CXX>:-mf16c> $<$<COMPILE_LANGUAGE:CXX>:-fopenmp> $<$<COMPILE_LANGUAGE:CXX>:-Wall> $<$<COMPILE_LANGUAGE:CXX>:-Wextra>)
+    if (HAVEN_ENABLE_CUDA)
+        add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-O3> $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+    endif()
     add_link_options(-fopenmp)
     if (WIN32)
         add_compile_definitions(NOMINMAX)
@@ -72,6 +87,12 @@ set(HAVEN_CORE_SRCS
     src/haven_cluster.cpp
 )
 
+if (HAVEN_ENABLE_CUDA)
+    list(APPEND HAVEN_CORE_SRCS src/haven_cuda.cu)
+else()
+    list(APPEND HAVEN_CORE_SRCS src/haven_cuda_stub.cpp)
+endif()
+
 # Core Static Engine Library (builds all core sources once for fast compilation)
 add_library(haven_core STATIC
     ${HAVEN_CORE_SRCS}
@@ -86,6 +107,9 @@ if (WIN32)
 else()
     target_link_libraries(haven_core PUBLIC pthread dl)
 endif()
+if (HAVEN_ENABLE_CUDA)
+    target_link_libraries(haven_core PUBLIC CUDA::cudart CUDA::cublas)
+endif()
 
 # Shared Library (haven_engine.dll / libhaven.so) for C# Gemmi & Android JNI
 add_library(haven_engine SHARED
@@ -99,6 +123,9 @@ if (WIN32)
     endif()
 else()
     target_link_libraries(haven_engine PUBLIC pthread dl)
+endif()
+if (HAVEN_ENABLE_CUDA)
+    target_link_libraries(haven_engine PUBLIC CUDA::cudart CUDA::cublas)
 endif()
 
 # Standalone CLI Executable & Benchmark Runner
@@ -172,6 +199,10 @@ target_link_libraries(test-tpu-pjrt-bench PRIVATE haven_core)
 # Full On-Chip Transformer StableHLO Persistent HBM3 TPU Engine Benchmark
 add_executable(test-tpu-gemma4-onchip tests/test_tpu_gemma4_onchip.cpp)
 target_link_libraries(test-tpu-gemma4-onchip PRIVATE haven_core)
+
+# Native Zero-Compile-Time CUDA Engine Verification & Benchmark
+add_executable(test-cuda-gemma4 tests/test_cuda_gemma4.cpp)
+target_link_libraries(test-cuda-gemma4 PRIVATE haven_core)
 
 # Multi-Tenant TPU Continuous-Batching Scheduler Unit Test
 add_executable(test-tpu-scheduler tests/test_tpu_scheduler.cpp)

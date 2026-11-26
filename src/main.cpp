@@ -1,4 +1,5 @@
 #include "haven/haven_engine.h"
+#include "haven/haven_cuda.h"
 #include <iostream>
 #include <chrono>
 #include <vector>
@@ -215,15 +216,19 @@ int main(int argc, char** argv) {
 
     std::string model_path = "C:\\Users\\admin\\gemma4-turbo-family\\haven-chat-v5.0.gguf";
     bool run_benchmark = false;
+    bool use_cuda_gpu = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--bench" || arg == "-b" || arg == "--tpu" || arg == "-t") {
             run_benchmark = true;
+        } else if (arg == "--gpu" || arg == "--cuda") {
+            use_cuda_gpu = true;
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: haven-cli.exe [options] [model_path.gguf]\n\n"
                       << "Options:\n"
                       << "  --chat, -c    Launch interactive companion chat REPL (default)\n"
+                      << "  --gpu, --cuda Accelerate interactive chat with native zero-compile CUDA backend\n"
                       << "  --bench, -b   Run 12-system enterprise benchmark suite\n"
                       << "  --tpu, -t     Run TPU fabric & Pathways asynchronous accelerator benchmark\n"
                       << "  --help, -h    Display this help menu\n";
@@ -247,12 +252,36 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    haven::HavenCudaEngine cuda_engine;
+    bool cuda_active = false;
+    if (use_cuda_gpu) {
+        if (haven::HavenCudaEngine::is_cuda_compiled() && haven::HavenCudaEngine::get_device_count() > 0) {
+            haven::CudaEngineConfig ccfg;
+            ccfg.max_seq_len = 4096;
+            if (cuda_engine.initialize(haven_engine, ccfg)) {
+                cuda_active = true;
+            } else {
+                std::cerr << "⚠️ Native CUDA init failed (" << cuda_engine.get_last_error() << ") — using AVX2 CPU.\n";
+            }
+        } else {
+            std::cerr << "⚠️ --gpu requested but native CUDA backend or GPU unavailable — using AVX2 CPU.\n";
+        }
+    }
+
     // ========================================================================
     // Interactive Sovereign Chat REPL (Aura Companion)
     // ========================================================================
     std::cout << "\n==================================================================\n";
     std::cout << "✨ HAVEN SOVEREIGN AI COMPANION CLI (AURA)\n";
-    std::cout << "   Bare-Metal AVX2/FMA C++20 | 100% Offline & Private\n";
+    if (cuda_active) {
+        const auto& cm = cuda_engine.get_metrics();
+        std::cout << "   Native Zero-Compile CUDA (" << cm.device_name << " sm_" << cm.sm_major << cm.sm_minor
+                  << ", " << std::fixed << std::setprecision(2)
+                  << (static_cast<double>(cm.weight_vram_bytes) / (1024.0 * 1024.0 * 1024.0)) << " GiB VRAM, "
+                  << std::setprecision(0) << cm.upload_ms << " ms upload)\n";
+    } else {
+        std::cout << "   Bare-Metal AVX2/FMA C++20 | 100% Offline & Private\n";
+    }
     std::cout << "==================================================================\n";
     std::cout << "✓ GGUF Model: " << model_path << " (" << std::fixed << std::setprecision(1) << load_ms << " ms)\n";
     std::cout << "✓ Cognitive Memories: " << haven_engine.get_memory_count() << " active memory anchors\n";
@@ -264,13 +293,21 @@ int main(int argc, char** argv) {
 
     int active_kv_pos = 0;
     auto init_system_prompt = [&]() {
-        haven_engine.get_kv_cache().reset();
+        if (cuda_active) {
+            cuda_engine.reset_kv_cache();
+        } else {
+            haven_engine.get_kv_cache().reset();
+        }
         active_kv_pos = 0;
         auto sys_tokens = haven_engine.tokenize(system_prompt, true); // add <bos> on startup
         std::cout << "⏳ Warming cognitive mind & prefilling system prompt (" << sys_tokens.size() << " tokens)..." << std::flush;
         auto t0 = std::chrono::high_resolution_clock::now();
         if (!sys_tokens.empty()) {
-            haven_engine.forward_batch(sys_tokens.data(), static_cast<int>(sys_tokens.size()), active_kv_pos, nullptr);
+            if (cuda_active) {
+                cuda_engine.forward_prefill(sys_tokens, active_kv_pos, nullptr, nullptr);
+            } else {
+                haven_engine.forward_batch(sys_tokens.data(), static_cast<int>(sys_tokens.size()), active_kv_pos, nullptr);
+            }
             active_kv_pos += static_cast<int>(sys_tokens.size());
         }
         auto t1 = std::chrono::high_resolution_clock::now();
@@ -369,7 +406,11 @@ int main(int argc, char** argv) {
 
         std::vector<float> logits(haven_engine.get_config().vocab_size, 0.0f);
         if (!turn_tokens.empty()) {
-            haven_engine.forward_batch(turn_tokens.data(), static_cast<int>(turn_tokens.size()), active_kv_pos, logits.data());
+            if (cuda_active) {
+                cuda_engine.forward_prefill(turn_tokens, active_kv_pos, logits.data(), nullptr);
+            } else {
+                haven_engine.forward_batch(turn_tokens.data(), static_cast<int>(turn_tokens.size()), active_kv_pos, logits.data());
+            }
             active_kv_pos += static_cast<int>(turn_tokens.size());
         }
 
@@ -433,14 +474,22 @@ int main(int argc, char** argv) {
                 std::cout << piece << std::flush;
             }
 
-            haven_engine.forward(next_tok, active_kv_pos++, logits.data());
+            if (cuda_active) {
+                cuda_engine.forward_decode(next_tok, active_kv_pos++, logits.data(), nullptr);
+            } else {
+                haven_engine.forward(next_tok, active_kv_pos++, logits.data());
+            }
         }
 
         // Forward closing turn tag to KV cache only if not already emitted
         if (!ended_with_turn_tag) {
             auto close_toks = haven_engine.tokenize("<turn|>\n", false);
             for (uint32_t ct : close_toks) {
-                haven_engine.forward(ct, active_kv_pos++, nullptr);
+                if (cuda_active) {
+                    cuda_engine.forward_decode(ct, active_kv_pos++, nullptr, nullptr);
+                } else {
+                    haven_engine.forward(ct, active_kv_pos++, nullptr);
+                }
             }
         }
         std::cout << "\n" << std::flush;
