@@ -38,7 +38,8 @@ HAVEN_MOD_EXPORT int haven_backend_probe_runtime(HavenBackendProbeResult* out) {
         "/opt/tpu/libtpu.so"
     };
     for (const char* p : cands) {
-        if (p && p[0] != '\0' && std::filesystem::exists(p)) {
+        std::error_code ec;
+        if (p && p[0] != '\0' && std::filesystem::exists(p, ec)) {
             out->available = 1u;
             out->device_count = 1u;
             out->total_mem_bytes = 32ULL * 1024ULL * 1024ULL * 1024ULL;

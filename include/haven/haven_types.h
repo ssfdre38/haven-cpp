@@ -24,14 +24,23 @@ enum class QuantType : uint32_t {
     Q5_K = 13,
     Q6_K = 14,
     Q8_K = 15,
-    IQ4_NL = 20,
-    IQ4_XS = 23,
-    I8   = 24,
-    I16  = 25,
-    I32  = 26,
-    I64  = 27,
-    F64  = 28,
-    BF16 = 30,
+    IQ2_XXS = 16,
+    IQ2_XS  = 17,
+    IQ3_XXS = 18,
+    IQ1_S   = 19,
+    IQ4_NL  = 20,
+    IQ3_S   = 21,
+    IQ2_S   = 22,
+    IQ4_XS  = 23,
+    I8      = 24,
+    I16     = 25,
+    I32     = 26,
+    I64     = 27,
+    F64     = 28,
+    IQ1_M   = 29,
+    BF16    = 30,
+    TQ1_0   = 34,
+    TQ2_0   = 35,
     COUNT
 };
 
@@ -157,12 +166,15 @@ struct ModelConfig {
     uint32_t head_dim = 0;
     uint32_t head_dim_swa = 0;
     uint32_t max_context_length = 131072;
-    float rope_freq_base = 1000000.0f;
+    float rope_freq_base = 10000.0f;
     float rope_freq_base_swa = 10000.0f;
+    bool  has_rope_freq_base_swa = false;
     float rope_freq_scale = 1.0f;
-    uint32_t rope_dimension_count = 512;
-    uint32_t rope_dimension_count_swa = 256;
+    uint32_t rope_dimension_count = 0;
+    uint32_t rope_dimension_count_swa = 0;
+    bool  is_neox_rope = true;
     float rms_norm_eps = 1e-5f;
+    float query_pre_attn_scalar = 0.0f;
     uint32_t sliding_window = 0;
     uint32_t shared_kv_layers = 0;
     bool has_shared_kv_layers_kv = false;
@@ -175,6 +187,7 @@ struct ModelConfig {
     float final_logit_softcapping = 0.0f;
     float attn_logit_softcapping = 0.0f;
     bool is_gemma = false;
+    bool is_gemma4 = false;
     FfnActivation ffn_activation = FfnActivation::SILU;
 
     // Gemma 4.5 Turbo Baked Architecture Metadata (0 / false for standard unmodified GGUFs)

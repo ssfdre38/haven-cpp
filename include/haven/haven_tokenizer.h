@@ -48,6 +48,7 @@ private:
     uint32_t pad_token_ = 0;
     uint32_t unk_token_ = 3;
     bool     add_space_prefix_ = true;
+    bool     is_gpt2_bpe_ = false;
 };
 
 } // namespace haven

@@ -13,6 +13,7 @@
 #include "../include/haven_posture_sway.hpp"
 #include <iostream>
 #include <cassert>
+#include "haven/haven_test_check.h"
 #include <chrono>
 #include <vector>
 #include <cmath>

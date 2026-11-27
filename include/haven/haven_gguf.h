@@ -12,6 +12,8 @@ class GgufLoader {
 public:
     GgufLoader();
     ~GgufLoader();
+    GgufLoader(const GgufLoader&) = delete;
+    GgufLoader& operator=(const GgufLoader&) = delete;
 
     bool load_file(const std::string& filepath);
     void close();

@@ -8,6 +8,8 @@
 #include <thread>
 #include <filesystem>
 #include <unordered_set>
+#include <cctype>
+#include <cerrno>
 
 namespace haven {
 
@@ -238,7 +240,6 @@ bool McpProcessBridge::start() {
 
 void McpProcessBridge::stop() {
     std::lock_guard<std::recursive_mutex> lock(io_mutex_);
-    if (!is_running_) return;
 
 #ifdef _WIN32
     if (h_child_stdin_wr_) {
@@ -253,19 +254,30 @@ void McpProcessBridge::stop() {
         TerminateProcess(proc_info_.hProcess, 0);
         WaitForSingleObject(proc_info_.hProcess, 500);
         CloseHandle(proc_info_.hProcess);
-        CloseHandle(proc_info_.hThread);
+        if (proc_info_.hThread) CloseHandle(proc_info_.hThread);
         proc_info_ = {};
     }
 #else
-    if (stdin_fd_ >= 0) close(stdin_fd_);
-    if (stdout_fd_ >= 0) close(stdout_fd_);
+    if (stdin_fd_ >= 0) { close(stdin_fd_); stdin_fd_ = -1; }
+    if (stdout_fd_ >= 0) { close(stdout_fd_); stdout_fd_ = -1; }
     if (child_pid_ > 0) {
         kill(child_pid_, SIGTERM);
-        waitpid(child_pid_, nullptr, WNOHANG);
+        int status = 0;
+        bool reaped = false;
+        for (int i = 0; i < 30; ++i) {
+            pid_t w = waitpid(child_pid_, &status, WNOHANG);
+            if (w == child_pid_ || (w < 0 && errno == ECHILD)) {
+                reaped = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (!reaped) {
+            kill(child_pid_, SIGKILL);
+            waitpid(child_pid_, &status, 0);
+        }
+        child_pid_ = -1;
     }
-    stdin_fd_ = -1;
-    stdout_fd_ = -1;
-    child_pid_ = -1;
 #endif
 
     is_running_ = false;
@@ -330,6 +342,10 @@ bool McpProcessBridge::read_json_line(std::string& out_line, int timeout_ms) {
             return false;
         }
 #else
+        if (stdout_fd_ < 0 || stdout_fd_ >= FD_SETSIZE) {
+            is_running_ = false;
+            return false;
+        }
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(stdout_fd_, &fds);
@@ -498,12 +514,33 @@ bool McpProcessBridge::call_tool(const std::string& tool_name, const std::string
         return false;
     }
 
-    std::string target_id_str = "\"id\":" + std::to_string(call_id);
+    auto matches_jsonrpc_id = [](const std::string& line, int expected_id) -> bool {
+        const std::string id_num = std::to_string(expected_id);
+        size_t pos = 0;
+        while ((pos = line.find("\"id\"", pos)) != std::string::npos) {
+            size_t cur = pos + 4;
+            while (cur < line.size() && (line[cur] == ' ' || line[cur] == '\t')) ++cur;
+            if (cur < line.size() && line[cur] == ':') {
+                ++cur;
+                while (cur < line.size() && (line[cur] == ' ' || line[cur] == '\t')) ++cur;
+                if (cur + id_num.size() <= line.size() &&
+                    line.compare(cur, id_num.size(), id_num) == 0) {
+                    size_t after = cur + id_num.size();
+                    if (after >= line.size() || !std::isdigit(static_cast<unsigned char>(line[after]))) {
+                        return true;
+                    }
+                }
+            }
+            pos += 4;
+        }
+        return false;
+    };
+
     std::string resp;
     bool got_res = false;
 
     while (read_json_line(resp, timeout_ms)) {
-        if (resp.find(target_id_str) != std::string::npos) {
+        if (matches_jsonrpc_id(resp, call_id)) {
             got_res = true;
             break;
         }
@@ -752,8 +789,24 @@ bool McpManager::restart_server(const std::string& name) {
     auto it = servers_.find(name);
     if (it != servers_.end()) {
         it->second->stop();
+        for (auto t_it = tools_.begin(); t_it != tools_.end();) {
+            if (t_it->second.server_name == name) {
+                t_it = tools_.erase(t_it);
+            } else {
+                ++t_it;
+            }
+        }
         std::vector<McpToolInfo> server_tools;
-        return it->second->discover_tools(server_tools);
+        if (it->second->discover_tools(server_tools)) {
+            for (const auto& t : server_tools) {
+                tools_[t.full_action_name] = t;
+                if (tools_.find(t.tool_name) == tools_.end()) {
+                    tools_[t.tool_name] = t;
+                }
+            }
+            return true;
+        }
+        return false;
     }
     return false;
 }

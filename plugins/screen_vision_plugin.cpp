@@ -35,8 +35,10 @@ public:
     }
 
     void on_prompt_prefill(std::string& prompt, std::vector<uint32_t>& tokens) override {
+        (void)tokens;
 #ifdef _WIN32
         HWND hwnd = GetForegroundWindow();
+        if (!hwnd) return;
         char title[256] = {0};
         GetWindowTextA(hwnd, title, sizeof(title));
 
@@ -71,6 +73,10 @@ public:
 #ifdef _WIN32
         if (action == "get_active_window") {
             HWND hwnd = GetForegroundWindow();
+            if (!hwnd) {
+                output = "👁️ No foreground active window detected.";
+                return true;
+            }
             char title[512] = {0};
             GetWindowTextA(hwnd, title, sizeof(title));
 
@@ -83,7 +89,7 @@ public:
                 CloseHandle(hProc);
             }
 
-            RECT rect;
+            RECT rect{};
             GetWindowRect(hwnd, &rect);
 
             std::ostringstream ss;

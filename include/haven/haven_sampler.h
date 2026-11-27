@@ -4,6 +4,8 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
+#include <limits>
 #include <random>
 
 namespace haven {
@@ -52,6 +54,13 @@ private:
     std::vector<float> persona_embedding_;
     std::unordered_map<uint32_t, float> token_penalties_;
     std::vector<std::vector<uint32_t>> lemma_family_;
+    std::unordered_set<uint32_t> control_token_ids_;
+    uint32_t tok_space_lparen_ = std::numeric_limits<uint32_t>::max();
+    uint32_t tok_lparen_       = std::numeric_limits<uint32_t>::max();
+    uint32_t tok_hyphen_       = std::numeric_limits<uint32_t>::max();
+    uint32_t tok_space_star_   = std::numeric_limits<uint32_t>::max();
+    uint32_t tok_star_         = std::numeric_limits<uint32_t>::max();
+    bool vocab_initialized_    = false;
     std::mt19937 rng_;
 };
 

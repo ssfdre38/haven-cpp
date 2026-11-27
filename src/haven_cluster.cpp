@@ -405,22 +405,24 @@ bool ClusterTransportRing::connect_to_peer(uint32_t node_id, const std::string& 
 }
 
 void ClusterTransportRing::stop() {
-    if (!is_running_.exchange(false)) {
-        return;
-    }
+    is_running_.store(false);
 
-    inbound_ring_->close();
+    if (inbound_ring_) {
+        inbound_ring_->close();
+    }
 
     // 1. Shutdown all peer sockets to immediately unblock any blocking recv calls
     {
         std::lock_guard<std::mutex> lock(peers_mutex_);
         for (auto& [id, sess] : peer_sessions_) {
             socket_t s = static_cast<socket_t>(sess.socket_handle);
+            if (s != HAVEN_INVALID_SOCKET) {
 #if defined(_WIN32)
-            ::shutdown(s, SD_BOTH);
+                ::shutdown(s, SD_BOTH);
 #else
-            ::shutdown(s, SHUT_RDWR);
+                ::shutdown(s, SHUT_RDWR);
 #endif
+            }
         }
     }
 
@@ -435,7 +437,7 @@ void ClusterTransportRing::stop() {
         server_thread_.join();
     }
 
-    // 3. Join all client receiver threads cleanly
+    // 3. Join all client receiver threads cleanly (even if connect_to_peer was used without start_server)
     std::vector<std::thread> to_join;
     {
         std::lock_guard<std::mutex> lock(threads_mutex_);
@@ -452,7 +454,10 @@ void ClusterTransportRing::stop() {
     {
         std::lock_guard<std::mutex> lock(peers_mutex_);
         for (auto& [id, sess] : peer_sessions_) {
-            closesocket(static_cast<socket_t>(sess.socket_handle));
+            socket_t s = static_cast<socket_t>(sess.socket_handle);
+            if (s != HAVEN_INVALID_SOCKET) {
+                closesocket(s);
+            }
             HavenSecurity::secure_zero(sess.session_key, sizeof(sess.session_key));
         }
         peer_sessions_.clear();
@@ -489,10 +494,9 @@ bool ClusterTransportRing::send_activation(uint32_t target_node_id, const HavenA
         return false;
     }
 
-    const bool is_protected_data =
-        (frame.header.flags & (FRAME_FLAG_ACTIVATION | FRAME_FLAG_KV_SYNC | FRAME_FLAG_LOGITS)) != 0;
+    const bool is_handshake_frame = (frame.header.flags & FRAME_FLAG_HANDSHAKE) != 0;
 
-    if (has_key && is_protected_data) {
+    if (has_key && !is_handshake_frame) {
         HavenActivationFrameHeader wire_hdr = frame.header;
         wire_hdr.flags |= FRAME_FLAG_ENCRYPTED;
         const size_t pt_bytes = frame.data.size() * sizeof(float);
@@ -660,6 +664,22 @@ void ClusterTransportRing::client_recv_loop(uint64_t socket_handle, uint32_t pee
     uint8_t server_nonce[32] = {0};
     bool challenge_issued = false;
 
+    auto detach_and_close_sock = [&]() {
+        // Erase from peer_sessions_ BEFORE closing the socket so stop() can never double-close it
+        {
+            std::lock_guard<std::mutex> lock(peers_mutex_);
+            auto it = peer_sessions_.find(peer_node_id);
+            if (it != peer_sessions_.end() && it->second.socket_handle == socket_handle) {
+                HavenSecurity::secure_zero(it->second.session_key, sizeof(it->second.session_key));
+                peer_sessions_.erase(it);
+            }
+        }
+        if (sock != HAVEN_INVALID_SOCKET) {
+            closesocket(sock);
+            sock = HAVEN_INVALID_SOCKET;
+        }
+    };
+
     // Immediately issue 256-bit random challenge nonce to inbound peers when cluster token is active
     if (require_auth && !init_token.empty()) {
         HavenSecurity::generate_random_bytes(server_nonce, sizeof(server_nonce));
@@ -672,8 +692,7 @@ void ClusterTransportRing::client_recv_loop(uint64_t socket_handle, uint32_t pee
         if (!send_all(sock, &chal_hdr, sizeof(chal_hdr)) ||
             !send_all(sock, server_nonce, sizeof(server_nonce)))
         {
-            closesocket(sock);
-            sock = HAVEN_INVALID_SOCKET;
+            detach_and_close_sock();
         } else {
             challenge_issued = true;
         }
@@ -691,8 +710,7 @@ void ClusterTransportRing::client_recv_loop(uint64_t socket_handle, uint32_t pee
 #else
             ::shutdown(sock, SHUT_WR);
 #endif
-            closesocket(sock);
-            sock = HAVEN_INVALID_SOCKET;
+            detach_and_close_sock();
         }
     };
 
@@ -724,6 +742,12 @@ void ClusterTransportRing::client_recv_loop(uint64_t socket_handle, uint32_t pee
 
         // Handle Handshake (SHCP v2 Challenge-Response when token active; legacy node-id announce when token empty)
         if (is_handshake) {
+            if (has_aead_session || (challenge_issued && is_authenticated)) {
+                std::cerr << "⛔ [ClusterSecurity] Re-handshake rejected on authenticated session (Node "
+                          << peer_node_id << "). Severing connection.\n";
+                send_reject_and_close();
+                break;
+            }
             uint32_t real_node_id = frame.header.from_node_id;
             std::string active_token = get_cluster_token();
 
@@ -818,11 +842,8 @@ void ClusterTransportRing::client_recv_loop(uint64_t socket_handle, uint32_t pee
             }
         }
 
-        const bool is_protected_data =
-            (frame.header.flags & (FRAME_FLAG_ACTIVATION | FRAME_FLAG_KV_SYNC | FRAME_FLAG_LOGITS)) != 0;
-
-        // Enforce zero plaintext downgrade when AEAD session is established
-        if (has_aead_session && is_protected_data && !is_encrypted) {
+        // Enforce zero plaintext downgrade on ALL non-handshake frames once AEAD session is established
+        if (has_aead_session && !is_encrypted) {
             std::cerr << "⛔ [ClusterSecurity] Plaintext downgrade frame rejected on AEAD session (Node "
                       << peer_node_id << "). Severing connection.\n";
             send_reject_and_close();
@@ -909,18 +930,8 @@ void ClusterTransportRing::client_recv_loop(uint64_t socket_handle, uint32_t pee
     HavenSecurity::secure_zero(session_key, sizeof(session_key));
     HavenSecurity::secure_zero(server_nonce, sizeof(server_nonce));
 
-    // Peer disconnected: clean up under mutex
-    if (is_running_) {
-        std::lock_guard<std::mutex> lock(peers_mutex_);
-        auto it = peer_sessions_.find(peer_node_id);
-        if (it != peer_sessions_.end() && it->second.socket_handle == socket_handle) {
-            HavenSecurity::secure_zero(it->second.session_key, sizeof(it->second.session_key));
-            peer_sessions_.erase(it);
-        }
-        if (sock != HAVEN_INVALID_SOCKET) {
-            closesocket(sock);
-        }
-    }
+    // Peer disconnected or stopping: atomically detach from peer_sessions_ before closing socket
+    detach_and_close_sock();
 }
 
 // ============================================================================
@@ -1213,15 +1224,18 @@ void HavenClusterNode::set_cluster_token(const std::string& token) {
     }
 }
 
-std::string HavenClusterNode::generate_invite_uri(const std::string& host_override) const {
+std::string HavenClusterNode::generate_invite_uri(const std::string& host_override) {
     std::string host = host_override.empty() ? "127.0.0.1" : host_override;
     std::string current_token;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         current_token = cluster_token_;
     }
-    std::string token = current_token.empty() ? HavenSecurity::generate_cluster_token() : current_token;
-    return HavenSecurity::create_invite_uri(host, listen_port_, token);
+    if (current_token.empty()) {
+        current_token = HavenSecurity::generate_cluster_token();
+        set_cluster_token(current_token);
+    }
+    return HavenSecurity::create_invite_uri(host, listen_port_, current_token);
 }
 
 bool HavenClusterNode::init_worker_with_token(uint32_t local_node_id, uint16_t listen_port, 

@@ -69,9 +69,12 @@ public:
             }
 
             int size_needed = WideCharToMultiByte(CP_UTF8, 0, pszText, -1, NULL, 0, NULL, NULL);
-            std::string utf8_text(size_needed, 0);
-            WideCharToMultiByte(CP_UTF8, 0, pszText, -1, &utf8_text[0], size_needed, NULL, NULL);
-            if (!utf8_text.empty() && utf8_text.back() == '\0') utf8_text.pop_back();
+            std::string utf8_text;
+            if (size_needed > 0) {
+                utf8_text.resize(static_cast<size_t>(size_needed), '\0');
+                WideCharToMultiByte(CP_UTF8, 0, pszText, -1, &utf8_text[0], size_needed, NULL, NULL);
+                if (!utf8_text.empty() && utf8_text.back() == '\0') utf8_text.pop_back();
+            }
 
             GlobalUnlock(hData);
             CloseClipboard();
@@ -98,7 +101,12 @@ public:
             EmptyClipboard();
 
             int wlen = MultiByteToWideChar(CP_UTF8, 0, payload.c_str(), -1, NULL, 0);
-            HGLOBAL hGlob = GlobalAlloc(GMEM_MOVEABLE, wlen * sizeof(wchar_t));
+            if (wlen <= 0) {
+                CloseClipboard();
+                output = "📋 [Clipboard] Failed to convert UTF-8 text.";
+                return true;
+            }
+            HGLOBAL hGlob = GlobalAlloc(GMEM_MOVEABLE, static_cast<size_t>(wlen) * sizeof(wchar_t));
             if (!hGlob) {
                 CloseClipboard();
                 output = "📋 [Clipboard] Failed to allocate global memory.";
@@ -106,10 +114,21 @@ public:
             }
 
             wchar_t* pGlob = static_cast<wchar_t*>(GlobalLock(hGlob));
+            if (!pGlob) {
+                GlobalFree(hGlob);
+                CloseClipboard();
+                output = "📋 [Clipboard] Failed to lock global memory.";
+                return true;
+            }
             MultiByteToWideChar(CP_UTF8, 0, payload.c_str(), -1, pGlob, wlen);
             GlobalUnlock(hGlob);
 
-            SetClipboardData(CF_UNICODETEXT, hGlob);
+            if (!SetClipboardData(CF_UNICODETEXT, hGlob)) {
+                GlobalFree(hGlob);
+                CloseClipboard();
+                output = "📋 [Clipboard] Failed to set clipboard data.";
+                return true;
+            }
             CloseClipboard();
 
             output = "📋 Copied text to Daniel's clipboard: \"" + payload.substr(0, 80) + "...\"";

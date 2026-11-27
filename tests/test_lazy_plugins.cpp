@@ -1,6 +1,7 @@
 #include "haven/haven_plugin_manager.h"
 #include <iostream>
 #include <cassert>
+#include "haven/haven_test_check.h"
 
 using namespace haven;
 

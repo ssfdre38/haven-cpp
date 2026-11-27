@@ -10,6 +10,24 @@
 
 namespace haven {
 
+namespace {
+// RAII library lifetime guard captured by plugin shared_ptr deleters so
+// FreeLibrary/dlclose NEVER executes while any concurrent snapshot holds a reference!
+struct PluginLibraryGuard {
+#ifdef _WIN32
+    HMODULE handle = nullptr;
+    explicit PluginLibraryGuard(HMODULE h) : handle(h) {}
+    ~PluginLibraryGuard() { if (handle) FreeLibrary(handle); }
+#else
+    void* handle = nullptr;
+    explicit PluginLibraryGuard(void* h) : handle(h) {}
+    ~PluginLibraryGuard() { if (handle) dlclose(handle); }
+#endif
+    PluginLibraryGuard(const PluginLibraryGuard&) = delete;
+    PluginLibraryGuard& operator=(const PluginLibraryGuard&) = delete;
+};
+} // namespace
+
 static const std::vector<std::string> KNOWN_TOOL_ACTIONS = {
     // Circadian
     "daily_briefing", "hydrate_check", "circadian_status", "care_reminder",
@@ -215,18 +233,22 @@ bool PluginManager::load_plugin_file(const std::string& filepath, PluginExecutio
             record.supported_actions.push_back(act);
         }
     }
-    record.instance = std::shared_ptr<IHavenPlugin>(raw_instance, [destroy_func](IHavenPlugin* p) {
+    auto lib_guard = std::make_shared<PluginLibraryGuard>(hModule);
+    record.instance = std::shared_ptr<IHavenPlugin>(raw_instance, [destroy_func, lib_guard](IHavenPlugin* p) {
         if (p) {
             p->on_unload();
             if (destroy_func) destroy_func(p);
             else delete p;
         }
+        // lib_guard releases FreeLibrary AFTER destroy_func returns and all snapshots expire!
     });
-    record.dll_handle = hModule;
+    record.dll_handle = nullptr; // Owned safely by lib_guard inside instance deleter
     record.destroy_func = destroy_func;
     record.is_loaded = true;
     record.last_used = std::chrono::steady_clock::now();
 
+    auto existing = plugins_.find(meta.id);
+    if (existing != plugins_.end()) unload_plugin_instance(existing->second);
     plugins_[meta.id] = record;
     std::cout << "✨ [Plugin Loaded] " << meta.name << " v" << meta.version << " by " << meta.author << " (" << meta.description << ")\n";
     return true;
@@ -271,18 +293,21 @@ bool PluginManager::load_plugin_file(const std::string& filepath, PluginExecutio
             record.supported_actions.push_back(act);
         }
     }
-    record.instance = std::shared_ptr<IHavenPlugin>(raw_instance, [destroy_func](IHavenPlugin* p) {
+    auto lib_guard = std::make_shared<PluginLibraryGuard>(handle);
+    record.instance = std::shared_ptr<IHavenPlugin>(raw_instance, [destroy_func, lib_guard](IHavenPlugin* p) {
         if (p) {
             p->on_unload();
             if (destroy_func) destroy_func(p);
             else delete p;
         }
     });
-    record.so_handle = handle;
+    record.so_handle = nullptr; // Owned safely by lib_guard inside instance deleter
     record.destroy_func = destroy_func;
     record.is_loaded = true;
     record.last_used = std::chrono::steady_clock::now();
 
+    auto existing = plugins_.find(meta.id);
+    if (existing != plugins_.end()) unload_plugin_instance(existing->second);
     plugins_[meta.id] = record;
     std::cout << "✨ [Plugin Loaded] " << meta.name << " v" << meta.version << " (" << meta.description << ")\n";
     return true;
@@ -351,9 +376,10 @@ bool PluginManager::ensure_plugin_loaded(LoadedPluginRecord& record, PluginExecu
         return false;
     }
 
-    record.dll_handle = hModule;
+    record.dll_handle = nullptr;
     record.destroy_func = destroy_func;
-    record.instance = std::shared_ptr<IHavenPlugin>(raw_instance, [destroy_func](IHavenPlugin* p) {
+    auto lib_guard = std::make_shared<PluginLibraryGuard>(hModule);
+    record.instance = std::shared_ptr<IHavenPlugin>(raw_instance, [destroy_func, lib_guard](IHavenPlugin* p) {
         if (p) {
             p->on_unload();
             if (destroy_func) destroy_func(p);
@@ -390,9 +416,10 @@ bool PluginManager::ensure_plugin_loaded(LoadedPluginRecord& record, PluginExecu
         dlclose(handle);
         return false;
     }
-    record.so_handle = handle;
+    record.so_handle = nullptr;
     record.destroy_func = destroy_func;
-    record.instance = std::shared_ptr<IHavenPlugin>(raw_instance, [destroy_func](IHavenPlugin* p) {
+    auto lib_guard = std::make_shared<PluginLibraryGuard>(handle);
+    record.instance = std::shared_ptr<IHavenPlugin>(raw_instance, [destroy_func, lib_guard](IHavenPlugin* p) {
         if (p) {
             p->on_unload();
             if (destroy_func) destroy_func(p);
@@ -416,23 +443,17 @@ bool PluginManager::ensure_plugin_loaded_by_id(const std::string& plugin_id, Plu
 bool PluginManager::unload_plugin_instance(LoadedPluginRecord& record) {
     std::lock_guard<std::recursive_mutex> lock(plugins_mutex_);
     if (!record.is_loaded) return true;
-    if (record.filepath == "[in-process]") return false;
+    if (record.filepath == "[in-process]") {
+        if (record.instance) record.instance->on_unload();
+        record.instance.reset();
+        record.is_loaded = false;
+        return true;
+    }
 
     std::string name = record.metadata.name;
-    record.instance.reset(); // custom deleter triggers on_unload() and destroy_func()
-
-#ifdef _WIN32
-    if (record.dll_handle) {
-        FreeLibrary(record.dll_handle);
-        record.dll_handle = nullptr;
-    }
-#else
-    if (record.so_handle) {
-        dlclose(record.so_handle);
-        record.so_handle = nullptr;
-    }
-#endif
-
+    // Dropping record.instance releases on_unload -> destroy_func -> FreeLibrary/dlclose
+    // safely ONLY once the final reference (including any concurrent snapshot) expires.
+    record.instance.reset();
     record.is_loaded = false;
     std::cout << "❄️ [Plugin Unloaded to Cold Storage] " << name << " (RAM Released)\n";
     return true;

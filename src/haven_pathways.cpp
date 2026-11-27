@@ -56,6 +56,14 @@ std::future<PathwaysTaskResult> PathwaysEngine::enqueue_step(uint32_t token, int
 
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
+        if (!is_running_.load()) {
+            PathwaysTaskResult fail;
+            fail.task_id = task.task_id;
+            fail.executed_on_node = task.target_node_id;
+            fail.success = false;
+            promise->set_value(fail);
+            return future;
+        }
         task_queue_.emplace(std::move(task), promise);
     }
     queue_cv_.notify_one();
@@ -75,6 +83,14 @@ std::future<PathwaysTaskResult> PathwaysEngine::enqueue_memory_sync(const std::v
 
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
+        if (!is_running_.load()) {
+            PathwaysTaskResult fail;
+            fail.task_id = task.task_id;
+            fail.executed_on_node = task.target_node_id;
+            fail.success = false;
+            promise->set_value(fail);
+            return future;
+        }
         task_queue_.emplace(std::move(task), promise);
     }
     queue_cv_.notify_one();
@@ -88,9 +104,13 @@ void PathwaysEngine::set_token_stream_listener(std::function<void(uint32_t token
 }
 
 void PathwaysEngine::publish_stream_token(uint32_t token, const std::string& piece) {
-    std::lock_guard<std::mutex> lock(listener_mutex_);
-    if (token_listener_) {
-        token_listener_(token, piece);
+    std::function<void(uint32_t, const std::string&)> cb;
+    {
+        std::lock_guard<std::mutex> lock(listener_mutex_);
+        cb = token_listener_;
+    }
+    if (cb) {
+        cb(token, piece);
     }
 }
 
@@ -101,7 +121,7 @@ size_t PathwaysEngine::get_queue_depth() const {
 
 void PathwaysEngine::worker_loop(size_t worker_idx) {
     (void)worker_idx;
-    while (is_running_) {
+    while (true) {
         std::pair<PathwaysTask, std::shared_ptr<std::promise<PathwaysTaskResult>>> item;
         {
             std::unique_lock<std::mutex> lock(queue_mutex_);

@@ -120,13 +120,14 @@ public:
     // Self-inverse (H_B^2 = I_B) for any power-of-2 block_size >= 8 (e.g. 64, 256, 512).
     static void fwht_block_inplace(float* x, int n, int block_size);
 
-    // RoPE Rotary Position Embedding Kernel with partial dimension support
+    // RoPE Rotary Position Embedding Kernel with partial dimension & NeoX/interleaved support
     static void apply_rope(
         float* q, float* k,
         int head_dim, int num_heads, int num_kv_heads,
         int pos, float freq_base = 10000.0f, float freq_scale = 1.0f,
         const float* freq_factors = nullptr,
-        int rope_dim = 0
+        int rope_dim = 0,
+        bool neox_style = true
     );
 
     // Fast In-Place Softmax over an array of floats

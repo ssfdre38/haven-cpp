@@ -189,6 +189,7 @@ void run_benchmark_suite(haven::HavenEngine& haven_engine, const std::string& mo
         std::cout << "   ✓ Pathways Async Throughput: " << std::fixed << std::setprecision(1) << p_throughput << " tasks/sec ("
                   << std::setprecision(2) << (p_elapsed_us / num_pathway_tasks) << " µs per task dispatch)\n";
         std::cout << "   ✓ Non-Blocking Stream Published: " << streamed_tokens.size() << " chunks collected with zero stalls\n";
+        pathways->set_token_stream_listener(nullptr);
     }
 
     std::cout << "\n==================================================================\n";
@@ -439,10 +440,21 @@ int main(int argc, char** argv) {
         auto turn_tokens = haven_engine.tokenize(turn_prompt, false);
         haven_engine.get_plugin_manager().dispatch_prompt_prefill(turn_prompt, turn_tokens);
 
+        const int max_ctx = std::max(1, static_cast<int>(haven_engine.get_config().max_context_length));
+        if (active_kv_pos + static_cast<int>(turn_tokens.size()) + 16 >= max_ctx) {
+            std::cout << "\n⚠️ Context window (" << max_ctx << " tokens) reached; resetting KV cache.\n";
+            session->reset_kv_cache();
+            active_kv_pos = 0;
+        }
+
         std::vector<float> logits(haven_engine.get_config().vocab_size, 0.0f);
         if (!turn_tokens.empty()) {
-            session->prefill(turn_tokens.data(), turn_tokens.size(), active_kv_pos, logits.data(), nullptr);
-            active_kv_pos += static_cast<int>(turn_tokens.size());
+            const size_t avail = static_cast<size_t>(std::max(0, max_ctx - active_kv_pos));
+            const size_t cnt = std::min(turn_tokens.size(), avail);
+            if (cnt > 0) {
+                session->prefill(turn_tokens.data(), cnt, active_kv_pos, logits.data(), nullptr);
+                active_kv_pos += static_cast<int>(cnt);
+            }
         }
 
         std::cout << "                                  \r✨ Aura: " << std::flush;
@@ -450,13 +462,12 @@ int main(int argc, char** argv) {
         std::string accumulated_output;
         bool ended_with_turn_tag = false;
 
-        for (int gen = 0; gen < 512; ++gen) {
+        for (int gen = 0; gen < 512 && active_kv_pos < max_ctx; ++gen) {
             uint32_t next_tok = haven_engine.get_sampler().sample(
                 logits.data(), haven_engine.get_config().vocab_size, turn_generated_tokens);
             turn_generated_tokens.push_back(next_tok);
 
-            // Gemma 4 end of turn tokens: <eos> (1), <turn|> (106), </s> (212)
-            if (next_tok == haven_engine.get_tokenizer().eos_token() || next_tok == 1 || next_tok == 106 || next_tok == 212) {
+            if (haven_engine.get_tokenizer().is_stop_token(next_tok)) {
                 ended_with_turn_tag = true;
                 break;
             }
@@ -512,6 +523,7 @@ int main(int argc, char** argv) {
         if (!ended_with_turn_tag) {
             auto close_toks = haven_engine.tokenize("<turn|>\n", false);
             for (uint32_t ct : close_toks) {
+                if (active_kv_pos >= max_ctx) break;
                 session->decode_step(ct, active_kv_pos++, nullptr, nullptr);
             }
         }

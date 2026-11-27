@@ -28,7 +28,7 @@ private:
 public:
     void onRenderFrame(float deltaSeconds) {
         // 1. Step the engine (82ns execution time, zero heap allocations)
-        haven::SwayOutput sway = swayEngine_.step(deltaSeconds);
+        haven::SwayOutput sway = swayEngine_.update(deltaSeconds);
 
         // 2. Apply SO(3) quaternion directly to character torso/spine
         torsoBone.setRotation(sway.filtered_torso_quat.x,

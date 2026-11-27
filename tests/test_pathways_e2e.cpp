@@ -1,6 +1,7 @@
 #include "haven/haven_engine.h"
 #include <iostream>
 #include <cassert>
+#include "haven/haven_test_check.h"
 #include <vector>
 #include <string>
 

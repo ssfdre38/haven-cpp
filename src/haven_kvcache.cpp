@@ -47,11 +47,12 @@ void DynamicKVCacheManager::reinit(
         layers_[l].salience_scores.resize(capacity_, 1.0f);
         layers_[l].active_mask.resize(capacity_, true);
         layers_[l].current_len = 0;
+        layers_[l].kv_dim = num_kv_heads_ * head_dim_;
     }
 }
 
 void DynamicKVCacheManager::write(uint32_t layer, int pos, const float* k, const float* v, uint32_t kv_dim) {
-    if (!k || !v || kv_dim == 0 || layer >= num_layers_ || pos < 0 || pos >= (int)max_context_length_) return;
+    if (!k || !v || kv_dim == 0 || layer >= num_layers_ || pos < 0 || static_cast<uint32_t>(pos) >= max_context_length_) return;
 
     const size_t elem_stride = std::max(static_cast<size_t>(num_kv_heads_) * head_dim_, static_cast<size_t>(kv_dim));
 
@@ -74,6 +75,7 @@ void DynamicKVCacheManager::write(uint32_t layer, int pos, const float* k, const
     }
 
     auto& lay = layers_[layer];
+    lay.kv_dim = kv_dim;
     const size_t offset = static_cast<size_t>(pos) * static_cast<size_t>(kv_dim);
     const size_t num_bytes = static_cast<size_t>(kv_dim) * sizeof(float);
 
@@ -91,7 +93,8 @@ void DynamicKVCacheManager::write(uint32_t layer, int pos, const float* k, const
 }
 
 void DynamicKVCacheManager::append(uint32_t layer, const float* k, const float* v, uint32_t kv_dim) {
-    write(layer, current_length_, k, v, kv_dim);
+    if (layer >= num_layers_) return;
+    write(layer, layers_[layer].current_len, k, v, kv_dim);
 }
 
 void DynamicKVCacheManager::update_salience(uint32_t layer, const float* attention_weights, int seq_len) {
@@ -111,8 +114,10 @@ size_t DynamicKVCacheManager::prune_stale_entries(uint32_t layer) {
 
     auto& lay = layers_[layer];
     size_t pruned_count = 0;
-    const size_t vec_stride = static_cast<size_t>(num_kv_heads_) * head_dim_;
-    const size_t safe_len = std::min({static_cast<size_t>(std::max(0, current_length_)), lay.active_mask.size(), lay.salience_scores.size()});
+    const size_t vec_stride = (lay.kv_dim > 0)
+        ? static_cast<size_t>(lay.kv_dim)
+        : (static_cast<size_t>(num_kv_heads_) * head_dim_);
+    const size_t safe_len = std::min({static_cast<size_t>(std::max(0, lay.current_len)), lay.active_mask.size(), lay.salience_scores.size()});
 
     // Pinned Anchors: Never prune the first 4 tokens (system / soul core anchors)
     const size_t pin_count = std::min<size_t>(4, safe_len);

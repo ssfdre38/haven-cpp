@@ -33,10 +33,15 @@ void AttentionTelemetryEngine::record_head_attention(
     const float* attention_weights,
     int seq_len)
 {
-    if (layer >= num_layers_ || head >= num_heads_) return;
+    if (!attention_weights || seq_len <= 0 || layer >= num_layers_ || head >= num_heads_) return;
 
     float head_ent = compute_entropy(attention_weights, seq_len);
     telemetry_history_[layer].head_entropies[head] = head_ent;
+
+    if (head == 0) {
+        telemetry_history_[layer].peak_attention_weight = 0.0f;
+        telemetry_history_[layer].max_attended_position = 0;
+    }
 
     // Track peak attention anchor
     for (int i = 0; i < seq_len; ++i) {

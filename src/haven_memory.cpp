@@ -132,7 +132,8 @@ std::vector<MemoryAnchor> MemoryAttentionEngine::search_top_k(
 // ============================================================================
 
 bool MemoryAttentionEngine::save_to_hmb(const std::string& filepath) const {
-    std::ofstream out(filepath, std::ios::binary | std::ios::trunc);
+    const std::string tmp_path = filepath + ".tmp";
+    std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
     if (!out.is_open()) return false;
 
     uint32_t dim = 128;
@@ -221,6 +222,23 @@ bool MemoryAttentionEngine::save_to_hmb(const std::string& filepath) const {
     if (!string_table.empty()) {
         out.write(string_table.data(), string_table.size());
     }
+    out.flush();
+    bool write_ok = out.good();
+    out.close();
+    if (!write_ok) {
+        std::error_code ec;
+        std::filesystem::remove(tmp_path, ec);
+        return false;
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp_path, filepath, ec);
+    if (ec) {
+        // Windows rename does not always overwrite existing targets across filesystems; fallback cleanly
+        std::filesystem::copy_file(tmp_path, filepath, std::filesystem::copy_options::overwrite_existing, ec);
+        std::error_code ec2;
+        std::filesystem::remove(tmp_path, ec2);
+        if (ec) return false;
+    }
 
     std::cout << "[HMB] \xE2\x9C\x93 Successfully serialized 64-bit Haven Memory Bank to: " 
               << filepath << " (" << (header_size + vector_table_size + record_table_size + string_table.size()) << " bytes, "
@@ -240,19 +258,26 @@ bool MemoryAttentionEngine::load_from_hmb(const std::string& filepath) {
         std::cerr << "[HMB] Error: Invalid magic header in " << filepath << "\n";
         return false;
     }
+    if (hdr.version != 0x00020000 && hdr.version != 0x00010000) {
+        std::cerr << "[HMB] Error: Unsupported vault version in " << filepath << "\n";
+        return false;
+    }
 
     std::error_code ec;
     uintmax_t disk_sz = std::filesystem::file_size(filepath, ec);
     if (ec || disk_sz < sizeof(HmbHeader64)) return false;
 
-    if (hdr.total_anchors > 1000000 || hdr.embedding_dim > 8192 || hdr.string_table_size > 128ULL * 1024 * 1024) {
+    if (hdr.embedding_dim == 0 || hdr.total_anchors > 1000000 || hdr.embedding_dim > 8192 || hdr.string_table_size > 128ULL * 1024 * 1024) {
         std::cerr << "[HMB] Error: Header parameters exceed sanity thresholds in " << filepath << "\n";
         return false;
     }
 
     uint64_t vec_bytes = hdr.total_anchors * hdr.embedding_dim * sizeof(float);
     uint64_t rec_bytes = hdr.total_anchors * sizeof(HmbRecord64);
-    if (hdr.vector_table_offset > disk_sz || vec_bytes > disk_sz - hdr.vector_table_offset ||
+    if (hdr.vector_table_offset < sizeof(HmbHeader64) ||
+        hdr.record_table_offset < sizeof(HmbHeader64) ||
+        hdr.string_table_offset < sizeof(HmbHeader64) ||
+        hdr.vector_table_offset > disk_sz || vec_bytes > disk_sz - hdr.vector_table_offset ||
         hdr.record_table_offset > disk_sz || rec_bytes > disk_sz - hdr.record_table_offset ||
         hdr.string_table_offset > disk_sz || hdr.string_table_size > disk_sz - hdr.string_table_offset) {
         std::cerr << "[HMB] Error: Vault file table boundaries violate physical file length in " << filepath << "\n";
@@ -326,21 +351,28 @@ bool MemoryAttentionEngine::append_to_hmb(const std::string& filepath, const Mem
 // ============================================================================
 
 bool MemoryAttentionEngine::save_to_json(const std::string& filepath) const {
-    std::ofstream out(filepath, std::ios::trunc);
+    const std::string tmp_path = filepath + ".tmp";
+    std::ofstream out(tmp_path, std::ios::trunc);
     if (!out.is_open()) return false;
 
     auto esc_json = [](const std::string& s) {
-        std::string out;
-        out.reserve(s.size() + 8);
-        for (char c : s) {
-            if (c == '"') out += "\\\"";
-            else if (c == '\n') out += "\\n";
-            else if (c == '\r') out += "\\r";
-            else if (c == '\t') out += "\\t";
-            else if (c == '\\') out += "\\\\";
-            else out += c;
+        std::string out_s;
+        out_s.reserve(s.size() + 8);
+        for (unsigned char c : s) {
+            if (c == '"') out_s += "\\\"";
+            else if (c == '\n') out_s += "\\n";
+            else if (c == '\r') out_s += "\\r";
+            else if (c == '\t') out_s += "\\t";
+            else if (c == '\\') out_s += "\\\\";
+            else if (c < 0x20) {
+                char buf[8];
+                std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                out_s += buf;
+            } else {
+                out_s += static_cast<char>(c);
+            }
         }
-        return out;
+        return out_s;
     };
 
     out << "{\n  \"version\": 2,\n  \"engine\": \"haven-cpp-hmb-64bit\",\n  \"memories\": [\n";
@@ -358,6 +390,22 @@ bool MemoryAttentionEngine::save_to_json(const std::string& filepath) const {
         out << "    }" << (i + 1 < memories_.size() ? "," : "") << "\n";
     }
     out << "  ]\n}\n";
+    out.flush();
+    bool write_ok = out.good();
+    out.close();
+    if (!write_ok) {
+        std::error_code ec;
+        std::filesystem::remove(tmp_path, ec);
+        return false;
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp_path, filepath, ec);
+    if (ec) {
+        std::filesystem::copy_file(tmp_path, filepath, std::filesystem::copy_options::overwrite_existing, ec);
+        std::error_code ec2;
+        std::filesystem::remove(tmp_path, ec2);
+        if (ec) return false;
+    }
     return true;
 }
 

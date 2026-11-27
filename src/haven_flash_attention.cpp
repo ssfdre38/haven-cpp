@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <limits>
 
 namespace haven {
 
@@ -46,7 +47,7 @@ void FlashAttentionCpu::compute_tiled_attention(
     if (!q || !layer_k || !layer_v || !out_attn || num_tokens == 0 || head_dim == 0) return;
     std::memset(out_attn, 0, head_dim * sizeof(float));
 
-    float max_score = -1e9f;
+    float max_score = -std::numeric_limits<float>::infinity();
     float sum_exp = 0.0f;
     float block_scores[FLASH_BLOCK_BC];
 
@@ -55,11 +56,15 @@ void FlashAttentionCpu::compute_tiled_attention(
         uint32_t block_end = std::min(num_tokens, (uint32_t)(block_start + FLASH_BLOCK_BC));
         uint32_t current_block_size = block_end - block_start;
 
-        float block_max = -1e9f;
+        float block_max = -std::numeric_limits<float>::infinity();
 
         // Compute Q · K^T dot products for this block using AVX2 SIMD
         for (uint32_t i = 0; i < current_block_size; ++i) {
-            uint32_t abs_s = indices ? (uint32_t)indices[block_start + i] : (block_start + i);
+            if (indices && indices[block_start + i] < 0) {
+                block_scores[i] = -std::numeric_limits<float>::infinity();
+                continue;
+            }
+            uint32_t abs_s = indices ? static_cast<uint32_t>(indices[block_start + i]) : (block_start + i);
             const float* k_vec = layer_k + static_cast<size_t>(abs_s) * static_cast<size_t>(kv_dim) + kv_head_offset;
 
             float dot = Avx2Math::vec_dot_f32((int)head_dim, q, k_vec);
@@ -67,13 +72,16 @@ void FlashAttentionCpu::compute_tiled_attention(
             if (softcap > 0.0f) {
                 score = softcap * std::tanh(score / softcap);
             }
+            if (std::isnan(score)) score = -std::numeric_limits<float>::infinity();
             block_scores[i] = score;
             if (score > block_max) block_max = score;
         }
 
+        if (!std::isfinite(block_max)) continue;
+
         // Online softmax update: Rescale previous accumulator
         float new_max = std::max(max_score, block_max);
-        float rescale_prev = (max_score > -1e8f) ? std::exp(max_score - new_max) : 0.0f;
+        float rescale_prev = std::isfinite(max_score) ? std::exp(max_score - new_max) : 0.0f;
         sum_exp *= rescale_prev;
 
         __m256 vrescale = _mm256_set1_ps(rescale_prev);
@@ -88,7 +96,8 @@ void FlashAttentionCpu::compute_tiled_attention(
 
         // Accumulate new weighted values from this block with AVX2 FMA
         for (uint32_t i = 0; i < current_block_size; ++i) {
-            uint32_t abs_s = indices ? (uint32_t)indices[block_start + i] : (block_start + i);
+            if (!std::isfinite(block_scores[i]) || (indices && indices[block_start + i] < 0)) continue;
+            uint32_t abs_s = indices ? static_cast<uint32_t>(indices[block_start + i]) : (block_start + i);
             const float* v_vec = layer_v + static_cast<size_t>(abs_s) * static_cast<size_t>(kv_dim) + kv_head_offset;
 
             float exp_val = std::exp(block_scores[i] - new_max);

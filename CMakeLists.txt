@@ -17,12 +17,18 @@ if (HAVEN_ENABLE_CUDA)
     add_compile_definitions(HAVEN_HAS_CUDA)
 endif()
 
-# Enable AVX2, FMA, F16C, OpenMP and Aggressive Optimization
+# Enable AVX2, FMA, F16C, OpenMP and Aggressive Optimization (x86_64 guarded for ARM64/Apple Silicon portability)
 if (MSVC)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/O2> $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2> $<$<COMPILE_LANGUAGE:CXX>:/W4> $<$<COMPILE_LANGUAGE:CXX>:/openmp> $<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
+    if (HAVEN_ENABLE_CUDA)
+        add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-O3> $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+    endif()
     add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS)
 else()
-    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-O3> $<$<COMPILE_LANGUAGE:CXX>:-march=native> $<$<COMPILE_LANGUAGE:CXX>:-mavx2> $<$<COMPILE_LANGUAGE:CXX>:-mfma> $<$<COMPILE_LANGUAGE:CXX>:-mf16c> $<$<COMPILE_LANGUAGE:CXX>:-fopenmp> $<$<COMPILE_LANGUAGE:CXX>:-Wall> $<$<COMPILE_LANGUAGE:CXX>:-Wextra>)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-O3> $<$<COMPILE_LANGUAGE:CXX>:-fopenmp> $<$<COMPILE_LANGUAGE:CXX>:-Wall> $<$<COMPILE_LANGUAGE:CXX>:-Wextra>)
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
+        add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-march=native> $<$<COMPILE_LANGUAGE:CXX>:-mavx2> $<$<COMPILE_LANGUAGE:CXX>:-mfma> $<$<COMPILE_LANGUAGE:CXX>:-mf16c>)
+    endif()
     if (HAVEN_ENABLE_CUDA)
         add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-O3> $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
     endif()
@@ -32,30 +38,27 @@ else()
     endif()
 endif()
 
-if (WIN32)
+set(HAVEN_MLX_DIR "" CACHE PATH "Optional path to local MLX C/C++ checkout (empty = disabled for reproducible builds)")
+if (HAVEN_MLX_DIR)
     find_path(MLX_INCLUDE_DIR "mlx/c/mlx.h"
-        PATHS "C:/Users/admin/source/ollama-main/mlx/include"
+        PATHS "${HAVEN_MLX_DIR}/include" "${HAVEN_MLX_DIR}"
+        NO_DEFAULT_PATH
     )
-    if (MLX_INCLUDE_DIR)
-        include_directories(include ${MLX_INCLUDE_DIR})
-        add_definitions(-DHAVEN_HAS_MLX)
-        link_directories(
-            "C:/Users/admin/source/ollama-main/build/mlx/mlx/_deps/mlx-c-build"
-            "C:/Users/admin/source/ollama-main/build/mlx/mlx/_deps/mlx-build"
-            "C:/Users/admin/source/ollama-main/build/mlx/mlx"
-        )
-    else()
-        include_directories(include)
-    endif()
 elseif (APPLE)
     find_path(MLX_INCLUDE_DIR "mlx/c/mlx.h"
-        PATHS "/usr/local/include"
+        PATHS "/opt/homebrew/include" "/usr/local/include"
     )
-    if (MLX_INCLUDE_DIR)
-        include_directories(include ${MLX_INCLUDE_DIR})
-        add_definitions(-DHAVEN_HAS_MLX)
-    else()
-        include_directories(include)
+endif()
+
+if (MLX_INCLUDE_DIR)
+    include_directories(include ${MLX_INCLUDE_DIR})
+    add_definitions(-DHAVEN_HAS_MLX)
+    if (HAVEN_MLX_DIR)
+        link_directories(
+            "${HAVEN_MLX_DIR}/build/_deps/mlx-c-build"
+            "${HAVEN_MLX_DIR}/build/_deps/mlx-build"
+            "${HAVEN_MLX_DIR}/lib"
+        )
     endif()
 else()
     include_directories(include)
@@ -153,6 +156,8 @@ if (WIN32)
     else()
         target_link_libraries(haven_companion PUBLIC ws2_32 psapi)
     endif()
+elseif (APPLE AND MLX_INCLUDE_DIR)
+    target_link_libraries(haven_companion PUBLIC pthread dl mlxc mlx)
 else()
     target_link_libraries(haven_companion PUBLIC pthread dl)
 endif()
@@ -171,6 +176,8 @@ if (WIN32)
     else()
         target_link_libraries(haven_engine PUBLIC ws2_32 psapi)
     endif()
+elseif (APPLE AND MLX_INCLUDE_DIR)
+    target_link_libraries(haven_engine PUBLIC pthread dl mlxc mlx)
 else()
     target_link_libraries(haven_engine PUBLIC pthread dl)
 endif()
@@ -304,12 +311,9 @@ target_link_libraries(test-secure-cluster PRIVATE haven_core)
 add_executable(test-security-fuzz tests/test_security_fuzz.cpp)
 target_link_libraries(test-security-fuzz PRIVATE haven_core)
 
-# Autonomic Postural Sway Engine Targets
+# Autonomic Postural Sway Engine Targets (Pure header-only — zero core library bloat!)
 add_executable(test-haven-sway tests/test_haven_sway.cpp)
-target_link_libraries(test-haven-sway PRIVATE haven_core)
-
 add_executable(quickstart-sway examples/quickstart_sway.cpp)
-target_link_libraries(quickstart-sway PRIVATE haven_core)
 
 # Native Sovereign Plugins
 add_library(plugin_yt_music SHARED

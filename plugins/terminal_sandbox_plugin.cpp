@@ -17,7 +17,10 @@
 #else
 #include <stdio.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
 #include <signal.h>
 #endif
 
@@ -118,19 +121,27 @@ public:
                 }
             }
 
-            std::string cmd_lower = cmd;
-            for (char& c : cmd_lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            // Normalize out quotes so quote-splitting obfuscation (e.g. c"m"d / p'o'wershell) cannot bypass checks
+            std::string cmd_norm;
+            cmd_norm.reserve(cmd.size());
+            for (char c : cmd) {
+                if (c == '"' || c == '\'') continue;
+                cmd_norm += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            }
             const std::string blocked_subcmds[] = {
-                "format ", "rmdir /s", "del /s", "diskpart", "rm -rf /", "rm -rf /*",
-                "rm -r /", "mkfs", "dd if=/dev/zero", "dd if=/dev/urandom",
-                ":(){ :|:& };:", "chmod -r 777 /", "cmd /c", "cmd.exe", "powershell",
-                "pwsh", "wscript", "cscript", "mshta", "certutil", "bitsadmin",
-                "reg delete", "reg add", "net user", "shutdown", "bcdedit", "vssadmin",
-                "bash -c", "sh -c", "sudo ", "su ", "runas ", "schtasks", "icacls", "takeown"
+                "format ", "rmdir ", "del ", "erase ", "diskpart", "rm ", "unlink ",
+                "mkfs", "dd ", ":(){ :|:& };:", "chmod ", "chown ",
+                "cmd /c", "cmd.exe", "powershell", "pwsh", "wscript", "cscript",
+                "mshta", "certutil", "bitsadmin", "rundll32", "regsvr32", "msiexec",
+                "python", "node ", "node.exe", "perl ", "ruby ", "curl ", "wget ",
+                "nc ", "ncat ", "ssh ", "scp ", "ftp ", "telnet ",
+                "reg delete", "reg add", "net user", "net localgroup", "shutdown",
+                "bcdedit", "vssadmin", "bash ", "sh -c", "zsh ", "sudo ", "su ",
+                "runas ", "schtasks", "icacls", "takeown", "wmic ", "sc "
             };
             for (const auto& bad : blocked_subcmds) {
-                if (cmd_lower.find(bad) != std::string::npos) {
-                    output = "🐚 [Terminal] Security Block: Destructive or sub-shell escalation commands are disallowed in sovereign sandbox.";
+                if (cmd_norm.find(bad) != std::string::npos) {
+                    output = "🐚 [Terminal] Security Block: Destructive, network, interpreter, or sub-shell escalation commands are disallowed in sovereign sandbox.";
                     return true;
                 }
             }
@@ -146,21 +157,10 @@ public:
                 return true;
             }
 #else
-            std::string full_cmd = cwd_path.empty() ? (cmd + " 2>&1") : ("cd \"" + cwd_path + "\" && " + cmd + " 2>&1");
-            FILE* pipe = popen(full_cmd.c_str(), "r");
-            if (!pipe) {
-                output = "🐚 [Terminal] Failed to launch process for command: " + cmd;
+            if (!execute_posix_sandbox(cmd, cwd_path, result, exit_code, timed_out)) {
+                output = "🐚 [Terminal] Failed to launch OS-sandboxed process for command: " + cmd;
                 return true;
             }
-            std::array<char, 512> buffer;
-            while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
-                result += buffer.data();
-                if (result.length() > 16000) {
-                    result += "\n... [Output truncated at 16,000 characters]";
-                    break;
-                }
-            }
-            exit_code = pclose(pipe);
 #endif
 
             auto end_time = std::chrono::high_resolution_clock::now();
@@ -333,6 +333,111 @@ private:
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
         CloseHandle(hJob);
+        return true;
+    }
+#else
+    static bool execute_posix_sandbox(const std::string& cmd, const std::string& cwd_path,
+                                      std::string& result, int& exit_code, bool& timed_out) {
+        constexpr int TIMEOUT_MS = 15000;
+        constexpr size_t MAX_OUTPUT_BYTES = 16000;
+
+        int pipefd[2];
+        if (pipe(pipefd) < 0) return false;
+
+        pid_t pid = fork();
+        if (pid < 0) {
+            close(pipefd[0]);
+            close(pipefd[1]);
+            return false;
+        }
+        if (pid == 0) {
+            setpgid(0, 0);
+            int devnull = open("/dev/null", O_RDONLY);
+            if (devnull >= 0) {
+                dup2(devnull, STDIN_FILENO);
+                close(devnull);
+            }
+            dup2(pipefd[1], STDOUT_FILENO);
+            dup2(pipefd[1], STDERR_FILENO);
+            close(pipefd[0]);
+            close(pipefd[1]);
+
+            struct rlimit rl_cpu{15, 15};
+            setrlimit(RLIMIT_CPU, &rl_cpu);
+#ifdef RLIMIT_AS
+            struct rlimit rl_as{512ULL * 1024 * 1024, 512ULL * 1024 * 1024};
+            setrlimit(RLIMIT_AS, &rl_as);
+#endif
+#ifdef RLIMIT_NPROC
+            struct rlimit rl_proc{32, 32};
+            setrlimit(RLIMIT_NPROC, &rl_proc);
+#endif
+            if (!cwd_path.empty() && chdir(cwd_path.c_str()) != 0) {
+                _exit(126);
+            }
+            const char* argv[] = {"/bin/sh", "-c", cmd.c_str(), nullptr};
+            execv("/bin/sh", const_cast<char* const*>(argv));
+            _exit(127);
+        }
+
+        close(pipefd[1]);
+        fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
+
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(TIMEOUT_MS);
+        char buf[512];
+        bool child_exited = false;
+        int status = 0;
+
+        while (true) {
+            struct pollfd pfd{pipefd[0], POLLIN, 0};
+            auto now = std::chrono::steady_clock::now();
+            int rem_ms = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+            if (rem_ms <= 0) {
+                timed_out = true;
+                kill(-pid, SIGKILL);
+                waitpid(pid, &status, 0);
+                break;
+            }
+            int pr = poll(&pfd, 1, std::min(rem_ms, 50));
+            if (pr > 0) {
+                ssize_t n = read(pipefd[0], buf, sizeof(buf));
+                if (n > 0) {
+                    if (result.size() < MAX_OUTPUT_BYTES) {
+                        size_t take = std::min<size_t>(static_cast<size_t>(n), MAX_OUTPUT_BYTES - result.size());
+                        result.append(buf, take);
+                    }
+                } else if (n == 0) {
+                    break;
+                }
+            }
+            pid_t w = waitpid(pid, &status, WNOHANG);
+            if (w == pid) {
+                child_exited = true;
+                // Final non-blocking drain
+                while (true) {
+                    ssize_t n = read(pipefd[0], buf, sizeof(buf));
+                    if (n <= 0) break;
+                    if (result.size() < MAX_OUTPUT_BYTES) {
+                        size_t take = std::min<size_t>(static_cast<size_t>(n), MAX_OUTPUT_BYTES - result.size());
+                        result.append(buf, take);
+                    }
+                }
+                break;
+            }
+        }
+        close(pipefd[0]);
+        if (!child_exited && !timed_out) {
+            waitpid(pid, &status, 0);
+        }
+        if (timed_out) {
+            exit_code = 124;
+        } else if (WIFEXITED(status)) {
+            exit_code = WEXITSTATUS(status);
+        } else if (WIFSIGNALED(status)) {
+            exit_code = 128 + WTERMSIG(status);
+        } else {
+            exit_code = -1;
+        }
         return true;
     }
 #endif

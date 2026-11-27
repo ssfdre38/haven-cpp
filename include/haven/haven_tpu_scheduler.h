@@ -129,6 +129,9 @@ private:
 
     std::atomic<bool> running_{false};
     std::thread worker_thread_;
+    mutable std::mutex lifecycle_mtx_;
+    std::atomic<int> cached_max_seq_len_{2048};
+    std::atomic<int> cached_batch_cap_{0};
 
     std::mutex queue_mtx_;
     std::condition_variable worker_cv_;

@@ -42,16 +42,25 @@ inline constexpr QuantBlockSpec quant_block_spec(QuantType type) {
         case QuantType::Q3_K:   return {256u, static_cast<uint32_t>(sizeof(block_q3_K))};
         case QuantType::Q4_K:   return {256u, static_cast<uint32_t>(sizeof(block_q4_K))};
         case QuantType::Q5_K:   return {256u, static_cast<uint32_t>(sizeof(block_q5_K))};
-        case QuantType::Q6_K:   return {256u, static_cast<uint32_t>(sizeof(block_q6_K))};
-        case QuantType::Q8_K:   return {256u, 292u};
-        case QuantType::IQ4_NL: return {32u,  static_cast<uint32_t>(sizeof(block_iq4_nl))};
-        case QuantType::IQ4_XS: return {256u, static_cast<uint32_t>(sizeof(block_iq4_xs))};
-        case QuantType::I8:     return {1u,   1u};
-        case QuantType::I16:    return {1u,   2u};
-        case QuantType::I32:    return {1u,   4u};
+        case QuantType::Q6_K:    return {256u, static_cast<uint32_t>(sizeof(block_q6_K))};
+        case QuantType::Q8_K:    return {256u, 292u};
+        case QuantType::IQ2_XXS: return {256u, 66u};
+        case QuantType::IQ2_XS:  return {256u, 74u};
+        case QuantType::IQ3_XXS: return {256u, 98u};
+        case QuantType::IQ1_S:   return {256u, 50u};
+        case QuantType::IQ4_NL:  return {32u,  static_cast<uint32_t>(sizeof(block_iq4_nl))};
+        case QuantType::IQ3_S:   return {256u, 110u};
+        case QuantType::IQ2_S:   return {256u, 82u};
+        case QuantType::IQ4_XS:  return {256u, static_cast<uint32_t>(sizeof(block_iq4_xs))};
+        case QuantType::I8:      return {1u,   1u};
+        case QuantType::I16:     return {1u,   2u};
+        case QuantType::I32:     return {1u,   4u};
         case QuantType::I64:
-        case QuantType::F64:    return {1u,   8u};
-        default:                return {1u,   1u};
+        case QuantType::F64:     return {1u,   8u};
+        case QuantType::IQ1_M:   return {256u, 56u};
+        case QuantType::TQ1_0:   return {256u, 54u};
+        case QuantType::TQ2_0:   return {256u, 66u};
+        default:                 return {0u,   0u};
     }
 }
 

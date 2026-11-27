@@ -64,14 +64,18 @@ bool HavenEngine::enable_tpu_offload(HavenTpuPjrtBackend* external_backend) {
     size_t total_bytes = 0;
 
     // Upload all layer FFN weights (GeGLU) across available TPU HBM3 chips (round-robin shard by layer)
-    if (cfg.ffn_activation == FfnActivation::GELU) {
+    // Skip FFN offload when turbo_hadamard_ffn_down > 0 (fused TPU kernel expects unrotated GeGLU output)
+    if (cfg.ffn_activation == FfnActivation::GELU && cfg.turbo_hadamard_ffn_down == 0) {
         for (uint32_t l = 0; l < cfg.num_layers && l < layers_.size(); ++l) {
             const auto& lt = layers_[l];
             if (!lt.ffn_gate || !lt.ffn_up || !lt.ffn_down) continue;
+            const int layer_F = (lt.ffn_gate->shape.size() > 1 && lt.ffn_gate->shape[1] > 0)
+                ? static_cast<int>(lt.ffn_gate->shape[1])
+                : static_cast<int>(cfg.hidden_dim);
             const int dev_idx = static_cast<int>(l % static_cast<uint32_t>(n_devs));
-            bool ok = tpu_backend_->upload_gguf_weight_matrix(*lt.ffn_gate, static_cast<int>(cfg.hidden_dim), static_cast<int>(cfg.embedding_dim), tpu_layers_[l].ffn_gate, dev_idx)
-                   && tpu_backend_->upload_gguf_weight_matrix(*lt.ffn_up,   static_cast<int>(cfg.hidden_dim), static_cast<int>(cfg.embedding_dim), tpu_layers_[l].ffn_up, dev_idx)
-                   && tpu_backend_->upload_gguf_weight_matrix(*lt.ffn_down, static_cast<int>(cfg.embedding_dim), static_cast<int>(cfg.hidden_dim), tpu_layers_[l].ffn_down, dev_idx);
+            bool ok = tpu_backend_->upload_gguf_weight_matrix(*lt.ffn_gate, layer_F, static_cast<int>(cfg.embedding_dim), tpu_layers_[l].ffn_gate, dev_idx)
+                   && tpu_backend_->upload_gguf_weight_matrix(*lt.ffn_up,   layer_F, static_cast<int>(cfg.embedding_dim), tpu_layers_[l].ffn_up, dev_idx)
+                   && tpu_backend_->upload_gguf_weight_matrix(*lt.ffn_down, static_cast<int>(cfg.embedding_dim), layer_F, tpu_layers_[l].ffn_down, dev_idx);
             if (ok) {
                 tpu_layers_[l].has_ffn = true;
                 total_bytes += tpu_layers_[l].ffn_gate.bytes + tpu_layers_[l].ffn_up.bytes + tpu_layers_[l].ffn_down.bytes;
@@ -114,6 +118,17 @@ void HavenEngine::disable_tpu_offload() {
 }
 
 bool HavenEngine::load_model(const std::string& gguf_filepath) {
+    // Always detach TPU offload and clear all cached tensor pointers before reloading (prevents UAF on failed reload!)
+    disable_tpu_offload();
+    token_embd_tensor_ = nullptr;
+    per_layer_token_embd_tensor_ = nullptr;
+    per_layer_model_proj_tensor_ = nullptr;
+    per_layer_proj_norm_tensor_ = nullptr;
+    output_norm_tensor_ = nullptr;
+    rope_freqs_tensor_ = nullptr;
+    output_tensor_ = nullptr;
+    layers_.clear();
+
     if (!loader_.load_file(gguf_filepath)) {
         return false;
     }
@@ -122,6 +137,7 @@ bool HavenEngine::load_model(const std::string& gguf_filepath) {
         cfg.num_heads == 0 || cfg.num_kv_heads == 0 || cfg.head_dim == 0 ||
         cfg.vocab_size == 0 || cfg.max_context_length == 0) {
         std::cerr << "⛔ [HavenEngine] Invalid zero model dimension in GGUF config.\n";
+        loader_.close();
         return false;
     }
 
@@ -145,7 +161,8 @@ bool HavenEngine::load_model(const std::string& gguf_filepath) {
     }
     logits_scratch_.resize(cfg.vocab_size, 0.0f);
     default_norm_weights_.assign(std::max({cfg.embedding_dim, cfg.hidden_dim, cfg.head_dim, 256u}), 1.0f);
-    attn_scores_scratch_.resize(std::max(1024u, cfg.max_context_length), 0.0f);
+    attn_scores_scratch_.clear();
+    attn_scores_scratch_.shrink_to_fit();
 
     // Cache global tensors
     token_embd_tensor_ = loader_.get_tensor("token_embd.weight");
@@ -243,7 +260,6 @@ bool HavenEngine::load_model(const std::string& gguf_filepath) {
     per_layer_emb_scratch_.resize(pleias_dim, 0.0f);
     per_layer_proj_scratch_.resize(pleias_dim, 0.0f);
     pleias_proj_scratch_.resize(cfg.embedding_dim, 0.0f);
-    attn_scores_scratch_.resize(static_cast<size_t>(cfg.num_heads) * cfg.max_context_length, 0.0f);
     attn_heads_out_scratch_.resize(std::max<size_t>(cfg.embedding_dim, max_q_dim), 0.0f);
     attn_indices_scratch_.resize(std::max<size_t>(static_cast<size_t>(cfg.max_context_length) + 4, 520), 0);
     logits_scratch_.resize(cfg.vocab_size, 0.0f);
@@ -251,9 +267,6 @@ bool HavenEngine::load_model(const std::string& gguf_filepath) {
 
     // Initialize Persistent Cognitive Memory Vault
     std::string mem_path = "wwwroot/memories.json";
-    if (!std::filesystem::exists(mem_path)) {
-        mem_path = "C:\\Users\\admin\\source\\haven-cpp\\wwwroot\\memories.json";
-    }
     if (!memory_engine_.load_from_json(mem_path)) {
         memory_engine_.initialize_sovereign_anchors(cfg.head_dim);
         memory_engine_.save_to_json(mem_path);
@@ -261,9 +274,6 @@ bool HavenEngine::load_model(const std::string& gguf_filepath) {
 
     // Discover and load sovereign plugins
     plugin_manager_.discover_plugins("plugins");
-    if (plugin_manager_.get_plugin_count() == 0) {
-        plugin_manager_.discover_plugins("C:\\Users\\admin\\source\\haven-cpp\\plugins");
-    }
 
     // Initialize Universal Default Persona Sampler Configuration (Single Source of Truth across CLI & Server)
     sampler_.get_params().temperature = 0.48f;
@@ -452,7 +462,11 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         const int kv_dim = std::max(1, std::min<int>(
             static_cast<int>(k_scratch_.size()),
             (lt.attn_k && lt.attn_k->shape.size() > 1) ? (int)lt.attn_k->shape[1] : (int)(layer_n_kv_heads * static_cast<uint32_t>(actual_head_dim))));
-        const float attn_scale = cfg.is_gemma ? 1.0f : (1.0f / std::sqrt((float)actual_head_dim));
+        const float attn_scale = cfg.is_gemma4
+            ? 1.0f
+            : (cfg.query_pre_attn_scalar > 0.0f
+                ? (1.0f / std::sqrt(cfg.query_pre_attn_scalar))
+                : (1.0f / std::sqrt((float)actual_head_dim)));
         const int gqa_ratio = std::max(1u, cfg.num_heads / std::max(1u, layer_n_kv_heads));
 
         // 2a. Pre-Attention RMSNorm (+ optional Gemma 4.5 Turbo Block-FWHT)
@@ -468,7 +482,9 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         const bool has_swa = (cfg.sliding_window > 0) && (cfg.is_gemma || cfg.architecture == "mistral");
         const bool is_swa = (l < cfg.sliding_window_pattern.size())
             ? cfg.sliding_window_pattern[l]
-            : (has_swa && (cfg.architecture == "mistral" || (l % 6 != 5)));
+            : (has_swa && (cfg.architecture == "mistral"
+                ? true
+                : (cfg.architecture == "gemma2" ? (l % 2 == 0) : (l % 6 != 5))));
         const bool is_shared_kv = (cfg.shared_kv_layers > 0 && cfg.shared_kv_layers < cfg.num_layers &&
             l >= (cfg.num_layers - cfg.shared_kv_layers));
         const bool has_kv = !is_shared_kv && (lt.attn_k != nullptr);
@@ -554,7 +570,7 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
                 Avx2Math::rms_norm(k_h, k_h, k_norm_w, actual_head_dim, cfg.rms_norm_eps);
             }
         }
-        if (has_kv && cfg.is_gemma && lt.attn_q_norm && lt.attn_k_norm) {
+        if (has_kv && cfg.is_gemma4 && lt.attn_q_norm && lt.attn_k_norm) {
             for (uint32_t h = 0; h < layer_n_kv_heads; ++h) {
                 float* v_h = v_scratch_.data() + h * actual_head_dim;
                 Avx2Math::rms_norm(v_h, v_h, default_norm_weights_.data(), actual_head_dim, cfg.rms_norm_eps);
@@ -562,8 +578,11 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         }
 
         // 2c. RoPE Rotary Embeddings
-        float layer_freq_base = is_swa ? cfg.rope_freq_base_swa : cfg.rope_freq_base;
-        int rope_dim = actual_head_dim;
+        float layer_freq_base = (is_swa && (cfg.has_rope_freq_base_swa || cfg.is_gemma)) ? cfg.rope_freq_base_swa : cfg.rope_freq_base;
+        const uint32_t cfg_rope_dim = is_swa ? cfg.rope_dimension_count_swa : cfg.rope_dimension_count;
+        int rope_dim = (!cfg.is_gemma4 && cfg_rope_dim > 0 && static_cast<int>(cfg_rope_dim) <= actual_head_dim)
+            ? static_cast<int>(cfg_rope_dim)
+            : actual_head_dim;
         const float* freq_factors_w = (!is_swa && rope_freqs_tensor_ && rope_freqs_tensor_->type == QuantType::F32 &&
             (rope_freqs_tensor_->size_bytes == 0 || rope_freqs_tensor_->size_bytes >= static_cast<size_t>(rope_dim / 2) * sizeof(float)))
             ? reinterpret_cast<const float*>(rope_freqs_tensor_->data) : nullptr;
@@ -582,10 +601,10 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         }
 
         if (has_kv) {
-            Avx2Math::apply_rope(q_scratch_.data(), k_scratch_.data(), actual_head_dim, cfg.num_heads, layer_n_kv_heads, pos, layer_freq_base, cfg.rope_freq_scale, freq_factors_w, rope_dim);
+            Avx2Math::apply_rope(q_scratch_.data(), k_scratch_.data(), actual_head_dim, cfg.num_heads, layer_n_kv_heads, pos, layer_freq_base, cfg.rope_freq_scale, freq_factors_w, rope_dim, cfg.is_neox_rope);
             kv_cache_.write(l, pos, k_scratch_.data(), v_scratch_.data(), kv_dim);
         } else {
-            Avx2Math::apply_rope(q_scratch_.data(), nullptr, actual_head_dim, cfg.num_heads, 0, pos, layer_freq_base, cfg.rope_freq_scale, freq_factors_w, rope_dim);
+            Avx2Math::apply_rope(q_scratch_.data(), nullptr, actual_head_dim, cfg.num_heads, 0, pos, layer_freq_base, cfg.rope_freq_scale, freq_factors_w, rope_dim, cfg.is_neox_rope);
         }
 
         // 2e. Multi-Head Attention (GQA) with Attention Sinks & Zero-Allocation Scratch Buffers
@@ -659,8 +678,14 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
             Avx2Math::fwht_block_inplace(norm_scratch_.data(), D_emb, static_cast<int>(cfg.turbo_hadamard_ffn));
         }
 
+        const bool has_moe_layer = (lt.ffn_gate_inp && lt.ffn_down_exps &&
+            (lt.ffn_gate_up_exps || (lt.ffn_gate_exps && lt.ffn_up_exps)) && cfg.expert_count > 0);
+
         // 2h + 2i. FFN Gate/Up/Activation/Down (Fused TPU MXU GeGLU when offload active, else Fused Integer AVX2 CPU)
-        if (tpu_offload_active_ && tpu_backend_ && l < tpu_layers_.size() && tpu_layers_[l].has_ffn &&
+        if (!lt.ffn_gate && !lt.ffn_up && !lt.ffn_down && has_moe_layer) {
+            // Pure-MoE layer (e.g., Mixtral / Qwen-MoE without shared dense MLP): zero dense branch
+            std::memset(ffn_down_scratch_.data(), 0, static_cast<size_t>(D_emb) * sizeof(float));
+        } else if (tpu_offload_active_ && tpu_backend_ && l < tpu_layers_.size() && tpu_layers_[l].has_ffn &&
             tpu_backend_->fused_geglu_ffn(norm_scratch_.data(), 1,
                                           tpu_layers_[l].ffn_gate, tpu_layers_[l].ffn_up, tpu_layers_[l].ffn_down,
                                           ffn_down_scratch_.data())) {
@@ -774,8 +799,9 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
             for (int k = 0; k < K_used; ++k) w_sum += moe_router_scratch_[static_cast<size_t>(exp_idx[k])];
             if (w_sum < 6.103515625e-5f) w_sum = 6.103515625e-5f;
 
-            // Pre-FFN norm 2 on attn_out for sparse experts (+ optional Gemma 4.5 Turbo Block-FWHT)
-            const float* pre2_w = cfg.turbo_folded_norms ? default_norm_weights_.data() : safe_f32_weights(lt.pre_ffw_norm_2, cfg.embedding_dim);
+            // Pre-FFN norm 2 on attn_out for sparse experts (fall back to ffn_norm for pure-MoE models without pre_ffw_norm_2)
+            const TensorDesc* pre2_tensor = lt.pre_ffw_norm_2 ? lt.pre_ffw_norm_2 : lt.ffn_norm;
+            const float* pre2_w = cfg.turbo_folded_norms ? default_norm_weights_.data() : safe_f32_weights(pre2_tensor, cfg.embedding_dim);
             Avx2Math::rms_norm(moe_norm_scratch_.data(), embedding_scratch_.data(), pre2_w, D_emb, cfg.rms_norm_eps);
             if (cfg.turbo_hadamard_moe_in > 0 && (D_emb % static_cast<int>(cfg.turbo_hadamard_moe_in)) == 0) {
                 Avx2Math::fwht_block_inplace(moe_norm_scratch_.data(), D_emb, static_cast<int>(cfg.turbo_hadamard_moe_in));
@@ -1292,7 +1318,11 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
             const int kv_dim = std::max(1, std::min<int>(
                 max_kv_dim,
                 (lt.attn_k && lt.attn_k->shape.size() > 1) ? static_cast<int>(lt.attn_k->shape[1]) : static_cast<int>(layer_n_kv_heads * static_cast<uint32_t>(actual_head_dim))));
-            const float attn_scale = cfg.is_gemma ? 1.0f : (1.0f / std::sqrt(static_cast<float>(actual_head_dim)));
+            const float attn_scale = cfg.is_gemma4
+                ? 1.0f
+                : (cfg.query_pre_attn_scalar > 0.0f
+                    ? (1.0f / std::sqrt(cfg.query_pre_attn_scalar))
+                    : (1.0f / std::sqrt(static_cast<float>(actual_head_dim))));
             const int gqa_ratio = std::max(1u, cfg.num_heads / std::max(1u, layer_n_kv_heads));
 
             // 2a. Batched Pre-Attention RMSNorm (+ optional Gemma 4.5 Turbo Block-FWHT)
@@ -1310,7 +1340,9 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
             const bool has_swa = (cfg.sliding_window > 0) && (cfg.is_gemma || cfg.architecture == "mistral");
             const bool is_swa = (l < cfg.sliding_window_pattern.size())
                 ? cfg.sliding_window_pattern[l]
-                : (has_swa && (cfg.architecture == "mistral" || (l % 6 != 5)));
+                : (has_swa && (cfg.architecture == "mistral"
+                    ? true
+                    : (cfg.architecture == "gemma2" ? (l % 2 == 0) : (l % 6 != 5))));
             const bool is_shared_kv = (cfg.shared_kv_layers > 0 && cfg.shared_kv_layers < cfg.num_layers &&
                 l >= (cfg.num_layers - cfg.shared_kv_layers));
             const bool has_kv = !is_shared_kv && (lt.attn_k != nullptr);
@@ -1377,9 +1409,12 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
             // 2b-2 & 2c. Batched Per-Head Q/K/V Norms + RoPE
             const float* q_norm_w = lt.attn_q_norm ? safe_f32_weights(lt.attn_q_norm, static_cast<size_t>(actual_head_dim)) : nullptr;
             const float* k_norm_w = (has_kv && lt.attn_k_norm) ? safe_f32_weights(lt.attn_k_norm, static_cast<size_t>(actual_head_dim)) : nullptr;
-            const bool do_v_norm  = (has_kv && cfg.is_gemma && lt.attn_q_norm && lt.attn_k_norm);
-            const float layer_freq_base = is_swa ? cfg.rope_freq_base_swa : cfg.rope_freq_base;
-            const int rope_dim = actual_head_dim;
+            const bool do_v_norm  = (has_kv && cfg.is_gemma4 && lt.attn_q_norm && lt.attn_k_norm);
+            const float layer_freq_base = (is_swa && (cfg.has_rope_freq_base_swa || cfg.is_gemma)) ? cfg.rope_freq_base_swa : cfg.rope_freq_base;
+            const uint32_t cfg_rope_dim = is_swa ? cfg.rope_dimension_count_swa : cfg.rope_dimension_count;
+            const int rope_dim = (!cfg.is_gemma4 && cfg_rope_dim > 0 && static_cast<int>(cfg_rope_dim) <= actual_head_dim)
+                ? static_cast<int>(cfg_rope_dim)
+                : actual_head_dim;
             const float* freq_factors_w = (!is_swa && rope_freqs_tensor_ && rope_freqs_tensor_->type == QuantType::F32 &&
                 (rope_freqs_tensor_->size_bytes == 0 || rope_freqs_tensor_->size_bytes >= static_cast<size_t>(rope_dim / 2) * sizeof(float)))
                 ? reinterpret_cast<const float*>(rope_freqs_tensor_->data) : nullptr;
@@ -1409,9 +1444,9 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
                     }
                 }
                 if (has_kv) {
-                    Avx2Math::apply_rope(qt, kt, actual_head_dim, cfg.num_heads, layer_n_kv_heads, cur_pos, layer_freq_base, cfg.rope_freq_scale, freq_factors_w, rope_dim);
+                    Avx2Math::apply_rope(qt, kt, actual_head_dim, cfg.num_heads, layer_n_kv_heads, cur_pos, layer_freq_base, cfg.rope_freq_scale, freq_factors_w, rope_dim, cfg.is_neox_rope);
                 } else {
-                    Avx2Math::apply_rope(qt, nullptr, actual_head_dim, cfg.num_heads, 0, cur_pos, layer_freq_base, cfg.rope_freq_scale, freq_factors_w, rope_dim);
+                    Avx2Math::apply_rope(qt, nullptr, actual_head_dim, cfg.num_heads, 0, cur_pos, layer_freq_base, cfg.rope_freq_scale, freq_factors_w, rope_dim, cfg.is_neox_rope);
                 }
             }
 
@@ -1531,57 +1566,63 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
                     ? static_cast<int>(cfg.hidden_dim_per_layer[l])
                     : static_cast<int>(cfg.hidden_dim))));
 
-            if (lt.ffn_gate && lt.ffn_up) {
-                if (Avx2Math::supports_q8k_gemm(lt.ffn_gate->type, D) && Avx2Math::supports_q8k_gemm(lt.ffn_up->type, D)) {
-                    Q8KBatch ffn_batch;
-                    Avx2Math::pack_q8k_batch(norm_buf.data(), D, D, S, ffn_batch);
-                    Avx2Math::gemm_slice_q8k(ffn_gate_buf.data(), layer_F, *lt.ffn_gate, 0, ffn_batch, layer_F, D, true);
-                    Avx2Math::gemm_slice_q8k(ffn_up_buf.data(),   layer_F, *lt.ffn_up,   0, ffn_batch, layer_F, D, true);
-                } else if (Avx2Math::supports_q8_32_gemm(lt.ffn_gate->type, D) && Avx2Math::supports_q8_32_gemm(lt.ffn_up->type, D)) {
-                    Q8_32Batch ffn_batch;
-                    Avx2Math::pack_q8_32_batch(norm_buf.data(), D, D, S, ffn_batch);
-                    Avx2Math::gemm_slice_q8_32(ffn_gate_buf.data(), layer_F, *lt.ffn_gate, 0, ffn_batch, layer_F, D, true);
-                    Avx2Math::gemm_slice_q8_32(ffn_up_buf.data(),   layer_F, *lt.ffn_up,   0, ffn_batch, layer_F, D, true);
-                } else {
-                    Avx2Math::gemm(ffn_gate_buf.data(), layer_F, *lt.ffn_gate, norm_buf.data(), D, S, layer_F, D);
-                    Avx2Math::gemm(ffn_up_buf.data(),   layer_F, *lt.ffn_up,   norm_buf.data(), D, S, layer_F, D);
-                }
-                const int h_ffn_dn = (cfg.turbo_hadamard_ffn_down > 0 && (layer_F % static_cast<int>(cfg.turbo_hadamard_ffn_down)) == 0)
-                    ? static_cast<int>(cfg.turbo_hadamard_ffn_down) : 0;
-                if (use_gelu) {
-                    #pragma omp parallel for schedule(static)
-                    for (int t = 0; t < S; ++t) {
-                        const size_t off = static_cast<size_t>(t) * static_cast<size_t>(layer_F);
-                        geglu_avx2_range(ffn_gate_buf.data() + off, ffn_gate_buf.data() + off, ffn_up_buf.data() + off, layer_F);
-                        if (h_ffn_dn > 0) Avx2Math::fwht_block_inplace(ffn_gate_buf.data() + off, layer_F, h_ffn_dn);
+            const bool has_moe_layer = (lt.ffn_gate_inp && lt.ffn_down_exps &&
+                (lt.ffn_gate_up_exps || (lt.ffn_gate_exps && lt.ffn_up_exps)) && cfg.expert_count > 0);
+            if (!lt.ffn_gate && !lt.ffn_up && !lt.ffn_down && has_moe_layer) {
+                std::memset(ffn_down_buf.data(), 0, static_cast<size_t>(S) * static_cast<size_t>(D) * sizeof(float));
+            } else {
+                if (lt.ffn_gate && lt.ffn_up) {
+                    if (Avx2Math::supports_q8k_gemm(lt.ffn_gate->type, D) && Avx2Math::supports_q8k_gemm(lt.ffn_up->type, D)) {
+                        Q8KBatch ffn_batch;
+                        Avx2Math::pack_q8k_batch(norm_buf.data(), D, D, S, ffn_batch);
+                        Avx2Math::gemm_slice_q8k(ffn_gate_buf.data(), layer_F, *lt.ffn_gate, 0, ffn_batch, layer_F, D, true);
+                        Avx2Math::gemm_slice_q8k(ffn_up_buf.data(),   layer_F, *lt.ffn_up,   0, ffn_batch, layer_F, D, true);
+                    } else if (Avx2Math::supports_q8_32_gemm(lt.ffn_gate->type, D) && Avx2Math::supports_q8_32_gemm(lt.ffn_up->type, D)) {
+                        Q8_32Batch ffn_batch;
+                        Avx2Math::pack_q8_32_batch(norm_buf.data(), D, D, S, ffn_batch);
+                        Avx2Math::gemm_slice_q8_32(ffn_gate_buf.data(), layer_F, *lt.ffn_gate, 0, ffn_batch, layer_F, D, true);
+                        Avx2Math::gemm_slice_q8_32(ffn_up_buf.data(),   layer_F, *lt.ffn_up,   0, ffn_batch, layer_F, D, true);
+                    } else {
+                        Avx2Math::gemm(ffn_gate_buf.data(), layer_F, *lt.ffn_gate, norm_buf.data(), D, S, layer_F, D);
+                        Avx2Math::gemm(ffn_up_buf.data(),   layer_F, *lt.ffn_up,   norm_buf.data(), D, S, layer_F, D);
                     }
-                } else {
-                    #pragma omp parallel for schedule(static)
-                    for (int t = 0; t < S; ++t) {
-                        const size_t off = static_cast<size_t>(t) * static_cast<size_t>(layer_F);
-                        float* gb = ffn_gate_buf.data() + off;
-                        const float* ub = ffn_up_buf.data() + off;
-                        for (int idx = 0; idx < layer_F; ++idx) {
-                            const float g = gb[idx];
-                            gb[idx] = (g / (1.0f + std::exp(-g))) * ub[idx];
+                    const int h_ffn_dn = (cfg.turbo_hadamard_ffn_down > 0 && (layer_F % static_cast<int>(cfg.turbo_hadamard_ffn_down)) == 0)
+                        ? static_cast<int>(cfg.turbo_hadamard_ffn_down) : 0;
+                    if (use_gelu) {
+                        #pragma omp parallel for schedule(static)
+                        for (int t = 0; t < S; ++t) {
+                            const size_t off = static_cast<size_t>(t) * static_cast<size_t>(layer_F);
+                            geglu_avx2_range(ffn_gate_buf.data() + off, ffn_gate_buf.data() + off, ffn_up_buf.data() + off, layer_F);
+                            if (h_ffn_dn > 0) Avx2Math::fwht_block_inplace(ffn_gate_buf.data() + off, layer_F, h_ffn_dn);
                         }
-                        if (h_ffn_dn > 0) Avx2Math::fwht_block_inplace(gb, layer_F, h_ffn_dn);
+                    } else {
+                        #pragma omp parallel for schedule(static)
+                        for (int t = 0; t < S; ++t) {
+                            const size_t off = static_cast<size_t>(t) * static_cast<size_t>(layer_F);
+                            float* gb = ffn_gate_buf.data() + off;
+                            const float* ub = ffn_up_buf.data() + off;
+                            for (int idx = 0; idx < layer_F; ++idx) {
+                                const float g = gb[idx];
+                                gb[idx] = (g / (1.0f + std::exp(-g))) * ub[idx];
+                            }
+                            if (h_ffn_dn > 0) Avx2Math::fwht_block_inplace(gb, layer_F, h_ffn_dn);
+                        }
                     }
+                } else {
+                    for (int t = 0; t < S; ++t)
+                        for (int i = 0; i < layer_F; ++i)
+                            ffn_gate_buf[static_cast<size_t>(t) * static_cast<size_t>(layer_F) + static_cast<size_t>(i)] =
+                                norm_buf[static_cast<size_t>(t) * static_cast<size_t>(D) + static_cast<size_t>(i % D)] * 0.1f;
                 }
-            } else {
-                for (int t = 0; t < S; ++t)
-                    for (int i = 0; i < layer_F; ++i)
-                        ffn_gate_buf[static_cast<size_t>(t) * static_cast<size_t>(layer_F) + static_cast<size_t>(i)] =
-                            norm_buf[static_cast<size_t>(t) * static_cast<size_t>(D) + static_cast<size_t>(i % D)] * 0.1f;
-            }
 
-            if (lt.ffn_down) {
-                Avx2Math::gemm(ffn_down_buf.data(), D, *lt.ffn_down, ffn_gate_buf.data(), layer_F, S, D, layer_F);
-            } else {
-                for (int t = 0; t < S; ++t)
-                    for (int i = 0; i < D; ++i)
-                        ffn_down_buf[static_cast<size_t>(t) * static_cast<size_t>(D) + static_cast<size_t>(i)] =
-                            ffn_gate_buf[static_cast<size_t>(t) * static_cast<size_t>(layer_F) + static_cast<size_t>(i % layer_F)] * 0.05f;
+                if (lt.ffn_down) {
+                    Avx2Math::gemm(ffn_down_buf.data(), D, *lt.ffn_down, ffn_gate_buf.data(), layer_F, S, D, layer_F);
+                } else {
+                    for (int t = 0; t < S; ++t)
+                        for (int i = 0; i < D; ++i)
+                            ffn_down_buf[static_cast<size_t>(t) * static_cast<size_t>(D) + static_cast<size_t>(i)] =
+                                ffn_gate_buf[static_cast<size_t>(t) * static_cast<size_t>(layer_F) + static_cast<size_t>(i % layer_F)] * 0.05f;
+                }
             }
 
             // 2i-1b. Batched Expert-Grouped Sparse Mixture-of-Experts Branch (Ava / Gemma 4 26B-A4B MoE)
@@ -1636,8 +1677,9 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
                     }
                 }
 
-                // Pre-FFN norm 2 on X for all S tokens (+ optional Gemma 4.5 Turbo Block-FWHT)
-                const float* pre2_w = cfg.turbo_folded_norms ? default_norm_weights_.data() : safe_f32_weights(lt.pre_ffw_norm_2, cfg.embedding_dim);
+                // Pre-FFN norm 2 on X for all S tokens (fall back to ffn_norm for pure-MoE models)
+                const TensorDesc* pre2_tensor = lt.pre_ffw_norm_2 ? lt.pre_ffw_norm_2 : lt.ffn_norm;
+                const float* pre2_w = cfg.turbo_folded_norms ? default_norm_weights_.data() : safe_f32_weights(pre2_tensor, cfg.embedding_dim);
                 const int h_moe_in = (cfg.turbo_hadamard_moe_in > 0 && (D % static_cast<int>(cfg.turbo_hadamard_moe_in)) == 0)
                     ? static_cast<int>(cfg.turbo_hadamard_moe_in) : 0;
                 const int h_moe_dn = (cfg.turbo_hadamard_moe_down > 0 && (F_exp % static_cast<int>(cfg.turbo_hadamard_moe_down)) == 0)

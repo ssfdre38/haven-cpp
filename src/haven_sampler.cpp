@@ -21,18 +21,64 @@ void PersonaSampler::add_anti_robotic_penalty(uint32_t token_id, float penalty_s
 
 void PersonaSampler::initialize_vocab_counterparts(const std::vector<std::string>& vocab) {
     lemma_family_.assign(vocab.size(), {});
+    control_token_ids_.clear();
+    tok_space_lparen_ = std::numeric_limits<uint32_t>::max();
+    tok_lparen_       = std::numeric_limits<uint32_t>::max();
+    tok_hyphen_       = std::numeric_limits<uint32_t>::max();
+    tok_space_star_   = std::numeric_limits<uint32_t>::max();
+    tok_star_         = std::numeric_limits<uint32_t>::max();
+    vocab_initialized_ = !vocab.empty();
 
     std::unordered_map<std::string, std::vector<uint32_t>> stem_to_tokens;
     stem_to_tokens.reserve(vocab.size());
 
-    for (uint32_t i = 107; i < (uint32_t)vocab.size(); ++i) {
-        std::string s = vocab[i];
-        if (s.length() > 3 && 
-            (unsigned char)s[0] == 0xe2 && 
-            (unsigned char)s[1] == 0x96 && 
-            (unsigned char)s[2] == 0x81) 
+    auto is_control_tok = [](const std::string& tok) -> bool {
+        if (tok.size() >= 3 && tok.front() == '<' && tok.back() == '>') {
+            return tok == "<pad>" || tok == "<eos>" || tok == "<bos>" || tok == "<unk>" ||
+                   tok == "<s>" || tok == "</s>" ||
+                   tok == "<|turn>" || tok == "<turn|>" || tok == "<|turn|>" ||
+                   tok == "<start_of_turn>" || tok == "<end_of_turn>" || tok == "</end_of_turn>" ||
+                   tok == "<|begin_of_text|>" || tok == "<|end_of_text|>" || tok == "<|eot_id|>" ||
+                   tok == "<|start_header_id|>" || tok == "<|end_header_id|>" ||
+                   tok == "<|im_start|>" || tok == "<|im_end|>" || tok == "<|endoftext|>" ||
+                   tok == "<|system|>" || tok == "<|user|>" || tok == "<|assistant|>" || tok == "<|end|>";
+        }
+        return false;
+    };
+
+    for (uint32_t i = 0; i < (uint32_t)vocab.size(); ++i) {
+        const std::string& raw = vocab[i];
+        if (is_control_tok(raw)) {
+            control_token_ids_.insert(i);
+            continue;
+        }
+        // Dynamically resolve punctuation token IDs for ANY architecture/vocab (Gemma, Llama, Qwen, Phi)
+        if (tok_space_lparen_ == std::numeric_limits<uint32_t>::max() &&
+            (raw == "\xe2\x96\x81(" || raw == "\xc4\xa0(" || raw == " (")) {
+            tok_space_lparen_ = i;
+        } else if (tok_lparen_ == std::numeric_limits<uint32_t>::max() && raw == "(") {
+            tok_lparen_ = i;
+        } else if (tok_hyphen_ == std::numeric_limits<uint32_t>::max() && raw == "-") {
+            tok_hyphen_ = i;
+        } else if (tok_space_star_ == std::numeric_limits<uint32_t>::max() &&
+                   (raw == "\xe2\x96\x81*" || raw == "\xc4\xa0*" || raw == " *")) {
+            tok_space_star_ = i;
+        } else if (tok_star_ == std::numeric_limits<uint32_t>::max() && raw == "*") {
+            tok_star_ = i;
+        }
+
+        std::string s = raw;
+        if (s.length() > 3 &&
+            (unsigned char)s[0] == 0xe2 &&
+            (unsigned char)s[1] == 0x96 &&
+            (unsigned char)s[2] == 0x81)
         {
             s = s.substr(3);
+        } else if (s.length() > 2 &&
+                   (unsigned char)s[0] == 0xc4 &&
+                   (unsigned char)s[1] == 0xa0)
+        {
+            s = s.substr(2);
         }
         std::string lower;
         for (char c : s) lower += (char)std::tolower((unsigned char)c);
@@ -59,18 +105,25 @@ uint32_t PersonaSampler::sample(
 {
     if (!logits || vocab_size == 0) return 0;
 
-    // 0. Greedy Argmax path for deterministic generation
+    // 0. Greedy Argmax path for deterministic generation (NaN-safe)
     if (params_.temperature <= 0.05f) {
         uint32_t best_token = 0;
-        float best_logit = logits[0];
-        for (uint32_t i = 1; i < vocab_size; ++i) {
-            if (logits[i] > best_logit) {
+        float best_logit = -std::numeric_limits<float>::infinity();
+        for (uint32_t i = 0; i < vocab_size; ++i) {
+            if (!std::isnan(logits[i]) && logits[i] > best_logit) {
                 best_logit = logits[i];
                 best_token = i;
             }
         }
         return best_token;
     }
+
+    auto is_exempt_control = [&](uint32_t t) -> bool {
+        if (vocab_initialized_) {
+            return control_token_ids_.find(t) != control_token_ids_.end();
+        }
+        return t <= 3u;
+    };
 
     // 1. Standard Token Frequency / Repetition Penalty (Sliding Window of 64 tokens)
     if (params_.repetition_penalty > 1.0f && !recent_tokens.empty()) {
@@ -80,7 +133,7 @@ uint32_t PersonaSampler::sample(
 
         for (size_t i = start_idx; i < recent_tokens.size(); ++i) {
             uint32_t t = recent_tokens[i];
-            if (t > 106) { // Skip control tokens (0..106: pad, eos, bos, start_of_turn, end_of_turn)
+            if (!is_exempt_control(t)) {
                 token_counts[t]++;
             }
         }
@@ -103,7 +156,7 @@ uint32_t PersonaSampler::sample(
         uint32_t last_token = recent_tokens.back();
 
         // 2a. Consecutive Exact Word & Full Lemma Stutter Suppression (e.g. Oh oh, Just just, Anything anything)
-        if (last_token < vocab_size && last_token > 106) {
+        if (last_token < vocab_size && !is_exempt_control(last_token)) {
             logits[last_token] -= 4.5f;
             if (last_token < lemma_family_.size() && !lemma_family_[last_token].empty()) {
                 for (uint32_t sibling : lemma_family_[last_token]) {
@@ -117,7 +170,7 @@ uint32_t PersonaSampler::sample(
         // 2b. A B A Loop Suppression
         if (n_tokens >= 2) {
             uint32_t prev2 = recent_tokens[n_tokens - 2];
-            if (prev2 < vocab_size && prev2 > 106) {
+            if (prev2 < vocab_size && !is_exempt_control(prev2)) {
                 logits[prev2] -= 2.5f;
                 if (prev2 < lemma_family_.size() && !lemma_family_[prev2].empty()) {
                     for (uint32_t sibling : lemma_family_[prev2]) {
@@ -129,29 +182,23 @@ uint32_t PersonaSampler::sample(
             }
         }
 
-        // 2c. Turn-Start Parenthetical Action Suppression (Tokens 568 = ' (', 236769 = '(')
-        if (n_tokens <= 2) {
-            if (vocab_size > 568) logits[568] -= 6.0f; // Prevent starting turn with "(chuckles..."
-            if (vocab_size > 236769) logits[236769] -= 6.0f;
-        }
-
-        // 2d. General & Consecutive Hyphen / Run-on Suppression (Token 236772 = '-')
-        if (vocab_size > 236772) {
-            logits[236772] -= 1.5f; // Mildly discourage coining hyphenated adjective compounds (anxious-storming)
-            if (last_token == 236772) {
-                logits[236772] -= 8.0f; // Strongly suppress hyphen-chains (e.g. I-don't-don't-can't)
+        // 2c-2e. Vocab-resolved formatting penalties (NEVER hardcode Gemma-4 IDs on Llama/Qwen/Phi!)
+        if (vocab_initialized_) {
+            if (n_tokens <= 2) {
+                if (tok_space_lparen_ < vocab_size) logits[tok_space_lparen_] -= 6.0f;
+                if (tok_lparen_ < vocab_size)       logits[tok_lparen_]       -= 6.0f;
             }
+            if (tok_hyphen_ < vocab_size) {
+                logits[tok_hyphen_] -= 1.5f;
+                if (last_token == tok_hyphen_) {
+                    logits[tok_hyphen_] -= 8.0f;
+                }
+            }
+            if (tok_space_star_ < vocab_size) logits[tok_space_star_] -= 8.0f;
+            if (tok_star_ < vocab_size)       logits[tok_star_]       -= 8.0f;
         }
 
-        // 2e. Roleplay Asterisk Suppression (Token 808 = ' *', Token 236829 = '*')
-        if (vocab_size > 808) {
-            logits[808] -= 8.0f; // Strongly suppress spaced asterisk (' *you')
-        }
-        if (vocab_size > 236829) {
-            logits[236829] -= 8.0f; // Strongly suppress raw asterisk ('*')
-        }
-
-        // 2e. 3-gram and 2-gram Phrase Repetition Suppression
+        // 2f. 3-gram and 2-gram Phrase Repetition Suppression
         if (n_tokens >= 2) {
             uint32_t prev1 = recent_tokens[n_tokens - 1];
             uint32_t prev2 = recent_tokens[n_tokens - 2];
@@ -159,7 +206,7 @@ uint32_t PersonaSampler::sample(
             for (size_t i = 0; i + 2 < n_tokens; ++i) {
                 if (recent_tokens[i] == prev2 && recent_tokens[i + 1] == prev1) {
                     uint32_t repeated_follower = recent_tokens[i + 2];
-                    if (repeated_follower < vocab_size && repeated_follower > 106) {
+                    if (repeated_follower < vocab_size && !is_exempt_control(repeated_follower)) {
                         logits[repeated_follower] -= 3.5f; // Break 3-gram phrase loops cleanly
                     }
                 }

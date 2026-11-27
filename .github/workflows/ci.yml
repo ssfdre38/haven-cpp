@@ -23,21 +23,27 @@ jobs:
       - name: Build core binaries and test suites
         run: |
           cmake --build build --target \
+            haven_engine \
             haven-cli \
             haven-server \
             haven-bake \
+            haven-modules \
             test-turbo-bake \
             test-security-fuzz \
             test-secure-cluster \
             test-multi-model-arch \
             test-model-intelligence \
             test-lean-session \
-            haven-modules \
+            test-haven-sway \
+            quickstart-sway \
+            test-cluster-fabric \
+            test-pathways-e2e \
+            test-cuda-gemma4 \
             test-tpu-scheduler \
             test-tpu-gemma4-onchip \
             -j$(nproc)
 
-      - name: Run zero-GGUF security, architecture, intelligence, lean session, scheduler & TPU StableHLO tests
+      - name: Run zero-GGUF security, architecture, intelligence, lean session, cluster, sway & TPU StableHLO tests
         run: |
           ./build/test-turbo-bake
           ./build/test-security-fuzz
@@ -45,6 +51,11 @@ jobs:
           ./build/test-multi-model-arch
           ./build/test-model-intelligence
           ./build/test-lean-session
+          ./build/test-haven-sway
+          ./build/quickstart-sway
+          ./build/test-cluster-fabric
+          ./build/test-pathways-e2e
+          ./build/test-cuda-gemma4 --probe-only
           ./build/test-tpu-scheduler
           ./build/test-tpu-gemma4-onchip --emit-only-synthetic
 
@@ -71,24 +82,31 @@ jobs:
       - name: Build core binaries and test suites
         run: |
           cmake --build build --target `
+            haven_engine `
             haven-cli `
             haven-server `
             haven-bake `
+            haven-modules `
             test-turbo-bake `
             test-security-fuzz `
             test-secure-cluster `
             test-multi-model-arch `
             test-model-intelligence `
             test-lean-session `
-            haven-modules `
+            test-haven-sway `
+            quickstart-sway `
+            test-cluster-fabric `
+            test-pathways-e2e `
+            test-cuda-gemma4 `
             test-tpu-scheduler `
             test-tpu-gemma4-onchip `
             plugin_terminal `
             plugin_workspace_coder `
             plugin_vault_sync `
-            plugin_browser
+            plugin_browser `
+            plugin_sqlite_graph
 
-      - name: Run zero-GGUF security, architecture, intelligence, lean session, scheduler & TPU StableHLO tests
+      - name: Run zero-GGUF security, architecture, intelligence, lean session, cluster, sway & TPU StableHLO tests
         run: |
           .\build\test-turbo-bake.exe
           .\build\test-security-fuzz.exe
@@ -96,5 +114,17 @@ jobs:
           .\build\test-multi-model-arch.exe
           .\build\test-model-intelligence.exe
           .\build\test-lean-session.exe
+          .\build\test-haven-sway.exe
+          .\build\quickstart-sway.exe
+          .\build\test-cluster-fabric.exe
+          .\build\test-pathways-e2e.exe
+          .\build\test-cuda-gemma4.exe --probe-only
           .\build\test-tpu-scheduler.exe
           .\build\test-tpu-gemma4-onchip.exe --emit-only-synthetic
+
+      - name: Verify ultra-lean desktop/edge build (-DHAVEN_ENABLE_TPU=OFF)
+        run: |
+          cmake -B build-lean -G Ninja -DCMAKE_BUILD_TYPE=Release -DHAVEN_ENABLE_TPU=OFF
+          cmake --build build-lean --target haven-cli haven-server haven-bake haven-modules test-model-intelligence test-lean-session
+          .\build-lean\test-model-intelligence.exe
+          .\build-lean\test-lean-session.exe

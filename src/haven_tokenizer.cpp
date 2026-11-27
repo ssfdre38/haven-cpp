@@ -19,6 +19,10 @@ void HavenTokenizer::initialize(const std::vector<std::string>& vocab, const Mod
     pad_token_ = 0;
     unk_token_ = 3;
     add_space_prefix_ = true;
+    is_gpt2_bpe_ = false;
+
+    bool has_sp_space = false;
+    bool has_gpt2_space = false;
 
     // Priority flags prevent literal vocab tokens like Gemma 4's "<s>" (203) / "</s>" (212)
     // from overwriting canonical "<bos>" (2) / "<eos>" (1)!
@@ -30,6 +34,12 @@ void HavenTokenizer::initialize(const std::vector<std::string>& vocab, const Mod
     for (uint32_t i = 0; i < (uint32_t)vocab.size(); ++i) {
         if (token_to_id_.find(vocab[i]) == token_to_id_.end()) {
             token_to_id_[vocab[i]] = i;
+        }
+        if (!has_sp_space && vocab[i].find("\xe2\x96\x81") != std::string::npos) {
+            has_sp_space = true;
+        }
+        if (!has_gpt2_space && vocab[i].find("\xc4\xa0") != std::string::npos) {
+            has_gpt2_space = true;
         }
         if (vocab[i] == "<bos>" || vocab[i] == "<|begin_of_text|>") {
             if (!found_primary_bos) { bos_token_ = i; found_primary_bos = true; found_any_bos = true; }
@@ -45,14 +55,21 @@ void HavenTokenizer::initialize(const std::vector<std::string>& vocab, const Mod
             unk_token_ = i;
         }
 
-        // Register universal stop tokens
+        // Register universal stop tokens (Gemma, Llama 3, Qwen 2/2.5/3, Phi-3/4, Mistral)
         if (vocab[i] == "<eos>" || vocab[i] == "<turn|>" || vocab[i] == "<|turn|>" ||
             vocab[i] == "<end_of_turn>" || vocab[i] == "</end_of_turn>" ||
             vocab[i] == "<|eot_id|>" || vocab[i] == "<|end_of_text|>" ||
             vocab[i] == "<|im_end|>" || vocab[i] == "<|endoftext|>" ||
+            vocab[i] == "<|end|>" ||
             (vocab[i] == "</s>" && (!cfg || !cfg->is_gemma))) {
             stop_tokens_.insert(i);
         }
+    }
+
+    // Auto-detect GPT-2 byte-level BPE (Llama 3, Qwen 2/2.5/3): uses Ġ (\xc4\xa0) and Ċ (\xc4\x8a)
+    is_gpt2_bpe_ = has_gpt2_space && !has_sp_space;
+    if (is_gpt2_bpe_) {
+        add_space_prefix_ = false;
     }
 
     // Honor authoritative GGUF header tokenizer metadata whenever present
@@ -73,20 +90,23 @@ void HavenTokenizer::initialize(const std::vector<std::string>& vocab, const Mod
 
 std::vector<uint32_t> HavenTokenizer::encode(const std::string& text, bool add_bos) const {
     std::vector<uint32_t> tokens;
-    if (vocab_.empty() || text.empty()) return tokens;
+    if (vocab_.empty()) return tokens;
 
     if (add_bos) {
         tokens.push_back(bos_token_);
     }
+    if (text.empty()) return tokens;
 
-    // List of priority control tokens across architectures (Gemma, LLaMA 3, Qwen 2.5, Mistral)
+    // List of priority control tokens across architectures (Gemma, LLaMA 3, Qwen 2.5, Phi-3, Mistral)
     static const std::vector<std::string> control_tokens = {
         "<|turn>", "<turn|>", "<bos>", "<eos>", "<pad>",
         "<|think|>", "<|channel>", "<channel|>",
         "<|tool_call>", "<tool_call|>", "<|tool_response>", "<tool_response|>",
         "<start_of_turn>", "<end_of_turn>", "</end_of_turn>",
         "<|begin_of_text|>", "<|end_of_text|>", "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>",
-        "<|im_start|>", "<|im_end|>", "<|endoftext|>", "<s>", "</s>"
+        "<|im_start|>", "<|im_end|>", "<|endoftext|>",
+        "<|system|>", "<|user|>", "<|assistant|>", "<|end|>",
+        "<s>", "</s>"
     };
 
     size_t pos = 0;
@@ -127,18 +147,26 @@ std::vector<uint32_t> HavenTokenizer::encode(const std::string& text, bool add_b
         std::string segment = text.substr(pos, next_ctrl - pos);
         pos = next_ctrl;
 
-        // Replace regular spaces with SentencePiece space indicator (\xe2\x96\x81 = ▁)
-        // Only prepend dummy prefix (\xe2\x96\x81) when add_space_prefix_ is enabled (never before '\n' or on Gemma 4!)
+        // Normalize spaces/newlines according to vocabulary style (GPT-2 BPE Ġ/Ċ vs SentencePiece ▁)
         std::string normalized;
         normalized.reserve(segment.length() * 2);
-        for (size_t i = 0; i < segment.length(); ++i) {
-            if (segment[i] == ' ') {
-                normalized += "\xe2\x96\x81";
-            } else {
-                if (add_space_prefix_ && segment[i] != '\n' && (normalized.empty() || normalized.back() == '\n')) {
+        if (is_gpt2_bpe_) {
+            for (size_t i = 0; i < segment.length(); ++i) {
+                if (segment[i] == ' ') normalized += "\xc4\xa0";       // Ġ (U+0120)
+                else if (segment[i] == '\n') normalized += "\xc4\x8a"; // Ċ (U+010A)
+                else if (segment[i] == '\t') normalized += "\xc4\x89"; // ĉ (U+0109)
+                else normalized += segment[i];
+            }
+        } else {
+            for (size_t i = 0; i < segment.length(); ++i) {
+                if (segment[i] == ' ') {
                     normalized += "\xe2\x96\x81";
+                } else {
+                    if (add_space_prefix_ && pos == next_ctrl && i == 0 && tokens.size() <= (add_bos ? 1u : 0u) && segment[i] != '\n') {
+                        normalized += "\xe2\x96\x81";
+                    }
+                    normalized += segment[i];
                 }
-                normalized += segment[i];
             }
         }
 
@@ -193,25 +221,24 @@ std::string HavenTokenizer::decode_token(uint32_t token_id) const {
         raw == "<pad>" || raw == "</s>" || raw == "<s>" ||
         raw == "<|begin_of_text|>" || raw == "<|end_of_text|>" ||
         raw == "<|start_header_id|>" || raw == "<|end_header_id|>" || raw == "<|eot_id|>" ||
-        raw == "<|im_start|>" || raw == "<|im_end|>" || raw == "<|endoftext|>") {
+        raw == "<|im_start|>" || raw == "<|im_end|>" || raw == "<|endoftext|>" ||
+        raw == "<|system|>" || raw == "<|user|>" || raw == "<|assistant|>" || raw == "<|end|>") {
         return "";
     }
 
     // Parse byte fallback tokens <0xXX>
     if (raw.length() == 6 && raw.rfind("<0x", 0) == 0 && raw[5] == '>') {
-        try {
-            unsigned int byte_val = 0;
-            std::stringstream ss;
-            ss << std::hex << raw.substr(3, 2);
-            ss >> byte_val;
-            return std::string(1, (char)(uint8_t)byte_val);
-        } catch (...) {
-            return "";
+        unsigned int byte_val = 0;
+        std::stringstream ss;
+        ss << std::hex << raw.substr(3, 2);
+        if ((ss >> byte_val) && ss.eof() && byte_val <= 0xFFu) {
+            return std::string(1, static_cast<char>(static_cast<uint8_t>(byte_val)));
         }
     }
 
-    // Replace SentencePiece space character (\xe2\x96\x81) with standard ASCII space
+    // Replace SentencePiece (▁) and GPT-2 BPE (Ġ/Ċ/ĉ) markers with standard ASCII whitespace
     std::string out;
+    out.reserve(raw.length());
     size_t i = 0;
     while (i < raw.length()) {
         if (i + 2 < raw.length() && 
@@ -219,8 +246,13 @@ std::string HavenTokenizer::decode_token(uint32_t token_id) const {
             (unsigned char)raw[i+1] == 0x96 && 
             (unsigned char)raw[i+2] == 0x81) 
         {
-            out += " ";
+            out += ' ';
             i += 3;
+        } else if (is_gpt2_bpe_ && i + 1 < raw.length() && (unsigned char)raw[i] == 0xc4) {
+            if ((unsigned char)raw[i+1] == 0xa0) { out += ' '; i += 2; continue; }
+            if ((unsigned char)raw[i+1] == 0x8a) { out += '\n'; i += 2; continue; }
+            if ((unsigned char)raw[i+1] == 0x89) { out += '\t'; i += 2; continue; }
+            out += raw[i++];
         } else {
             out += raw[i];
             i++;

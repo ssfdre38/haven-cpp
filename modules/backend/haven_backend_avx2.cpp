@@ -80,7 +80,8 @@ HAVEN_MOD_EXPORT int haven_backend_probe_runtime(HavenBackendProbeResult* out) {
             if (iss >> kb) out->free_mem_bytes = kb * 1024ULL;
         }
     }
-    has_hmb_vmm = std::filesystem::exists("/proc/hmb_pagefile") || std::filesystem::exists("/proc/hmb_swap");
+    std::error_code ec1, ec2;
+    has_hmb_vmm = std::filesystem::exists("/proc/hmb_pagefile", ec1) || std::filesystem::exists("/proc/hmb_swap", ec2);
     if (has_hmb_vmm) out->supported_features |= HAVEN_FEAT_HMB_VMM;
 #endif
 

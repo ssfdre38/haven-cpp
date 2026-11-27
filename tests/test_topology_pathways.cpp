@@ -2,6 +2,7 @@
 #include "haven/haven_pathways.h"
 #include <iostream>
 #include <cassert>
+#include "haven/haven_test_check.h"
 #include <vector>
 
 int main() {

@@ -65,6 +65,8 @@ public:
 
     HavenEngine();
     ~HavenEngine();
+    HavenEngine(const HavenEngine&) = delete;
+    HavenEngine& operator=(const HavenEngine&) = delete;
 
     bool load_model(const std::string& gguf_filepath);
     

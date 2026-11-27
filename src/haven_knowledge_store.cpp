@@ -28,7 +28,7 @@ void StructuredKnowledgeStore::apply_knowledge_boost(
     uint32_t active_cluster_id,
     int seq_len)
 {
-    if (lookup_table_.empty() || seq_len <= 0) return;
+    if (!attention_scores || lookup_table_.empty() || seq_len <= 0) return;
 
     uint64_t key = make_composite_key(current_token_id, active_cluster_id);
     auto it = lookup_table_.find(key);

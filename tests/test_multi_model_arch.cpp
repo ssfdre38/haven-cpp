@@ -4,6 +4,7 @@
 #include "haven/haven_tokenizer.h"
 #include <iostream>
 #include <cassert>
+#include "haven/haven_test_check.h"
 #include <cmath>
 #include <filesystem>
 

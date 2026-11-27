@@ -27,8 +27,9 @@ void YaRNScaler::compute_frequencies(uint32_t head_dim, float base_freq, std::ve
     }
     inv_freqs.resize(head_dim / 2);
 
-    float low_freq_wavelen = config_.original_context / config_.beta;
-    float high_freq_wavelen = config_.original_context / config_.alpha;
+    // YaRN paper: beta=32 (fast/high-freq cycles -> short wavelen), alpha=1 (slow/low-freq cycles -> long wavelen)
+    float high_freq_wavelen = config_.original_context / config_.beta;
+    float low_freq_wavelen = config_.original_context / config_.alpha;
     float denom = (config_.beta != config_.alpha) ? (config_.beta - config_.alpha) : 1.0f;
 
     for (size_t i = 0; i < head_dim / 2; ++i) {

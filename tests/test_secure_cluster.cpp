@@ -3,6 +3,7 @@
 #include <iostream>
 #include <iomanip>
 #include <cassert>
+#include "haven/haven_test_check.h"
 #include <cmath>
 #include <cstring>
 #include <vector>

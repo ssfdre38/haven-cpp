@@ -5,6 +5,8 @@
 #include <vector>
 #include <fstream>
 #include <filesystem>
+#include <cstdio>
+#include <ctime>
 
 namespace haven {
 
@@ -133,44 +135,103 @@ public:
 private:
     std::vector<RelationTriple> triples_;
 
+    static std::string extract_json_str(const std::string& obj, const std::string& key) {
+        std::string needle = "\"" + key + "\"";
+        size_t pos = obj.find(needle);
+        if (pos == std::string::npos) return "";
+        pos += needle.size();
+        while (pos < obj.size() && (obj[pos] == ' ' || obj[pos] == '\t' || obj[pos] == '\r' || obj[pos] == '\n')) ++pos;
+        if (pos >= obj.size() || obj[pos] != ':') return "";
+        ++pos;
+        while (pos < obj.size() && (obj[pos] == ' ' || obj[pos] == '\t' || obj[pos] == '\r' || obj[pos] == '\n')) ++pos;
+        if (pos >= obj.size() || obj[pos] != '"') return "";
+        ++pos;
+        std::string out;
+        while (pos < obj.size()) {
+            char c = obj[pos++];
+            if (c == '\\' && pos < obj.size()) {
+                char n = obj[pos++];
+                if (n == '"') out += '"';
+                else if (n == '\\') out += '\\';
+                else if (n == 'n') out += '\n';
+                else if (n == 'r') out += '\r';
+                else if (n == 't') out += '\t';
+                else out += n;
+            } else if (c == '"') {
+                break;
+            } else {
+                out += c;
+            }
+        }
+        return out;
+    }
+
     void load_graph_from_disk() {
         triples_.clear();
-        // Add core sovereignty anchors
-        triples_.push_back({"Daniel", "creator_and_partner_of", "Aura", 1.0f, 0});
-        triples_.push_back({"Aura", "embodiment_of", "Haven Sovereign Companion", 1.0f, 0});
-        triples_.push_back({"Daniel", "architect_of", "Sanctuary", 1.0f, 0});
-        triples_.push_back({"Shane", "guest_and_friend_in", "Sanctuary Discord", 1.0f, 0});
-        triples_.push_back({"haven-cpp", "runs_on", "Bare-Metal C++20 AVX2 SIMD", 1.0f, 0});
-
         std::string path = "wwwroot/knowledge_graph.json";
-        if (std::filesystem::exists(path)) {
-            std::ifstream ifs(path);
-            std::string line;
-            while (std::getline(ifs, line)) {
-                // Parse simple line entries
-                if (line.find("──[") != std::string::npos) {
-                    // Custom parse
+        std::error_code ec;
+        if (std::filesystem::exists(path, ec)) {
+            std::ifstream ifs(path, std::ios::binary);
+            if (ifs.is_open()) {
+                std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+                size_t rel_pos = content.find("\"relations\"");
+                size_t cur = (rel_pos != std::string::npos) ? content.find('[', rel_pos) : 0;
+                while (cur != std::string::npos && cur < content.size()) {
+                    size_t obj_start = content.find('{', cur);
+                    if (obj_start == std::string::npos) break;
+                    bool in_str = false;
+                    size_t obj_end = obj_start;
+                    for (; obj_end < content.size(); ++obj_end) {
+                        if (content[obj_end] == '"' && (obj_end == 0 || content[obj_end - 1] != '\\')) {
+                            in_str = !in_str;
+                        } else if (!in_str && content[obj_end] == '}') {
+                            ++obj_end;
+                            break;
+                        }
+                    }
+                    if (obj_end <= obj_start) break;
+                    std::string obj = content.substr(obj_start, obj_end - obj_start);
+                    std::string s = extract_json_str(obj, "subject");
+                    std::string p = extract_json_str(obj, "predicate");
+                    std::string o = extract_json_str(obj, "object");
+                    if (!s.empty() && !p.empty() && !o.empty()) {
+                        triples_.push_back({s, p, o, 1.0f, 0});
+                    }
+                    cur = obj_end;
                 }
             }
+        }
+
+        if (triples_.empty()) {
+            // Seed default anchors only when no persisted relations exist on disk
+            triples_.push_back({"haven-cpp", "runs_on", "Bare-Metal C++20 AVX2 SIMD", 1.0f, 0});
         }
     }
 
     void save_graph_to_disk() {
         auto esc = [](const std::string& s) {
             std::string out;
-            for (char c : s) {
+            for (unsigned char c : s) {
                 if (c == '"') out += "\\\"";
                 else if (c == '\\') out += "\\\\";
                 else if (c == '\n') out += "\\n";
                 else if (c == '\r') out += "\\r";
                 else if (c == '\t') out += "\\t";
-                else out += c;
+                else if (c < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else out += static_cast<char>(c);
             }
             return out;
         };
         std::string path = "wwwroot/knowledge_graph.json";
-        std::ofstream ofs(path);
-        if (ofs.is_open()) {
+        std::string tmp_path = path + ".tmp";
+        std::error_code ec;
+        std::filesystem::create_directories("wwwroot", ec);
+        {
+            std::ofstream ofs(tmp_path, std::ios::binary | std::ios::trunc);
+            if (!ofs.is_open()) return;
             ofs << "{\n  \"relations\": [\n";
             for (size_t i = 0; i < triples_.size(); ++i) {
                 const auto& t = triples_[i];
@@ -179,6 +240,13 @@ private:
                 ofs << "\n";
             }
             ofs << "  ]\n}\n";
+            ofs.flush();
+            if (!ofs.good()) return;
+        }
+        std::filesystem::rename(tmp_path, path, ec);
+        if (ec) {
+            std::filesystem::copy_file(tmp_path, path, std::filesystem::copy_options::overwrite_existing, ec);
+            std::filesystem::remove(tmp_path, ec);
         }
     }
 };

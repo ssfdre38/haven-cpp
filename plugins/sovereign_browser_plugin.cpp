@@ -274,16 +274,28 @@ private:
             if ((ip6[0] & 0xFE) == 0xFC) return true;     // fc00::/7 (Unique Local)
             if (ip6[0] == 0xFE && (ip6[1] & 0xC0) == 0x80) return true; // fe80::/10 (Link-local)
             if (ip6[0] == 0xFF) return true;              // ff00::/8 (Multicast)
-            // IPv4-mapped ::ffff:a.b.c.d
-            bool v4_mapped = true;
-            for (int i = 0; i < 10; ++i) if (ip6[i] != 0) { v4_mapped = false; break; }
-            if (v4_mapped && ip6[10] == 0xFF && ip6[11] == 0xFF) {
+            // IPv4-mapped ::ffff:a.b.c.d and IPv4-compatible ::a.b.c.d
+            bool first_10_zero = true;
+            for (int i = 0; i < 10; ++i) if (ip6[i] != 0) { first_10_zero = false; break; }
+            if (first_10_zero && ((ip6[10] == 0xFF && ip6[11] == 0xFF) || (ip6[10] == 0x00 && ip6[11] == 0x00))) {
                 uint32_t v4 = (static_cast<uint32_t>(ip6[12]) << 24) |
                               (static_cast<uint32_t>(ip6[13]) << 16) |
                               (static_cast<uint32_t>(ip6[14]) << 8) |
                               static_cast<uint32_t>(ip6[15]);
                 return is_blocked_ipv4(v4);
             }
+            // NAT64 well-known prefix 64:ff9b::/96 (check embedded IPv4)
+            if (ip6[0] == 0x00 && ip6[1] == 0x64 && ip6[2] == 0xFF && ip6[3] == 0x9B) {
+                uint32_t v4 = (static_cast<uint32_t>(ip6[12]) << 24) |
+                              (static_cast<uint32_t>(ip6[13]) << 16) |
+                              (static_cast<uint32_t>(ip6[14]) << 8) |
+                              static_cast<uint32_t>(ip6[15]);
+                if (is_blocked_ipv4(v4)) return true;
+            }
+            // 6to4 (2002::/16) and Teredo (2001:0000::/32) transition ranges & 100::/64 discard
+            if (ip6[0] == 0x20 && ip6[1] == 0x02) return true;
+            if (ip6[0] == 0x20 && ip6[1] == 0x01 && ip6[2] == 0x00 && ip6[3] == 0x00) return true;
+            if (ip6[0] == 0x01 && ip6[1] == 0x00 && ip6[2] == 0x00 && ip6[3] == 0x00) return true;
             return false;
         };
 
@@ -304,29 +316,46 @@ private:
         }
         bool has_safe_addr = false;
         bool has_blocked_addr = false;
+        std::string pinned_ip;
         for (struct addrinfo* ai = res_list; ai != nullptr; ai = ai->ai_next) {
             if (ai->ai_family == AF_INET) {
                 auto* sin = reinterpret_cast<sockaddr_in*>(ai->ai_addr);
                 uint32_t ip_h = ntohl(sin->sin_addr.s_addr);
                 if (is_blocked_ipv4(ip_h)) { has_blocked_addr = true; break; }
+                if (pinned_ip.empty()) {
+                    char ipbuf[INET_ADDRSTRLEN] = {0};
+                    if (inet_ntop(AF_INET, &sin->sin_addr, ipbuf, sizeof(ipbuf))) {
+                        pinned_ip = ipbuf;
+                    }
+                }
                 has_safe_addr = true;
             } else if (ai->ai_family == AF_INET6) {
                 auto* sin6 = reinterpret_cast<sockaddr_in6*>(ai->ai_addr);
                 if (is_blocked_ipv6(reinterpret_cast<const uint8_t*>(&sin6->sin6_addr))) {
                     has_blocked_addr = true; break;
                 }
+                if (pinned_ip.empty()) {
+                    char ipbuf[INET6_ADDRSTRLEN] = {0};
+                    if (inet_ntop(AF_INET6, &sin6->sin6_addr, ipbuf, sizeof(ipbuf))) {
+                        pinned_ip = std::string("[") + ipbuf + "]";
+                    }
+                }
                 has_safe_addr = true;
             }
         }
         freeaddrinfo(res_list);
         if (wsa_started) WSACleanup();
-        if (has_blocked_addr || !has_safe_addr) return "";
+        if (has_blocked_addr || !has_safe_addr || pinned_ip.empty()) return "";
 
-        std::wstring whost(host.begin(), host.end());
+        // For plaintext HTTP, pin directly to the validated resolved IP with explicit Host header
+        // (prevents DNS rebinding TOCTOU). For HTTPS, use hostname for strict SNI/cert verification
+        // and verify the actual connected peer IP via WINHTTP_OPTION_CONNECTION_INFO before reading!
+        std::string connect_target = is_https ? host : pinned_ip;
+        std::wstring whost(connect_target.begin(), connect_target.end());
         std::wstring wpath(path.begin(), path.end());
 
         HINTERNET hSession = WinHttpOpen(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) HavenSovereignBrowser/2.0",
-                                         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+                                         WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
         if (!hSession) return "";
 
         WinHttpSetTimeouts(hSession, 5000, 5000, 10000, 10000);
@@ -349,11 +378,40 @@ private:
         DWORD redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
         WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirect_policy, sizeof(redirect_policy));
 
+        std::wstring extra_hdrs;
+        if (!is_https) {
+            std::string host_val = (port == 80) ? host : (host + ":" + std::to_string(port));
+            extra_hdrs = L"Host: " + std::wstring(host_val.begin(), host_val.end()) + L"\r\n";
+        }
+
         // Strict TLS certificate validation enforced by default (CWE-295 compliance)
 
         std::string response;
-        if (WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+        if (WinHttpSendRequest(hRequest,
+                               extra_hdrs.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : extra_hdrs.c_str(),
+                               static_cast<DWORD>(extra_hdrs.size()),
+                               WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
             WinHttpReceiveResponse(hRequest, NULL)) {
+#ifdef WINHTTP_OPTION_CONNECTION_INFO
+            WINHTTP_CONNECTION_INFO conn_info{};
+            DWORD ci_len = sizeof(conn_info);
+            if (WinHttpQueryOption(hRequest, WINHTTP_OPTION_CONNECTION_INFO, &conn_info, &ci_len)) {
+                bool peer_blocked = false;
+                if (conn_info.RemoteAddress.ss_family == AF_INET) {
+                    const auto* s4 = reinterpret_cast<const sockaddr_in*>(&conn_info.RemoteAddress);
+                    peer_blocked = is_blocked_ipv4(ntohl(s4->sin_addr.s_addr));
+                } else if (conn_info.RemoteAddress.ss_family == AF_INET6) {
+                    const auto* s6 = reinterpret_cast<const sockaddr_in6*>(&conn_info.RemoteAddress);
+                    peer_blocked = is_blocked_ipv6(reinterpret_cast<const uint8_t*>(&s6->sin6_addr));
+                }
+                if (peer_blocked) {
+                    WinHttpCloseHandle(hRequest);
+                    WinHttpCloseHandle(hConnect);
+                    WinHttpCloseHandle(hSession);
+                    return "";
+                }
+            }
+#endif
             DWORD dwSize = 0;
             DWORD dwDownloaded = 0;
             do {

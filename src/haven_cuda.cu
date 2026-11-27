@@ -417,8 +417,9 @@ __device__ __forceinline__ float warp_dot_q4_0(const uint8_t* __restrict__ row_p
         const float d = d_fp16_to_f32(blk->d);
         const uint8_t q = blk->qs[j];
         const float* xb = x + (b << 5);
-        acc = fmaf(d * static_cast<float>(static_cast<int>(q & 0x0Fu) - 8), xb[j * 2 + 0], acc);
-        acc = fmaf(d * static_cast<float>(static_cast<int>(q >> 4)    - 8), xb[j * 2 + 1], acc);
+        // GGUF split-half Q4_0 layout: low nibbles -> [0..15], high nibbles -> [16..31]
+        acc = fmaf(d * static_cast<float>(static_cast<int>(q & 0x0Fu) - 8), xb[j], acc);
+        acc = fmaf(d * static_cast<float>(static_cast<int>(q >> 4)    - 8), xb[j + 16], acc);
     }
     return warp_reduce_sum(acc);
 }
@@ -723,8 +724,8 @@ __global__ void k_dequant_to_f16(const uint8_t* __restrict__ W, QuantType qtype,
         const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(rp + static_cast<size_t>(b) * sizeof(block_q4_0));
         const float d = d_fp16_to_f32(blk->d);
         const uint8_t q = blk->qs[j];
-        dst[(b << 5) + j * 2 + 0] = __float2half(d * static_cast<float>(static_cast<int>(q & 0x0Fu) - 8));
-        dst[(b << 5) + j * 2 + 1] = __float2half(d * static_cast<float>(static_cast<int>(q >> 4)    - 8));
+        dst[(b << 5) + j]      = __float2half(d * static_cast<float>(static_cast<int>(q & 0x0Fu) - 8));
+        dst[(b << 5) + 16 + j] = __float2half(d * static_cast<float>(static_cast<int>(q >> 4)    - 8));
     } else if (qtype == QuantType::Q3_K) {
         const int nb = K >> 8;
         const int b = tid >> 5;
@@ -875,6 +876,17 @@ __global__ void k_dequant_rows_f32(const uint8_t* __restrict__ W, QuantType qtyp
         const uint8_t q = blk->qs[j];
         dst[(b << 5) + j]      = fmaf(d, static_cast<float>((q & 0x0Fu) | (((qh >> j) & 1u) << 4)), m) * scale;
         dst[(b << 5) + 16 + j] = fmaf(d, static_cast<float>((q >> 4)    | (((qh >> (j + 16)) & 1u) << 4)), m) * scale;
+    } else if (qtype == QuantType::Q5_0) {
+        const int nb = K >> 5;
+        const int b = tid >> 4;
+        if (b >= nb) return;
+        const int j = tid & 15;
+        const block_q5_0* blk = reinterpret_cast<const block_q5_0*>(rp + static_cast<size_t>(b) * sizeof(block_q5_0));
+        const float d = d_fp16_to_f32(blk->d) * scale;
+        uint32_t qh; memcpy(&qh, blk->qh, sizeof(uint32_t));
+        const uint8_t q = blk->qs[j];
+        dst[(b << 5) + j]      = d * static_cast<float>(static_cast<int>((q & 0x0Fu) | (((qh >> j) & 1u) << 4)) - 16);
+        dst[(b << 5) + 16 + j] = d * static_cast<float>(static_cast<int>((q >> 4)    | (((qh >> (j + 16)) & 1u) << 4)) - 16);
     } else if (qtype == QuantType::Q4_0) {
         const int nb = K >> 5;
         const int b = tid >> 4;
@@ -883,8 +895,36 @@ __global__ void k_dequant_rows_f32(const uint8_t* __restrict__ W, QuantType qtyp
         const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(rp + static_cast<size_t>(b) * sizeof(block_q4_0));
         const float d = d_fp16_to_f32(blk->d) * scale;
         const uint8_t q = blk->qs[j];
-        dst[(b << 5) + j * 2 + 0] = d * static_cast<float>(static_cast<int>(q & 0x0Fu) - 8);
-        dst[(b << 5) + j * 2 + 1] = d * static_cast<float>(static_cast<int>(q >> 4)    - 8);
+        dst[(b << 5) + j]      = d * static_cast<float>(static_cast<int>(q & 0x0Fu) - 8);
+        dst[(b << 5) + 16 + j] = d * static_cast<float>(static_cast<int>(q >> 4)    - 8);
+    } else if (qtype == QuantType::Q3_K) {
+        const int nb = K >> 8;
+        const int b = tid >> 5;
+        if (b >= nb) return;
+        const int lane = tid & 31;
+        const block_q3_K* blk = reinterpret_cast<const block_q3_K*>(rp + static_cast<size_t>(b) * sizeof(block_q3_K));
+        const float d_all = d_fp16_to_f32(blk->d) * scale;
+        uint32_t aux[4]; memcpy(aux, blk->scales, 12);
+        const uint32_t tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & 0x0F0F0F0Fu) | (((tmp >> 4) & 0x03030303u) << 4);
+        aux[3] = ((aux[1] >> 4) & 0x0F0F0F0Fu) | (((tmp >> 6) & 0x03030303u) << 4);
+        aux[0] = (aux[0] & 0x0F0F0F0Fu) | (((tmp >> 0) & 0x03030303u) << 4);
+        aux[1] = (aux[1] & 0x0F0F0F0Fu) | (((tmp >> 2) & 0x03030303u) << 4);
+        const int8_t* sc = reinterpret_cast<const int8_t*>(aux);
+        for (int n = 0; n < 2; ++n) {
+            const uint8_t* q = blk->qs + (n << 5);
+            const uint8_t m0 = static_cast<uint8_t>(1u << (n << 2));
+            const uint8_t m1 = static_cast<uint8_t>(m0 << 1);
+            const uint8_t m2 = static_cast<uint8_t>(m0 << 2);
+            const uint8_t m3 = static_cast<uint8_t>(m0 << 3);
+            const int base = (b << 8) + (n << 7) + lane;
+            const int is0 = (n << 3) + (lane >> 4);
+            const uint8_t qv = q[lane], hm = blk->hmask[lane];
+            dst[base +  0] = d_all * static_cast<float>(sc[is0 + 0] - 32) * static_cast<float>(static_cast<int>((qv >> 0) & 3u) - ((hm & m0) ? 0 : 4));
+            dst[base + 32] = d_all * static_cast<float>(sc[is0 + 2] - 32) * static_cast<float>(static_cast<int>((qv >> 2) & 3u) - ((hm & m1) ? 0 : 4));
+            dst[base + 64] = d_all * static_cast<float>(sc[is0 + 4] - 32) * static_cast<float>(static_cast<int>((qv >> 4) & 3u) - ((hm & m2) ? 0 : 4));
+            dst[base + 96] = d_all * static_cast<float>(sc[is0 + 6] - 32) * static_cast<float>(static_cast<int>((qv >> 6) & 3u) - ((hm & m3) ? 0 : 4));
+        }
     } else if (qtype == QuantType::BF16) {
         if (tid >= K) return;
         dst[tid] = d_bf16_to_f32(reinterpret_cast<const uint16_t*>(rp)[tid]) * scale;
@@ -1046,12 +1086,12 @@ __global__ void k_gqa_attention(const float* __restrict__ Q,
                                 const __half* __restrict__ k_cache,
                                 const __half* __restrict__ v_cache,
                                 float* __restrict__ attn_out,
-                                int S, const int* __restrict__ d_pos, int start_pos_val,
+                                int S, const int* __restrict__ d_pos, int start_pos_val, int max_seq_len,
                                 int H, int Hkv, int HD,
                                 int swa_win, bool is_swa, float attn_scale, float attn_softcap) {
     const int h = blockIdx.x;
     const int s = blockIdx.y;
-    if (h >= H || s >= S) return;
+    if (h >= H || s >= S || !k_cache || !v_cache) return;
 
     const int start_pos = d_pos ? (*d_pos) : start_pos_val;
     const int tid = threadIdx.x;
@@ -1071,7 +1111,12 @@ __global__ void k_gqa_attention(const float* __restrict__ Q,
     }
     __syncthreads();
 
-    const int seq_len = start_pos + s + 1;
+    const int raw_seq_len = start_pos + s + 1;
+    const int seq_len = min(raw_seq_len, max_seq_len);
+    if (seq_len <= 0) {
+        for (int d = tid; d < HD; d += blockDim.x) oh[d] = 0.0f;
+        return;
+    }
     const int s_start = is_swa ? max(0, seq_len - swa_win) : 0;
     const bool use_sinks = (is_swa && s_start > 4);
     const int active_len = use_sinks ? (4 + (seq_len - s_start)) : (seq_len - s_start);
@@ -1172,6 +1217,7 @@ __global__ void k_moe_router_topk(const float* __restrict__ logits, const float*
     }
     __syncthreads();
     const float max_v = sm_red[0];
+    __syncthreads(); // Prevent WAR race before warp 0 overwrites sm_red[0] with local_sum!
 
     float local_sum = 0.0f;
     for (int e = tid; e < E; e += blockDim.x) {
@@ -1924,6 +1970,7 @@ struct HavenCudaEngine::Impl {
         const int K = tbl.cols;
         int threads_per_row = K;
         if (tbl.type == QuantType::Q6_K) threads_per_row = K >> 2;
+        else if (tbl.type == QuantType::Q3_K) threads_per_row = K >> 3;
         else if (tbl.type == QuantType::IQ4_XS || tbl.type == QuantType::IQ4_NL ||
                  tbl.type == QuantType::Q4_K || tbl.type == QuantType::Q5_K ||
                  tbl.type == QuantType::Q5_1 || tbl.type == QuantType::Q5_0 || tbl.type == QuantType::Q4_0) {
@@ -2023,7 +2070,8 @@ struct HavenCudaEngine::Impl {
             dim3 attn_grid(static_cast<unsigned int>(H), static_cast<unsigned int>(S), 1);
             k_gqa_attention<<<attn_grid, 256, 0, stream>>>(
                 d_q, kv_src.d_k_cache, kv_src.d_v_cache, d_attn_h,
-                S, d_pos_ptr, start_pos_val, H, kv_src.n_kv_heads, HD, swa_win, gl.is_swa, attn_scale, mc.attn_logit_softcapping);
+                S, d_pos_ptr, start_pos_val, static_cast<int>(max_seq_len_runtime),
+                H, kv_src.n_kv_heads, HD, swa_win, gl.is_swa, attn_scale, mc.attn_logit_softcapping);
 
             // 2f. Attention Output Projection + Optional Post-Attn Norm + Residual 1
             linear_forward(gl.attn_output, nullptr, d_attn_h, d_attn_o, S);
@@ -2406,13 +2454,39 @@ bool HavenCudaEngine::initialize(const HavenEngine& host_engine, const CudaEngin
         gl.has_kv = !is_shared_kv && (lt.attn_k != nullptr);
         gl.k_eq_v = gl.has_kv && (lt.attn_v == nullptr);
 
+        if (gl.head_dim > 512) {
+            last_error_ = "CUDA kernel limit exceeded: head_dim > 512 at layer " + std::to_string(l);
+            shutdown();
+            return false;
+        }
+        if (mc.expert_count > 256) {
+            last_error_ = "CUDA kernel limit exceeded: expert_count > 256 (got " + std::to_string(mc.expert_count) + ")";
+            shutdown();
+            return false;
+        }
         if (gl.has_kv) {
             gl.kv_source_layer = l;
-        } else if (mc.num_layers > 20 && mc.shared_kv_layers > 0 && mc.shared_kv_layers < mc.num_layers) {
-            int n_kv_start = static_cast<int>(mc.num_layers - mc.shared_kv_layers);
-            gl.kv_source_layer = std::max(0, n_kv_start - (gl.is_swa ? 2 : 1));
         } else {
-            gl.kv_source_layer = std::max(0, l - 1);
+            // Find the latest preceding KV-owning layer with matching SWA/Global type (safe for any num_layers / pattern!)
+            int found = -1;
+            for (int p = l - 1; p >= 0; --p) {
+                if (impl_->layers[static_cast<size_t>(p)].has_kv &&
+                    impl_->layers[static_cast<size_t>(p)].is_swa == gl.is_swa) {
+                    found = p;
+                    break;
+                }
+            }
+            if (found < 0) {
+                for (int p = l - 1; p >= 0; --p) {
+                    if (impl_->layers[static_cast<size_t>(p)].has_kv) { found = p; break; }
+                }
+            }
+            if (found < 0) {
+                last_error_ = "No valid KV source layer found for shared-KV layer " + std::to_string(l);
+                shutdown();
+                return false;
+            }
+            gl.kv_source_layer = found;
         }
 
         impl_->max_F = std::max(impl_->max_F, gl.F_hid);
@@ -2517,7 +2591,7 @@ bool HavenCudaEngine::initialize(const HavenEngine& host_engine, const CudaEngin
     impl_->d_am_out  = static_cast<uint32_t*>(impl_->alloc_gpu(sizeof(uint32_t), scratch_bytes));
 
     const size_t max_in_dim = static_cast<size_t>(std::max({D, impl_->max_F, impl_->max_q_dim}));
-    const size_t q8_blocks = std::max<size_t>(Smax * static_cast<size_t>(D >> 5), (max_in_dim >> 5) * static_cast<size_t>(8));
+    const size_t q8_blocks = Smax * ((max_in_dim + 31ULL) >> 5);
     impl_->d_x_q8 = static_cast<block_q8_1_gpu*>(impl_->alloc_gpu(q8_blocks * sizeof(block_q8_1_gpu), scratch_bytes));
 
     if (mc.expert_count > 0) {
@@ -2548,7 +2622,19 @@ bool HavenCudaEngine::initialize(const HavenEngine& host_engine, const CudaEngin
     impl_->w_f16_cap_elems = std::min(max_w_elems, static_cast<size_t>(256ULL * 1024ULL * 1024ULL));
     impl_->d_w_f16 = static_cast<__half*>(impl_->alloc_gpu(impl_->w_f16_cap_elems * sizeof(__half), scratch_bytes));
 
-    if (!impl_->d_x || !impl_->d_logits || !impl_->d_w_f16 || !impl_->d_x_q8) {
+    const bool core_scratch_ok =
+        impl_->d_step_args && impl_->d_tok_ids && impl_->d_x && impl_->d_norm &&
+        impl_->d_q && impl_->d_k && impl_->d_v && impl_->d_attn_h && impl_->d_attn_o &&
+        impl_->d_ffn_g && impl_->d_ffn_u && impl_->d_ffn_d && impl_->d_logits &&
+        impl_->d_am_vals && impl_->d_am_idx && impl_->d_am_out &&
+        impl_->d_x_q8 && impl_->d_x_f16 && impl_->d_w_f16;
+    const bool moe_scratch_ok = (mc.expert_count == 0) ||
+        (impl_->d_moe_norm && impl_->d_moe_router && impl_->d_moe_idx && impl_->d_moe_w &&
+         impl_->d_moe_act && impl_->d_moe_act_q8 && impl_->d_moe_out &&
+         impl_->d_moe_exp_offsets && impl_->d_moe_sorted_tok && impl_->d_moe_sorted_slot && impl_->d_moe_sorted_w);
+    const bool pleias_scratch_ok = (!impl_->has_pleias) ||
+        (impl_->d_pl_emb && impl_->d_pl_proj && impl_->d_pl_gate && impl_->d_pl_out);
+    if (!core_scratch_ok || !moe_scratch_ok || !pleias_scratch_ok) {
         last_error_ = "cudaMalloc failed allocating CUDA scratch buffers.";
         shutdown();
         return false;
@@ -2567,6 +2653,7 @@ bool HavenCudaEngine::initialize(const HavenEngine& host_engine, const CudaEngin
 
 bool HavenCudaEngine::reset_kv_cache() {
     if (!initialized_ || !impl_) return false;
+    if (cudaSetDevice(cfg_.device_id) != cudaSuccess) return false;
     for (auto& gl : impl_->layers) {
         if (gl.has_kv && gl.kv_bytes > 0) {
             cudaMemsetAsync(gl.d_k_cache, 0, gl.kv_bytes, impl_->stream);
@@ -2581,8 +2668,24 @@ bool HavenCudaEngine::forward_decode(uint32_t token, int pos, float* out_logits,
         last_error_ = "HavenCudaEngine is not initialized.";
         return false;
     }
+    if (pos < 0 || pos >= impl_->max_seq_len_runtime) {
+        last_error_ = "CUDA decode position " + std::to_string(pos) + " out of KV cache bounds [0, " +
+                      std::to_string(impl_->max_seq_len_runtime) + ").";
+        return false;
+    }
+    if (cudaSetDevice(cfg_.device_id) != cudaSuccess) {
+        last_error_ = "cudaSetDevice failed in forward_decode.";
+        return false;
+    }
     auto t0 = std::chrono::high_resolution_clock::now();
     bool ok = impl_->run_decode_step(token, pos, out_logits, out_next_token, last_error_);
+    if (ok) {
+        cudaError_t le = cudaGetLastError();
+        if (le != cudaSuccess) {
+            last_error_ = std::string("CUDA launch error: ") + cudaGetErrorString(le);
+            ok = false;
+        }
+    }
     auto t1 = std::chrono::high_resolution_clock::now();
     metrics_.last_decode_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     return ok;
@@ -2596,8 +2699,18 @@ bool HavenCudaEngine::forward_prefill(const std::vector<uint32_t>& tokens,
         last_error_ = "HavenCudaEngine not initialized or empty prompt.";
         return false;
     }
-    auto t0 = std::chrono::high_resolution_clock::now();
     const int total = static_cast<int>(tokens.size());
+    if (start_pos < 0 || start_pos + total > impl_->max_seq_len_runtime) {
+        last_error_ = "CUDA prefill range [" + std::to_string(start_pos) + ", " +
+                      std::to_string(start_pos + total) + ") exceeds KV cache capacity " +
+                      std::to_string(impl_->max_seq_len_runtime) + ".";
+        return false;
+    }
+    if (cudaSetDevice(cfg_.device_id) != cudaSuccess) {
+        last_error_ = "cudaSetDevice failed in forward_prefill.";
+        return false;
+    }
+    auto t0 = std::chrono::high_resolution_clock::now();
     int offset = 0;
     while (offset < total) {
         const int chunk = std::min(impl_->max_S, total - offset);
@@ -2609,6 +2722,11 @@ bool HavenCudaEngine::forward_prefill(const std::vector<uint32_t>& tokens,
             return false;
         }
         offset += chunk;
+    }
+    cudaError_t le = cudaGetLastError();
+    if (le != cudaSuccess) {
+        last_error_ = std::string("CUDA prefill launch error: ") + cudaGetErrorString(le);
+        return false;
     }
     auto t1 = std::chrono::high_resolution_clock::now();
     metrics_.last_prefill_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();

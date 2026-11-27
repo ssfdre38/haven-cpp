@@ -208,10 +208,12 @@ static ArchFamily classify_arch(const std::string& arch_raw) {
     if (a.find("gemma4") != std::string::npos) return ArchFamily::GEMMA4;
     if (a.find("gemma") != std::string::npos)  return ArchFamily::GEMMA_LEGACY;
     if (a.find("qwen") != std::string::npos)   return ArchFamily::QWEN;
-    if (a.find("phi") != std::string::npos)    return ArchFamily::PHI;
     if (a.find("mistral") != std::string::npos || a.find("mixtral") != std::string::npos) return ArchFamily::MISTRAL;
     if (a.find("deepseek") != std::string::npos) return ArchFamily::DEEPSEEK;
     if (a.find("llama") != std::string::npos)  return ArchFamily::LLAMA;
+    if (a == "phi" || starts_with(a, "phi2") || starts_with(a, "phi3") || starts_with(a, "phi4") || starts_with(a, "phi-")) {
+        return ArchFamily::PHI;
+    }
     return a.empty() ? ArchFamily::UNKNOWN : ArchFamily::GENERIC_TRANSFORMER;
 }
 
@@ -414,6 +416,10 @@ bool HavenModelIntelligence::probe_gguf_header(const std::string& filepath,
             if (max_ff > 0) out_fp.hidden_dim = max_ff;
         } else if (ends_with(key, ".block_count") && (vt == 4 || vt == 10)) {
             if (!rd.read_uint_val(vt, out_fp.num_layers)) return false;
+            if (out_fp.num_layers > 4096u) {
+                out_err = "GGUF block_count exceeds safety limit (4096)";
+                return false;
+            }
         } else if (ends_with(key, ".attention.head_count") && (vt == 4 || vt == 10)) {
             if (!rd.read_uint_val(vt, out_fp.num_heads)) return false;
         } else if (ends_with(key, ".attention.head_count_kv") && (vt == 4 || vt == 10)) {
@@ -615,23 +621,35 @@ bool HavenModelIntelligence::probe_gguf_header(const std::string& filepath,
     }
 
     // Exact FP16 KV cache budget at 4K context (respecting shared_kv_layers & per-layer head dims!)
+    constexpr uint32_t kMaxLayersCap = 4096u;
+    if (out_fp.num_layers > kMaxLayersCap) {
+        out_err = "GGUF num_layers exceeds safety limit";
+        return false;
+    }
     uint32_t kv_layers = (out_fp.num_layers > out_fp.shared_kv_layers)
         ? (out_fp.num_layers - out_fp.shared_kv_layers)
         : out_fp.num_layers;
     uint64_t kv_bytes_4k = 0;
+    auto sat_add_u64 = [](uint64_t a, uint64_t b) -> uint64_t {
+        return (a > std::numeric_limits<uint64_t>::max() - b) ? std::numeric_limits<uint64_t>::max() : (a + b);
+    };
     for (uint32_t l = 0; l < kv_layers; ++l) {
         bool is_swa = (l < swa_pattern.size()) ? swa_pattern[l] : (out_fp.has_swa && (l % 6 != 5));
         uint32_t hd = (is_swa && out_fp.head_dim_swa > 0) ? out_fp.head_dim_swa : out_fp.head_dim;
         uint32_t hkv = (l < head_count_kv_per_layer.size() && head_count_kv_per_layer[l] > 0)
             ? head_count_kv_per_layer[l]
             : out_fp.num_kv_heads;
-        // K + V in FP16 (2 bytes each) * 4096 tokens
-        kv_bytes_4k += 2ULL * 4096ULL * static_cast<uint64_t>(hkv) * static_cast<uint64_t>(hd) * 2ULL;
+        // K + V in FP16 (2 bytes each) * 4096 tokens (overflow-safe)
+        uint64_t hkv_hd = static_cast<uint64_t>(hkv) * static_cast<uint64_t>(hd);
+        uint64_t layer_kv = (hkv_hd > std::numeric_limits<uint64_t>::max() / 16384ULL)
+            ? std::numeric_limits<uint64_t>::max()
+            : (hkv_hd * 16384ULL);
+        kv_bytes_4k = sat_add_u64(kv_bytes_4k, layer_kv);
     }
     out_fp.kv_cache_bytes_4k = kv_bytes_4k;
     // Scratch + activations headroom (~384 MiB for dense, ~640 MiB for MoE)
     uint64_t scratch_est = out_fp.has_moe ? (640ULL * 1024ULL * 1024ULL) : (384ULL * 1024ULL * 1024ULL);
-    out_fp.estimated_vram_bytes = out_fp.llm_weight_bytes + kv_bytes_4k + scratch_est;
+    out_fp.estimated_vram_bytes = sat_add_u64(sat_add_u64(out_fp.llm_weight_bytes, kv_bytes_4k), scratch_est);
 
     // Compose feature flags bitmask
     uint64_t f = HAVEN_FEAT_NONE;
@@ -707,13 +725,14 @@ HardwareProfile HavenModelIntelligence::probe_hardware() {
             if (iss >> kb) hw.available_ram_bytes = kb * 1024ULL;
         }
     }
-    if (std::filesystem::exists("/proc/hmb_pagefile")) {
+    std::error_code hmb_ec;
+    if (std::filesystem::exists("/proc/hmb_pagefile", hmb_ec)) {
         hw.hmb_vmm_kernel_active = true;
         hw.hmb_vmm_node = "/proc/hmb_pagefile";
-    } else if (std::filesystem::exists("/proc/hmb_swap")) {
+    } else if (std::filesystem::exists("/proc/hmb_swap", hmb_ec)) {
         hw.hmb_vmm_kernel_active = true;
         hw.hmb_vmm_node = "/proc/hmb_swap";
-    } else if (std::filesystem::exists("/dev/hmb0")) {
+    } else if (std::filesystem::exists("/dev/hmb0", hmb_ec)) {
         hw.hmb_vmm_kernel_active = true;
         hw.hmb_vmm_node = "/dev/hmb0";
     }
@@ -749,7 +768,8 @@ HardwareProfile HavenModelIntelligence::probe_hardware() {
         "/opt/tpu/libtpu.so"
     };
     for (const auto& c : tpu_candidates) {
-        if (!c.empty() && std::filesystem::exists(c)) {
+        std::error_code ec;
+        if (!c.empty() && std::filesystem::exists(c, ec)) {
             hw.tpu_available = true;
             hw.tpu_library_path = c;
             break;
@@ -917,6 +937,8 @@ std::unordered_map<std::string, std::string> HavenModuleLoader::index_available_
 
 #ifdef _WIN32
     const std::string want_ext = ".dll";
+#elif defined(__APPLE__)
+    const std::string want_ext = ".dylib";
 #else
     const std::string want_ext = ".so";
 #endif
@@ -992,8 +1014,8 @@ bool HavenModuleLoader::load_single_module(const std::string& module_id,
         return false;
     }
     const HavenModuleDescriptor* desc = query_fn();
-    if (!desc || desc->abi_version != HAVEN_MODULE_ABI_VERSION || !desc->id) {
-        err = "ABI version mismatch or null descriptor in " + filepath;
+    if (!desc || desc->abi_version != HAVEN_MODULE_ABI_VERSION || !desc->id || !desc->name || !desc->version) {
+        err = "ABI version mismatch or null descriptor field in " + filepath;
         close_handle(mod);
         return false;
     }

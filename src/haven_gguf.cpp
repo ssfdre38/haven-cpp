@@ -100,6 +100,7 @@ void GgufLoader::close() {
 #endif
     tensors_.clear();
     vocab_.clear();
+    config_ = ModelConfig{};
     file_size_ = 0;
 }
 
@@ -214,7 +215,10 @@ bool GgufLoader::parse_header() {
     std::memcpy(&version, mmap_data_ + 4, sizeof(version));
     std::memcpy(&tensor_count, mmap_data_ + 8, sizeof(tensor_count));
     std::memcpy(&kv_count, mmap_data_ + 16, sizeof(kv_count));
-    (void)version;
+    if (version < 2 || version > 4) {
+        std::cerr << "⛔ Unsupported GGUF version: " << version << " (expected v2-v4)\n";
+        return false;
+    }
 
     constexpr uint64_t MAX_GGUF_KV = 1000000ULL;
     constexpr uint64_t MAX_GGUF_TENSORS = 1000000ULL;
@@ -270,6 +274,27 @@ bool GgufLoader::parse_header() {
             uint32_t v = 0;
             std::memcpy(&v, ptr, sizeof(v));
             ptr += 4;
+            out = static_cast<float>(v);
+            return true;
+        }
+        if (val_type == 5 && has_bytes(ptr, end, 4)) {
+            int32_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            ptr += 4;
+            out = static_cast<float>(v);
+            return true;
+        }
+        if (val_type == 10 && has_bytes(ptr, end, 8)) {
+            uint64_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            ptr += 8;
+            out = static_cast<float>(v);
+            return true;
+        }
+        if (val_type == 11 && has_bytes(ptr, end, 8)) {
+            int64_t v = 0;
+            std::memcpy(&v, ptr, sizeof(v));
+            ptr += 8;
             out = static_cast<float>(v);
             return true;
         }
@@ -394,11 +419,20 @@ bool GgufLoader::parse_header() {
         else if (ends_with(key, ".attention.layer_norm_rms_epsilon")) {
             if (!read_float_val(val_type, config_.rms_norm_eps)) return false;
         }
+        else if (ends_with(key, ".attention.query_pre_attn_scalar")) {
+            if (!read_float_val(val_type, config_.query_pre_attn_scalar)) return false;
+        }
         else if (ends_with(key, ".rope.freq_base_swa")) {
             if (!read_float_val(val_type, config_.rope_freq_base_swa)) return false;
+            config_.has_rope_freq_base_swa = true;
         }
         else if (ends_with(key, ".rope.freq_base")) {
             if (!read_float_val(val_type, config_.rope_freq_base)) return false;
+        }
+        else if (ends_with(key, ".rope.scaling.factor")) {
+            float factor = 1.0f;
+            if (!read_float_val(val_type, factor)) return false;
+            if (factor > 0.0f) config_.rope_freq_scale = 1.0f / factor;
         }
         else if (ends_with(key, ".rope.dimension_count_swa") && (val_type == 4 || val_type == 10)) {
             if (!read_uint_val(val_type, config_.rope_dimension_count_swa)) return false;
@@ -496,20 +530,27 @@ bool GgufLoader::parse_header() {
     }
 
     // Determine derived architecture hyperparameters
-    config_.is_gemma = (config_.architecture.find("gemma") != std::string::npos);
+    config_.is_gemma  = (config_.architecture.find("gemma") != std::string::npos);
+    config_.is_gemma4 = (config_.architecture.find("gemma4") != std::string::npos);
+    // Standard GGUF Llama/Mistral/Mixtral use interleaved (NORM) RoPE; Gemma/Qwen/Phi use split-half (NEOX) RoPE
+    config_.is_neox_rope = !(config_.architecture == "llama" ||
+                             config_.architecture == "mistral" ||
+                             config_.architecture == "mixtral");
     if (config_.is_gemma) {
         config_.ffn_activation = FfnActivation::GELU;
-        if (config_.final_logit_softcapping == 0.0f) config_.final_logit_softcapping = 30.0f;
+        if (config_.final_logit_softcapping == 0.0f &&
+            (config_.is_gemma4 || config_.architecture == "gemma2")) {
+            config_.final_logit_softcapping = 30.0f;
+        }
         if (config_.attn_logit_softcapping == 0.0f && config_.architecture == "gemma2") {
             config_.attn_logit_softcapping = 50.0f;
         }
-        if (!config_.has_shared_kv_layers_kv && config_.num_layers == 42) {
+        if (config_.is_gemma4 && !config_.has_shared_kv_layers_kv && config_.num_layers == 42) {
             config_.shared_kv_layers = 18; // Gemma 4 E4B default when key omitted
         }
     } else {
         config_.ffn_activation = FfnActivation::SILU;
-        config_.final_logit_softcapping = 0.0f;
-        config_.attn_logit_softcapping = 0.0f;
+        // Preserve any parsed logit softcapping values on non-Gemma architectures rather than erasing them
     }
 
     if (config_.head_dim == 0 && config_.num_heads > 0) {

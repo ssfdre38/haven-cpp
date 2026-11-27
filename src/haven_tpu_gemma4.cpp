@@ -3463,6 +3463,16 @@ bool HavenTpuGemma4Engine::initialize(HavenTpuPjrtBackend* backend,
                       std::to_string(cfg.num_replicas) + ".";
         return false;
     }
+    if (cfg.num_replicas > 1) {
+        auto hkv_valid = [&](int hkv) {
+            return hkv <= 0 || (hkv % cfg.num_replicas == 0) || (cfg.num_replicas % hkv == 0);
+        };
+        if (!hkv_valid(spec.num_kv_heads_swa) || !hkv_valid(spec.num_kv_heads_glob)) {
+            last_error_ = "Multi-chip TP requires KV head count divisible by or dividing num_replicas=" +
+                          std::to_string(cfg.num_replicas) + ".";
+            return false;
+        }
+    }
     if (cfg.use_int4_weights &&
         ((spec.embedding_dim % 2) != 0 || ((spec.hidden_dim / cfg.num_replicas) % 2) != 0)) {
         last_error_ = "W4A16 INT4 requires even embedding_dim and sharded hidden_dim.";
@@ -3732,6 +3742,13 @@ bool HavenTpuGemma4Engine::execute_graph(PJRT_LoadedExecutable* exec,
 
     if (!ok) {
         last_error_ = "On-chip TPU execute failed: " + backend_->get_last_error();
+        if (cfg_.donate_kv_cache) {
+            // Donated KV buffers were consumed by PJRT on launch; clear handles and reallocate clean KV slabs
+            for (auto& rkv : replica_kv_bufs_) {
+                for (auto*& b : rkv) b = nullptr;
+            }
+            allocate_zero_kv_cache();
+        }
         return false;
     }
 

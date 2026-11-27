@@ -2,7 +2,9 @@
 #include "haven/haven_engine.h"
 #include "haven/haven_tpu_gemma4.h"
 #include "haven/haven_tpu_pjrt.h"
+#include <algorithm>
 #include <cassert>
+#include "haven/haven_test_check.h"
 #include <cmath>
 #include <cstdint>
 #include <cstdio>

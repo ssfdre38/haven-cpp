@@ -73,15 +73,17 @@ public:
         std::strftime(time_buf, sizeof(time_buf), "%A, %B %d, %Y - %I:%M %p", &local_tm);
 
 #ifdef _WIN32
-        MEMORYSTATUSEX mem_info;
+        MEMORYSTATUSEX mem_info{};
         mem_info.dwLength = sizeof(MEMORYSTATUSEX);
-        GlobalMemoryStatusEx(&mem_info);
-        int mem_percent = (int)mem_info.dwMemoryLoad;
+        int mem_percent = GlobalMemoryStatusEx(&mem_info) ? static_cast<int>(mem_info.dwMemoryLoad) : 0;
 
-        SYSTEM_POWER_STATUS power;
-        GetSystemPowerStatus(&power);
-        int battery_life = (int)power.BatteryLifePercent;
-        bool on_ac = (power.ACLineStatus == 1);
+        SYSTEM_POWER_STATUS power{};
+        int battery_life = 100;
+        bool on_ac = true;
+        if (GetSystemPowerStatus(&power)) {
+            battery_life = static_cast<int>(power.BatteryLifePercent);
+            on_ac = (power.ACLineStatus == 1);
+        }
 #else
         int mem_percent = 0;
         int battery_life = 100;
@@ -203,9 +205,9 @@ public:
         }
 
         if (action == "volume_info" || action == "disk_usage") {
-            char drives[512];
-            DWORD len = GetLogicalDriveStringsA(sizeof(drives) - 1, drives);
-            if (len == 0) {
+            char drives[512] = {0};
+            DWORD len = GetLogicalDriveStringsA(sizeof(drives) - 2, drives);
+            if (len == 0 || len >= sizeof(drives) - 1) {
                 output = "🖥️ [SystemSensory] Failed to enumerate logical drives.";
                 return true;
             }

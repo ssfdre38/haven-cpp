@@ -49,7 +49,11 @@ public:
             last_error_ = "Avx2CpuSession not initialized";
             return false;
         }
-        if (count == 0 || !tokens) return true;
+        if (count == 0) return true;
+        if (!tokens) {
+            last_error_ = "Avx2CpuSession::prefill received null tokens pointer with count > 0";
+            return false;
+        }
 
         auto t0 = std::chrono::high_resolution_clock::now();
         const size_t vocab = host_->get_config().vocab_size;
@@ -157,7 +161,11 @@ public:
             last_error_ = "CudaNativeSession not initialized";
             return false;
         }
-        if (count == 0 || !tokens) return true;
+        if (count == 0) return true;
+        if (!tokens) {
+            last_error_ = "CudaNativeSession::prefill received null tokens pointer with count > 0";
+            return false;
+        }
         std::vector<uint32_t> vec(tokens, tokens + count);
         bool ok = cuda_.forward_prefill(vec, start_pos, out_last_logits, out_next_token);
         if (!ok) last_error_ = cuda_.get_last_error();
@@ -187,6 +195,8 @@ public:
 
     void shutdown() override {
         cuda_.shutdown();
+        metrics_ = {};
+        last_error_.clear();
     }
 
     SessionMetrics get_metrics() const override { return metrics_; }
@@ -225,6 +235,10 @@ std::unique_ptr<IHavenSession> HavenSessionFactory::create_for_plan(HavenEngine&
         } else {
             log << "[HavenSession] CUDA requested but unavailable -> falling back to AVX2 CPU. ";
         }
+    } else if (plan.selected_backend == BackendKind::TPU_PJRT) {
+        log << "[HavenSession] TPU_PJRT session dispatch uses dedicated HavenTpuGemma4Engine -> falling back to AVX2 CPU session. ";
+    } else if (plan.selected_backend == BackendKind::MLX) {
+        log << "[HavenSession] Apple MLX session execution not yet wired -> falling back to AVX2 CPU session. ";
     }
 
     auto cpu = create_cpu_session();

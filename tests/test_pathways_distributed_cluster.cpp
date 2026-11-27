@@ -10,6 +10,7 @@
 #include <thread>
 #include <future>
 #include <cassert>
+#include "haven/haven_test_check.h"
 #include <algorithm>
 
 // Model hyperparameters for cluster execution test

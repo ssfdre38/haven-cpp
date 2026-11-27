@@ -295,7 +295,7 @@ struct SwayConfig {
  * @brief Production-Grade Autonomic Postural Sway & Respiration Engine.
  * 
  * Provides biologically authentic posture sway for virtual companions, humanoid
- * avatars, and simulated robotics. Zero runtime allocations, header-only, thread-safe.
+ * avatars, and simulated robotics. Zero runtime allocations, header-only, reentrant per instance.
  */
 class AutonomicPosturalSwayEngine {
 private:
@@ -352,24 +352,27 @@ public:
         // -------------------------------------------------------------
         // 1. Asymmetric Diaphragmatic Breathing (35% Inhale / 65% Exhale)
         // -------------------------------------------------------------
-        breath_timer_ += dt;
-        float breath_period = 1.0f / config_.breath_freq;
-        float phase = std::fmod(breath_timer_, breath_period) / breath_period;
-        if (phase < 0.0f) phase += 1.0f;
+        const float safe_breath_freq = (config_.breath_freq > 1e-4f) ? config_.breath_freq : 0.18f;
+        const float safe_inhale = std::clamp(config_.inhale_fraction, 0.05f, 0.95f);
+        const float breath_period = 1.0f / safe_breath_freq;
+        breath_timer_ = std::fmod(breath_timer_ + dt, breath_period);
+        if (breath_timer_ < 0.0f) breath_timer_ += breath_period;
+        float phase = breath_timer_ / breath_period;
 
         float chest_pitch = 0.0f;
-        if (phase < config_.inhale_fraction) {
-            float u = phase / config_.inhale_fraction;
+        if (phase < safe_inhale) {
+            float u = phase / safe_inhale;
             chest_pitch = std::sin(u * (PI * 0.5f)) * config_.breath_amplitude;
         } else {
-            float v = (phase - config_.inhale_fraction) / (1.0f - config_.inhale_fraction);
+            float v = (phase - safe_inhale) / (1.0f - safe_inhale);
             chest_pitch = std::cos(v * (PI * 0.5f)) * config_.breath_amplitude;
         }
 
         // -------------------------------------------------------------
         // 2. Sub-stepped Numerical Lorenz Attractor Integration
         // -------------------------------------------------------------
-        int steps = std::clamp(static_cast<int>(dt / config_.sub_dt), 1, 5);
+        const float safe_sub_dt = (config_.sub_dt > 1e-5f) ? config_.sub_dt : 0.005f;
+        int steps = std::clamp(static_cast<int>(dt / safe_sub_dt), 1, 5);
         float sub_dt = dt / static_cast<float>(steps);
 
         for (int i = 0; i < steps; ++i) {
@@ -400,8 +403,11 @@ public:
         // -------------------------------------------------------------
         // 3. Lissajous Figure-8 Weight Shift & Spinal Mapping
         // -------------------------------------------------------------
-        sway_timer_ += dt;
-        float omega = TWO_PI * config_.sway_freq;
+        const float safe_sway_freq = (config_.sway_freq > 1e-4f) ? config_.sway_freq : 0.08f;
+        const float sway_period = 1.0f / safe_sway_freq;
+        sway_timer_ = std::fmod(sway_timer_ + dt, sway_period);
+        if (sway_timer_ < 0.0f) sway_timer_ += sway_period;
+        float omega = TWO_PI * safe_sway_freq;
 
         float fig8_x = config_.fig8_hip_x_amp * std::sin(omega * sway_timer_);
         float fig8_z = config_.fig8_hip_z_amp * std::sin(2.0f * omega * sway_timer_);

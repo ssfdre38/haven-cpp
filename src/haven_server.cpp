@@ -37,6 +37,7 @@ typedef SOCKET socket_t;
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <csignal>
 typedef int socket_t;
 #define HAVEN_INVALID_SOCKET (-1)
 #define closesocket close
@@ -154,6 +155,12 @@ public:
 #endif
         if (server_thread_.joinable()) {
             server_thread_.join();
+        }
+        // Wait for any in-flight detached client handlers to finish before member teardown
+        const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (active_clients_.load(std::memory_order_acquire) > 0 &&
+               std::chrono::steady_clock::now() < wait_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
 
@@ -285,32 +292,31 @@ private:
         return (hostname == "127.0.0.1" || hostname == "localhost");
     }
 
-    static bool is_trusted_origin(const std::string& origin) {
+    static bool is_trusted_origin(const std::string& origin, int expected_port) {
         if (origin.empty()) return true;
         std::string o = to_lower_ascii(origin);
-        auto check_prefix = [&](const char* prefix) -> bool {
+        const std::string port_str = std::to_string(expected_port);
+        auto check_prefix = [&](const char* prefix, bool is_https) -> bool {
             size_t plen = std::strlen(prefix);
             if (o.size() < plen || o.compare(0, plen, prefix) != 0) return false;
-            if (o.size() == plen) return true;
+            if (o.size() == plen) {
+                return (!is_https && expected_port == 80) || (is_https && expected_port == 443);
+            }
             if (o[plen] == ':') {
-                if (plen + 1 >= o.size()) return false;
-                for (size_t i = plen + 1; i < o.size(); ++i) {
-                    if (!std::isdigit(static_cast<unsigned char>(o[i]))) return false;
-                }
-                return true;
+                return o.compare(plen + 1, std::string::npos, port_str) == 0;
             }
             return false;
         };
-        return check_prefix("http://127.0.0.1") ||
-               check_prefix("https://127.0.0.1") ||
-               check_prefix("http://localhost") ||
-               check_prefix("https://localhost") ||
-               check_prefix("http://[::1]") ||
-               check_prefix("https://[::1]");
+        return check_prefix("http://127.0.0.1", false) ||
+               check_prefix("https://127.0.0.1", true) ||
+               check_prefix("http://localhost", false) ||
+               check_prefix("https://localhost", true) ||
+               check_prefix("http://[::1]", false) ||
+               check_prefix("https://[::1]", true);
     }
 
-    static std::string build_cors_headers(const std::string& origin) {
-        if (!origin.empty() && is_trusted_origin(origin)) {
+    std::string build_cors_headers(const std::string& origin) const {
+        if (!origin.empty() && is_trusted_origin(origin, port_)) {
             return "Access-Control-Allow-Origin: " + origin + "\r\nVary: Origin\r\n";
         }
         return "";
@@ -802,7 +808,11 @@ private:
     static bool send_all(socket_t sock, const char* data, int len) {
         int total = 0;
         while (total < len) {
+#ifdef MSG_NOSIGNAL
+            int sent = static_cast<int>(send(sock, data + total, static_cast<size_t>(len - total), MSG_NOSIGNAL));
+#else
             int sent = send(sock, data + total, len - total, 0);
+#endif
             if (sent <= 0) return false;
             total += sent;
         }
@@ -811,6 +821,9 @@ private:
 
     static bool is_client_disconnected(socket_t sock) {
         if (sock == HAVEN_INVALID_SOCKET) return true;
+#ifndef _WIN32
+        if (sock < 0 || sock >= FD_SETSIZE) return false;
+#endif
         fd_set read_fds;
         fd_set except_fds;
         FD_ZERO(&read_fds);
@@ -1056,11 +1069,11 @@ private:
                 continue;
             }
 
-            active_clients_.fetch_add(1, std::memory_order_relaxed);
+            active_clients_.fetch_add(1, std::memory_order_acquire);
             std::thread([this, client_sock]() {
                 struct ClientGuard {
                     std::atomic<size_t>& counter;
-                    ~ClientGuard() { counter.fetch_sub(1, std::memory_order_relaxed); }
+                    ~ClientGuard() { counter.fetch_sub(1, std::memory_order_release); }
                 } guard{active_clients_};
 
                 handle_client(client_sock);
@@ -1351,7 +1364,7 @@ private:
                     return false;
                 }
                 completion_token_count++;
-                if (next_tok == eos_tok || next_tok == 1 || next_tok == 106 || next_tok == 212) {
+                if (next_tok == eos_tok || haven_engine_.get_tokenizer().is_stop_token(next_tok)) {
                     return false;
                 }
                 std::string piece = haven_engine_.detokenize(next_tok);
@@ -1691,6 +1704,7 @@ private:
 
         const int MAX_TOOL_DEPTH = 3;
         int tool_depth = 0;
+        std::string model_only_response;
 
         if (stream) {
             std::string sse_hdr = "HTTP/1.1 200 OK\r\n"
@@ -1701,10 +1715,10 @@ private:
                                   + cors_hdr + "\r\n";
             send_all(client_sock, sse_hdr.c_str(), static_cast<int>(sse_hdr.length()));
 
-            while (tool_depth < MAX_TOOL_DEPTH && active_pos < max_ctx) {
+            bool client_disconnected = false;
+            while (tool_depth <= MAX_TOOL_DEPTH && active_pos < max_ctx && !client_disconnected) {
                 std::string phase_output = "";
                 size_t stream_cursor = 0;
-                bool client_disconnected = false;
 
                 // Returns trailing byte count if `s` ends with a proper prefix of `<|tool_call|>` or `<tool_call>`
                 auto trailing_tool_prefix_len = [](const std::string& s) -> size_t {
@@ -1734,7 +1748,7 @@ private:
                     completion_token_count++;
 
                     // Stop conditions
-                    if (next_tok == haven_engine_.get_tokenizer().eos_token() || next_tok == 1 || next_tok == 106 || next_tok == 212) {
+                    if (haven_engine_.get_tokenizer().is_stop_token(next_tok)) {
                         break;
                     }
 
@@ -1813,7 +1827,7 @@ private:
                     tc_pos = phase_output.find("<tool_call>");
                     tag_len = 11;
                 }
-                if (tc_pos != std::string::npos) {
+                if (tc_pos != std::string::npos && tool_depth < MAX_TOOL_DEPTH) {
                     size_t act_start = tc_pos + tag_len;
                     size_t tc_end = phase_output.find("<|tool_call|>", act_start);
                     if (tc_end == std::string::npos) tc_end = phase_output.find("</tool_call>", act_start);
@@ -1847,6 +1861,7 @@ private:
                     if (!tool_action.empty()) {
                         std::string text_before = phase_output.substr(0, tc_pos);
                         accumulated_response += text_before;
+                        model_only_response += text_before;
 
                         // Execute sovereign tool via PluginManager
                         std::string tool_output;
@@ -1922,14 +1937,17 @@ private:
                     send_all(client_sock, chunk.c_str(), static_cast<int>(chunk.length()));
                 }
                 accumulated_response += phase_output;
+                model_only_response += phase_output;
                 break; // Finished generation
             }
 
-            std::string done_chunk = "data: {\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion.chunk\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
-            send_all(client_sock, done_chunk.c_str(), static_cast<int>(done_chunk.length()));
+            if (!client_disconnected) {
+                std::string done_chunk = "data: {\"id\":\"chatcmpl-haven-sovereign\",\"object\":\"chat.completion.chunk\",\"model\":\"" + escape_json_string(active_model_id) + "\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                send_all(client_sock, done_chunk.c_str(), static_cast<int>(done_chunk.length()));
+            }
         } else {
             bool client_disconnected = false;
-            while (tool_depth < MAX_TOOL_DEPTH && active_pos < max_ctx && !client_disconnected) {
+            while (tool_depth <= MAX_TOOL_DEPTH && active_pos < max_ctx && !client_disconnected) {
                 std::string phase_output = "";
                 for (int gen = 0; gen < max_tokens && active_pos < max_ctx; ++gen) {
                     if (is_client_disconnected(client_sock)) {
@@ -1941,7 +1959,7 @@ private:
                     context_history.push_back(next_tok);
                     completion_token_count++;
 
-                    if (next_tok == haven_engine_.get_tokenizer().eos_token() || next_tok == 1 || next_tok == 106 || next_tok == 212) {
+                    if (haven_engine_.get_tokenizer().is_stop_token(next_tok)) {
                         break;
                     }
 
@@ -1987,7 +2005,7 @@ private:
                     tc_pos = phase_output.find("<tool_call>");
                     tag_len = 11;
                 }
-                if (tc_pos != std::string::npos) {
+                if (tc_pos != std::string::npos && tool_depth < MAX_TOOL_DEPTH) {
                     size_t act_start = tc_pos + tag_len;
                     size_t tc_end = phase_output.find("<|tool_call|>", act_start);
                     if (tc_end == std::string::npos) tc_end = phase_output.find("</tool_call>", act_start);
@@ -2021,6 +2039,7 @@ private:
                     if (!tool_action.empty()) {
                         std::string text_before = phase_output.substr(0, tc_pos);
                         accumulated_response += text_before;
+                        model_only_response += text_before;
 
                         std::string tool_output;
                         std::cout << "\n⚡ [Autonomous ReAct] Executing Tool (" << (tool_depth + 1) << "/" << MAX_TOOL_DEPTH << "): " 
@@ -2083,6 +2102,7 @@ private:
                 }
 
                 accumulated_response += phase_output;
+                model_only_response += phase_output;
                 break;
             }
 
@@ -2099,8 +2119,9 @@ private:
         EmptyWorkingSet(GetCurrentProcess());
 #endif
 
-        if (!accumulated_response.empty()) {
-            process_server_side_tools(accumulated_response);
+        // Scan ONLY model-generated spans (never untrusted tool outputs) to prevent indirect injection
+        if (!model_only_response.empty()) {
+            process_server_side_tools(model_only_response);
         }
     }
 
@@ -2155,6 +2176,64 @@ private:
                 }
                 headers_parsed = true;
                 std::string raw_hdrs = request.substr(0, header_end);
+
+                // Pre-body security validation: verify request line, Host, Origin, and Bearer API key
+                // BEFORE allocating/buffering up to 32 MiB of request payload!
+                {
+                    size_t pre_eol = raw_hdrs.find("\r\n");
+                    std::string pre_line = (pre_eol != std::string::npos) ? raw_hdrs.substr(0, pre_eol) : raw_hdrs;
+                    std::istringstream pre_ss(pre_line);
+                    std::string pre_method, pre_path, pre_ver;
+                    pre_ss >> pre_method >> pre_path >> pre_ver;
+                    if (pre_method.empty() || pre_path.empty()) {
+                        send_http_response(sock, "400 Bad Request", "text/plain", "Malformed HTTP request line");
+                        close_socket(sock);
+                        return;
+                    }
+                    std::string pre_host = get_http_header(raw_hdrs, "host");
+                    std::string pre_origin = get_http_header(raw_hdrs, "origin");
+                    std::string pre_auth = get_http_header(raw_hdrs, "authorization");
+                    std::string pre_cors = build_cors_headers(pre_origin);
+
+                    if ((bind_host_ == "127.0.0.1" || bind_host_ == "localhost") && !is_loopback_host_header(pre_host)) {
+                        send_http_response(sock, "403 Forbidden", "application/json; charset=utf-8",
+                                           "{\"ok\":false,\"error\":\"Forbidden Host header\"}");
+                        close_socket(sock);
+                        return;
+                    }
+                    const bool pre_is_api =
+                        pre_path.starts_with("/api/") ||
+                        pre_path.starts_with("/v1/") ||
+                        pre_path == "/completion" ||
+                        pre_path == "/props" || pre_path.starts_with("/props?") ||
+                        pre_path == "/slots" || pre_path.starts_with("/slots?");
+                    if (pre_method != "OPTIONS" && pre_is_api && !pre_origin.empty() && !is_trusted_origin(pre_origin, port_)) {
+                        send_http_response(sock, "403 Forbidden", "application/json; charset=utf-8",
+                                           "{\"ok\":false,\"error\":\"Cross-origin API access blocked\"}");
+                        close_socket(sock);
+                        return;
+                    }
+                    if (pre_method != "OPTIONS" && pre_is_api && !api_key_.empty()) {
+                        bool auth_ok = false;
+                        if (pre_auth.size() > 7 && to_lower_ascii(pre_auth.substr(0, 7)) == "bearer ") {
+                            auth_ok = HavenSecurity::constant_time_verify(pre_auth.substr(7), api_key_);
+                        }
+                        if (!auth_ok) {
+                            std::string unauth_body = "{\"ok\":false,\"error\":\"Unauthorized: valid Bearer token required\"}";
+                            std::string resp = "HTTP/1.1 401 Unauthorized\r\n"
+                                               "Content-Type: application/json; charset=utf-8\r\n"
+                                               "WWW-Authenticate: Bearer\r\n"
+                                               + pre_cors +
+                                               "Connection: close\r\n"
+                                               "Content-Length: " + std::to_string(unauth_body.length()) + "\r\n\r\n"
+                                               + unauth_body;
+                            send_all(sock, resp.c_str(), static_cast<int>(resp.length()));
+                            close_socket(sock);
+                            return;
+                        }
+                    }
+                }
+
                 size_t cl_count = 0;
                 std::string len_str = get_http_header(raw_hdrs, "content-length", &cl_count);
                 if (cl_count > 1) {
@@ -2230,9 +2309,9 @@ private:
 
         std::string cors_hdr = build_cors_headers(origin_hdr);
 
-        // CORS Preflight (restricted strictly to trusted loopback origins)
+        // CORS Preflight (restricted strictly to trusted same-port loopback origins)
         if (method == "OPTIONS") {
-            if (!origin_hdr.empty() && !is_trusted_origin(origin_hdr)) {
+            if (!origin_hdr.empty() && !is_trusted_origin(origin_hdr, port_)) {
                 send_http_response(sock, "403 Forbidden", "text/plain", "Untrusted CORS origin");
                 close_socket(sock);
                 return;
@@ -2255,7 +2334,7 @@ private:
             path == "/slots" || path.starts_with("/slots?");
 
         // Cross-Origin browser CSRF / RCE guard on all API endpoints
-        if (is_api_route && !origin_hdr.empty() && !is_trusted_origin(origin_hdr)) {
+        if (is_api_route && !origin_hdr.empty() && !is_trusted_origin(origin_hdr, port_)) {
             send_http_response(sock, "403 Forbidden", "application/json; charset=utf-8",
                                "{\"ok\":false,\"error\":\"Cross-origin API access blocked\"}");
             close_socket(sock);
@@ -2444,8 +2523,11 @@ private:
         }
         else if (path == "/api/telemetry") {
             size_t mem_count = 0;
+            bool cuda_active = false;
+            bool mlx_active = false;
             bool tpu_active = false;
             int tpu_reps = 0;
+            int tpu_batch_cap = 0;
             bool tpu_i8 = false;
             bool tpu_onchip_emb = false;
             double tpu_hbm_gb = 0.0;
@@ -2454,11 +2536,14 @@ private:
             {
                 std::lock_guard<std::mutex> lock(engine_mutex_);
                 mem_count = haven_engine_.get_memory_engine().get_all_memories().size();
+                cuda_active = cuda_native_active_;
+                mlx_active = is_mlx_active_;
                 tpu_active = tpu_onchip_active_;
                 if (tpu_active) {
                     const auto& tc = tpu_gemma4_.get_config();
                     const auto& tm = tpu_gemma4_.get_metrics();
                     tpu_reps = tc.num_replicas;
+                    tpu_batch_cap = tc.batch_size;
                     tpu_i8 = tc.use_int8_weights;
                     tpu_onchip_emb = tc.use_onchip_embeddings;
                     tpu_hbm_gb = static_cast<double>(tm.total_hbm_weight_bytes) / (1024.0 * 1024.0 * 1024.0);
@@ -2475,14 +2560,13 @@ private:
                 }
             } catch (...) {}
 
-            std::string active_backend = cuda_native_active_
+            std::string active_backend = cuda_active
                 ? "cuda_native"
                 : (tpu_active
                     ? (tpu_scheduler_active_.load(std::memory_order_relaxed) ? "tpu_onchip_batched" : "tpu_onchip")
-                    : (is_mlx_active_ ? "apple_mlx" : "cpu_avx2"));
+                    : (mlx_active ? "apple_mlx" : "cpu_avx2"));
             TpuSchedulerStats sstats = tpu_scheduler_active_.load(std::memory_order_relaxed)
                 ? tpu_scheduler_.get_stats() : TpuSchedulerStats{};
-            int tpu_batch_cap = tpu_active ? tpu_gemma4_.get_config().batch_size : 0;
             std::string json = "{\"ok\":true,\"status\":\"sovereign_online\",\"engine\":\"haven-cpp-v2.0\",\"active_backend\":\"" + active_backend
                              + "\",\"tpu_onchip_active\":" + std::string(tpu_active ? "true" : "false")
                              + ",\"tpu_replicas\":" + std::to_string(tpu_reps)
@@ -2503,6 +2587,12 @@ private:
             send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
         }
         else if (path == "/api/actions/execute") {
+            if (method != "POST") {
+                send_http_response(sock, "405 Method Not Allowed", "application/json; charset=utf-8",
+                                   "{\"ok\":false,\"error\":\"POST required\"}", cors_hdr);
+                close_socket(sock);
+                return;
+            }
             std::string action = extract_json_string(body, "action");
             std::string output = "Action completed successfully.";
 
@@ -2518,9 +2608,6 @@ private:
         else if (path == "/api/gallery" || path == "/api/uploads") {
             std::string items_json = "";
             std::string uploads_dir = "wwwroot/uploads";
-            if (!std::filesystem::exists(uploads_dir)) {
-                uploads_dir = "C:\\Users\\admin\\source\\haven-cpp\\wwwroot\\uploads";
-            }
             bool first = true;
             try {
                 if (std::filesystem::exists(uploads_dir)) {
@@ -2543,19 +2630,22 @@ private:
             send_http_response(sock, "200 OK", "application/json; charset=utf-8", json_body, cors_hdr);
         }
         else if (path == "/api/gallery/delete" || (path.starts_with("/api/gallery") && method == "DELETE")) {
+            if (method != "POST" && method != "DELETE") {
+                send_http_response(sock, "405 Method Not Allowed", "application/json; charset=utf-8",
+                                   "{\"ok\":false,\"error\":\"POST or DELETE required\"}", cors_hdr);
+                close_socket(sock);
+                return;
+            }
             std::string raw_fname = extract_json_string(body, "filename");
             if (raw_fname.empty()) raw_fname = extract_json_string(body, "name");
             std::string fname = std::filesystem::path(raw_fname).filename().string();
             bool deleted = false;
             if (!fname.empty() && fname == raw_fname && is_safe_model_token(fname)) {
-                std::string safe_p1, safe_p2;
+                std::string safe_p1;
                 std::error_code ec;
                 if (resolve_safe_path("wwwroot/uploads", fname, safe_p1) &&
                     std::filesystem::is_regular_file(safe_p1, ec)) {
                     deleted = std::filesystem::remove(safe_p1, ec);
-                } else if (resolve_safe_path("C:\\Users\\admin\\source\\haven-cpp\\wwwroot\\uploads", fname, safe_p2) &&
-                           std::filesystem::is_regular_file(safe_p2, ec)) {
-                    deleted = std::filesystem::remove(safe_p2, ec);
                 }
             }
             std::string json_body = "{\"ok\":" + std::string(deleted ? "true" : "false") + ",\"filename\":\"" + escape_json_string(fname) + "\"}";
@@ -2563,9 +2653,7 @@ private:
         }
         else if (path == "/api/knowledge_graph") {
             std::string content = "{\"relations\":[]}";
-            std::string p1 = "wwwroot/knowledge_graph.json";
-            std::string p2 = "C:\\Users\\admin\\source\\haven-cpp\\wwwroot\\knowledge_graph.json";
-            std::string chosen = std::filesystem::exists(p1) ? p1 : p2;
+            std::string chosen = "wwwroot/knowledge_graph.json";
             std::error_code ec;
             uintmax_t kg_size = std::filesystem::exists(chosen, ec) ? std::filesystem::file_size(chosen, ec) : 0;
             if (!ec && kg_size > 0 && kg_size <= 32ULL * 1024 * 1024) {
@@ -2579,6 +2667,12 @@ private:
             send_http_response(sock, "200 OK", "application/json; charset=utf-8", content, cors_hdr);
         }
         else if (path == "/api/save_image") {
+            if (method != "POST") {
+                send_http_response(sock, "405 Method Not Allowed", "application/json; charset=utf-8",
+                                   "{\"ok\":false,\"error\":\"POST required\"}", cors_hdr);
+                close_socket(sock);
+                return;
+            }
             std::string b64 = extract_json_string(body, "b64_json");
             std::string raw_fname = extract_json_string(body, "filename");
             std::string fname;
@@ -2599,9 +2693,6 @@ private:
             }
 
             std::string uploads_dir = "wwwroot/uploads";
-            if (!std::filesystem::exists(uploads_dir)) {
-                uploads_dir = "C:\\Users\\admin\\source\\haven-cpp\\wwwroot\\uploads";
-            }
             std::error_code dir_ec;
             std::filesystem::create_directories(uploads_dir, dir_ec);
             std::string file_path;
@@ -2626,15 +2717,25 @@ private:
             send_http_response(sock, "200 OK", "application/json; charset=utf-8", json_body, cors_hdr);
         }
         else if (path == "/health") {
-            std::string backend_name = cuda_native_active_
+            bool cuda_active = false;
+            bool tpu_active = false;
+            bool mlx_active = false;
+            int tpu_slots = 1;
+            {
+                std::lock_guard<std::mutex> lock(engine_mutex_);
+                cuda_active = cuda_native_active_;
+                tpu_active = tpu_onchip_active_;
+                mlx_active = is_mlx_active_;
+                if (tpu_active) tpu_slots = tpu_gemma4_.get_config().batch_size;
+            }
+            std::string backend_name = cuda_active
                 ? "cuda_native"
-                : (tpu_onchip_active_
+                : (tpu_active
                     ? (tpu_scheduler_active_.load(std::memory_order_relaxed) ? "tpu_onchip_batched" : "tpu_onchip")
-                    : (is_mlx_active_ ? "apple_mlx" : "cpu_avx2"));
-            int tpu_slots = tpu_onchip_active_ ? tpu_gemma4_.get_config().batch_size : 1;
+                    : (mlx_active ? "apple_mlx" : "cpu_avx2"));
             std::string resp_body = "{\"status\":\"sovereign_online\",\"engine\":\"haven-cpp-v2.0\",\"backend\":\"" + backend_name
-                                  + "\",\"cuda_native\":" + std::string(cuda_native_active_ ? "true" : "false")
-                                  + ",\"tpu_onchip\":" + std::string(tpu_onchip_active_ ? "true" : "false")
+                                  + "\",\"cuda_native\":" + std::string(cuda_active ? "true" : "false")
+                                  + ",\"tpu_onchip\":" + std::string(tpu_active ? "true" : "false")
                                   + ",\"tpu_batch_capacity\":" + std::to_string(tpu_slots) + ",\"gateway\":true}";
             send_http_response(sock, "200 OK", "application/json; charset=utf-8", resp_body, cors_hdr);
         }
@@ -2683,9 +2784,13 @@ private:
             send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
         }
         else if (path == "/v1/intelligence" || path == "/api/intelligence") {
-            std::string resp_body = has_active_plan_
-                ? HavenModelIntelligence::to_json(active_plan_, module_loader_.get_active_module_ids())
-                : "{\"loaded\":false,\"message\":\"No model profiled yet.\"}";
+            std::string resp_body;
+            {
+                std::lock_guard<std::mutex> lock(engine_mutex_);
+                resp_body = has_active_plan_
+                    ? HavenModelIntelligence::to_json(active_plan_, module_loader_.get_active_module_ids())
+                    : "{\"loaded\":false,\"message\":\"No model profiled yet.\"}";
+            }
             send_http_response(sock, "200 OK", "application/json; charset=utf-8", resp_body, cors_hdr);
         }
         else if (path == "/v1/models" || path == "/api/models") {
@@ -2758,6 +2863,12 @@ private:
             send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
         }
         else if (path == "/v1/models/load" || path == "/api/models/load" || path == "/v1/models/switch") {
+            if (method != "POST") {
+                send_http_response(sock, "405 Method Not Allowed", "application/json; charset=utf-8",
+                                   "{\"ok\":false,\"error\":\"POST required\"}", cors_hdr);
+                close_socket(sock);
+                return;
+            }
             std::string req_model = extract_json_string(body, "model");
             if (req_model.empty()) req_model = extract_json_string(body, "filename");
             if (req_model.empty()) req_model = extract_json_string(body, "id");
@@ -2806,18 +2917,35 @@ private:
             send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
         }
         else if (path == "/api/plugins/unload") {
+            if (method != "POST") {
+                send_http_response(sock, "405 Method Not Allowed", "application/json; charset=utf-8",
+                                   "{\"ok\":false,\"error\":\"POST required\"}", cors_hdr);
+                close_socket(sock);
+                return;
+            }
             size_t freed = haven_engine_.get_plugin_manager().unload_idle_plugins(0);
             size_t active = haven_engine_.get_plugin_manager().get_active_plugin_count();
             std::string json = "{\"ok\":true,\"unloaded\":" + std::to_string(freed) + ",\"active_in_ram\":" + std::to_string(active) + ",\"message\":\"Flushed idle plugins from memory.\"}";
             send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
         }
         else if (path == "/api/plugins/reload") {
+            if (method != "POST") {
+                send_http_response(sock, "405 Method Not Allowed", "application/json; charset=utf-8",
+                                   "{\"ok\":false,\"error\":\"POST required\"}", cors_hdr);
+                close_socket(sock);
+                return;
+            }
             size_t reloaded = haven_engine_.get_plugin_manager().reload_all("plugins");
-            if (reloaded == 0) reloaded = haven_engine_.get_plugin_manager().reload_all("C:\\Users\\admin\\source\\haven-cpp\\plugins");
             std::string json = "{\"ok\":true,\"reloaded\":" + std::to_string(reloaded) + ",\"message\":\"Hot-reloaded " + std::to_string(reloaded) + " plugins.\"}";
             send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
         }
         else if (path == "/api/reset") {
+            if (method != "POST") {
+                send_http_response(sock, "405 Method Not Allowed", "application/json; charset=utf-8",
+                                   "{\"ok\":false,\"error\":\"POST required\"}", cors_hdr);
+                close_socket(sock);
+                return;
+            }
             std::lock_guard<std::mutex> lock(engine_mutex_);
             const bool restart_sched = tpu_scheduler_active_.exchange(false, std::memory_order_acq_rel);
             if (restart_sched) tpu_scheduler_.stop();
@@ -2836,6 +2964,12 @@ private:
             send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
         }
         else if (path == "/api/tool") {
+            if (method != "POST") {
+                send_http_response(sock, "405 Method Not Allowed", "application/json; charset=utf-8",
+                                   "{\"ok\":false,\"error\":\"POST required\"}", cors_hdr);
+                close_socket(sock);
+                return;
+            }
             std::string action = extract_json_string(body, "action");
             std::string payload = extract_json_string(body, "payload");
             std::string output;
@@ -2852,6 +2986,12 @@ private:
             send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
         }
         else if (path == "/api/mcp/call") {
+            if (method != "POST") {
+                send_http_response(sock, "405 Method Not Allowed", "application/json; charset=utf-8",
+                                   "{\"ok\":false,\"error\":\"POST required\"}", cors_hdr);
+                close_socket(sock);
+                return;
+            }
             std::string action = extract_json_string(body, "action");
             if (action.empty()) action = extract_json_string(body, "tool");
             std::string payload = extract_json_string(body, "payload");
@@ -2862,6 +3002,12 @@ private:
             send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
         }
         else if (path == "/api/mcp/reload") {
+            if (method != "POST") {
+                send_http_response(sock, "405 Method Not Allowed", "application/json; charset=utf-8",
+                                   "{\"ok\":false,\"error\":\"POST required\"}", cors_hdr);
+                close_socket(sock);
+                return;
+            }
             haven_engine_.get_mcp_manager().reload_all();
             std::string json = "{\"ok\":true,\"servers_count\":" + std::to_string(haven_engine_.get_mcp_manager().get_active_server_count()) + ",\"tools_count\":" + std::to_string(haven_engine_.get_mcp_manager().get_tool_count()) + "}";
             send_http_response(sock, "200 OK", "application/json; charset=utf-8", json, cors_hdr);
@@ -2912,6 +3058,12 @@ private:
             send_http_response(sock, "200 OK", "application/json; charset=utf-8", ss.str(), cors_hdr);
         }
         else if (path == "/api/cluster/join") {
+            if (method != "POST") {
+                send_http_response(sock, "405 Method Not Allowed", "application/json; charset=utf-8",
+                                   "{\"ok\":false,\"error\":\"POST required\"}", cors_hdr);
+                close_socket(sock);
+                return;
+            }
             std::string invite_uri = extract_json_string(body, "invite_uri");
             uint16_t worker_port = static_cast<uint16_t>(port_ + 3);
             uint32_t local_id = 1;
@@ -3027,6 +3179,19 @@ private:
             std::string clean_rel = decoded_path.front() == '/' ? decoded_path.substr(1) : decoded_path;
             std::string rel_path = clean_rel;
 
+            // Block direct unauthenticated static download of private vaults, configs, and dotfiles
+            std::string rel_low = to_lower_ascii(clean_rel);
+            std::string base_low = to_lower_ascii(std::filesystem::path(clean_rel).filename().string());
+            if (rel_low.ends_with(".hmb") || rel_low.ends_with(".tmp") ||
+                base_low.starts_with(".") || rel_low.find("/.") != std::string::npos ||
+                base_low == "memories.json" || base_low == "persona.json" ||
+                base_low == "models_config.json" || base_low == "knowledge_graph.json" ||
+                base_low == "mcp_servers.json" || base_low == "discord_config.json") {
+                send_http_response(sock, "403 Forbidden", "text/plain", "Forbidden");
+                close_socket(sock);
+                return;
+            }
+
             std::string local_path;
             if (!resolve_safe_path("wwwroot", clean_rel, local_path)) {
                 send_http_response(sock, "403 Forbidden", "text/plain", "Forbidden");
@@ -3035,12 +3200,6 @@ private:
             }
 
             FILE* f = fopen(local_path.c_str(), "rb");
-            if (!f) {
-                std::string fallback_path;
-                if (resolve_safe_path("C:\\Users\\admin\\source\\haven-cpp\\wwwroot", clean_rel, fallback_path)) {
-                    f = fopen(fallback_path.c_str(), "rb");
-                }
-            }
 
             if (f) {
                 fseek(f, 0, SEEK_END);
@@ -3082,8 +3241,8 @@ private:
                     send_all(sock, file_data.data(), static_cast<int>(got));
                 }
             } else {
-                std::string fallback_body = "{\"ok\":true,\"msg\":\"Haven Sovereign Micro-Server Active\"}";
-                send_http_response(sock, "200 OK", "application/json; charset=utf-8", fallback_body, cors_hdr);
+                std::string not_found_body = "{\"ok\":false,\"error\":\"Not Found\"}";
+                send_http_response(sock, "404 Not Found", "application/json; charset=utf-8", not_found_body, cors_hdr);
             }
         }
 
@@ -3113,6 +3272,7 @@ int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 #else
+    std::signal(SIGPIPE, SIG_IGN);
     if (!std::getenv("OMP_WAIT_POLICY")) setenv("OMP_WAIT_POLICY", "PASSIVE", 0);
     if (!std::getenv("KMP_BLOCKTIME"))   setenv("KMP_BLOCKTIME", "0", 0);
 #endif
@@ -3194,7 +3354,11 @@ int main(int argc, char** argv) {
             return 0;
         } else if ((arg == "--host" || arg == "--bind") && i + 1 < argc) {
             bind_host = argv[++i];
-        } else if (arg == "--api-key" && i + 1 < argc) {
+        } else if (arg == "--api-key") {
+            if (i + 1 >= argc || argv[i + 1][0] == '\0') {
+                std::cerr << "[HavenServer] Error: --api-key requires a non-empty value.\n";
+                return 1;
+            }
             api_key = argv[++i];
         } else if (arg == "--tpu" || arg == "--tpu-onchip") {
             tpu_opts.enable_onchip = true;

@@ -235,7 +235,7 @@ public:
         std::lock_guard<std::mutex> lock(state_mutex_);
         return cluster_token_;
     }
-    std::string generate_invite_uri(const std::string& host_override = "") const;
+    std::string generate_invite_uri(const std::string& host_override = "");
     bool init_worker_with_token(uint32_t local_node_id, uint16_t listen_port, 
                                 const std::string& invite_or_host, uint16_t coordinator_port = 0,
                                 const std::string& token = "");

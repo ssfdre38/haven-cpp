@@ -24,6 +24,7 @@
 // ============================================================================
 
 #include "haven/haven_avx2.h"
+#include "haven/haven_quant_spec.h"
 #include "haven/haven_types.h"
 
 #include <algorithm>
@@ -180,12 +181,7 @@ static bool read_raw_gguf_value(std::ifstream& f, uint32_t val_type, std::vector
 }
 
 static uint64_t tensor_byte_size(QuantType type, const std::vector<uint64_t>& dims) {
-    if (dims.empty()) return 0;
-    uint64_t ne0 = dims[0];
-    uint64_t rows = 1;
-    for (size_t i = 1; i < dims.size(); ++i) rows *= dims[i];
-    size_t rb = Avx2Math::row_bytes(type, static_cast<int>(ne0));
-    return static_cast<uint64_t>(rb) * rows;
+    return quant_tensor_byte_size(type, dims);
 }
 
 static bool parse_blk_tensor(const std::string& name, int& out_layer, std::string& out_suffix) {
@@ -507,6 +503,11 @@ int main(int argc, char** argv) {
             if (!read_u32(f, tt) || !read_u64(f, t.rel_offset)) return 1;
             t.type = static_cast<QuantType>(tt);
             t.nbytes = tensor_byte_size(t.type, t.dims);
+            if (t.nbytes == 0) {
+                std::cerr << "[haven-bake] Error: Unsupported or zero-byte tensor '" << t.name
+                          << "' (quant type " << tt << "). Aborting to prevent corrupt output.\n";
+                return 1;
+            }
             tensors.push_back(std::move(t));
         }
 
@@ -529,7 +530,8 @@ int main(int argc, char** argv) {
     };
     auto kv_source_layer = [&](uint32_t l) -> uint32_t {
         if (l < kv_start) return l;
-        return kv_start - (is_swa_layer(l) ? 2u : 1u);
+        uint32_t back = is_swa_layer(l) ? 2u : 1u;
+        return (kv_start >= back) ? (kv_start - back) : 0u;
     };
 
     // 2. Analyze per-layer geometry, R2 V->O eligibility, and Hadamard block sizes
@@ -548,6 +550,8 @@ int main(int argc, char** argv) {
             std::string vname = "blk." + std::to_string(s) + ".attn_v.weight";
             auto vit = name_to_idx.find(vname);
             if (vit == name_to_idx.end()) continue; // k_eq_v layer: NEVER apply R2!
+            // Skip R2 if attn_v has a bias (e.g., Qwen 2/2.5): rotating W_v without rotating b_v breaks equivalence
+            if (name_to_idx.find("blk." + std::to_string(s) + ".attn_v.bias") != name_to_idx.end()) continue;
             const auto& vt = tensors[vit->second];
             int hd = layer_hd[s];
             if (!is_float_type(vt.type) || !is_pow2(static_cast<uint32_t>(hd)) ||

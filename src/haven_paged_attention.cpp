@@ -44,6 +44,8 @@ int32_t PagedAttentionManager::allocate_block() {
     block_pool_[block_id].num_tokens = 0;
     if (block_pool_[block_id].data.size() != block_data_size_) {
         block_pool_[block_id].data.assign(block_data_size_, 0.0f);
+    } else {
+        std::fill(block_pool_[block_id].data.begin(), block_pool_[block_id].data.end(), 0.0f);
     }
     return block_id;
 }
@@ -81,17 +83,17 @@ void PagedAttentionManager::append_token_kv(
     // Copy-on-Write (CoW) isolation: branch if block is shared by another sequence
     if (block->ref_count > 1) {
         int32_t new_block_id = allocate_block();
-        if (new_block_id >= 0) {
-            auto* new_block = get_block(new_block_id);
-            if (new_block) {
-                new_block->num_tokens = block->num_tokens;
-                new_block->data = block->data;
-                new_block->ref_count = 1;
-                block->ref_count--;
-                table[block_idx] = new_block_id;
-                block = new_block;
-            }
+        if (new_block_id < 0) {
+            return; // Pool exhausted: NEVER corrupt shared parent block!
         }
+        auto* new_block = get_block(new_block_id);
+        if (!new_block) return;
+        new_block->num_tokens = block->num_tokens;
+        new_block->data = block->data;
+        new_block->ref_count = 1;
+        block->ref_count--;
+        table[block_idx] = new_block_id;
+        block = new_block;
     }
 
     if (offset_in_block >= block->num_tokens) {
@@ -114,11 +116,17 @@ void PagedAttentionManager::append_token_kv(
 
 uint64_t PagedAttentionManager::fork_sequence(uint64_t parent_seq_id, uint64_t child_seq_id) {
     std::lock_guard<std::recursive_mutex> lock(paged_mutex_);
+    if (parent_seq_id == child_seq_id) return child_seq_id;
     auto parent_it = sequence_block_tables_.find(parent_seq_id);
     if (parent_it == sequence_block_tables_.end()) return parent_seq_id;
 
+    // Copy parent table BEFORE inserting child_seq_id so unordered_map rehash never invalidates parent_it
+    std::vector<int32_t> copied_table = parent_it->second;
+    if (sequence_block_tables_.find(child_seq_id) != sequence_block_tables_.end()) {
+        free_sequence(child_seq_id);
+    }
     auto& child_table = sequence_block_tables_[child_seq_id];
-    child_table = parent_it->second;
+    child_table = std::move(copied_table);
 
     for (int32_t block_id : child_table) {
         if (block_id >= 0 && (size_t)block_id < block_pool_.size()) {

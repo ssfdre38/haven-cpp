@@ -525,10 +525,19 @@ static void test_hardened_plugins() {
     assert(pm.dispatch_tool_execution("run_command", "powershell -c whoami", out));
     assert(out.find("Security Block") != std::string::npos);
 
-    // Workspace coder: outside-workspace absolute path blocked
+    // Workspace coder: outside-workspace absolute path & protected runtime paths blocked
     out.clear();
     assert(pm.dispatch_tool_execution("read_file", "C:\\Windows\\win.ini", out));
     assert(out.find("Blocked") != std::string::npos || out.find("outside") != std::string::npos || out.find("Security") != std::string::npos);
+    out.clear();
+    assert(pm.dispatch_tool_execution("write_file", "plugins/evil.dll\npwned", out));
+    assert(out.find("Blocked") != std::string::npos);
+    out.clear();
+    assert(pm.dispatch_tool_execution("write_file", "wwwroot/index.html\n<script>alert(1)</script>", out));
+    assert(out.find("Blocked") != std::string::npos);
+    out.clear();
+    assert(pm.dispatch_tool_execution("write_file", "mcp_servers.json\n{}", out));
+    assert(out.find("Blocked") != std::string::npos);
 
     // Vault sync: path traversal blocked (returns false + Blocked message)
     out.clear();

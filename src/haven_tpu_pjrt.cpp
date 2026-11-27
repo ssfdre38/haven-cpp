@@ -1288,7 +1288,7 @@ TpuGemmBenchResult HavenTpuPjrtBackend::benchmark_bf16_gemm(int M, int N, int K,
     auto run_wave = [&](bool verify_first) -> bool {
         std::vector<std::thread> threads;
         threads.reserve(static_cast<size_t>(use_devs));
-        std::vector<bool> flags(static_cast<size_t>(use_devs), false);
+        std::vector<uint8_t> flags(static_cast<size_t>(use_devs), 0u);
         float sample_val = 0.0f;
 
         for (int d = 0; d < use_devs; ++d) {
@@ -1305,12 +1305,12 @@ TpuGemmBenchResult HavenTpuPjrtBackend::benchmark_bf16_gemm(int M, int N, int K,
                     }
                 }
                 destroy_buffer(outs[0]);
-                flags[static_cast<size_t>(d)] = true;
+                flags[static_cast<size_t>(d)] = 1u;
             });
         }
         for (auto& th : threads) th.join();
         if (verify_first) res.checksum = sample_val;
-        for (bool f : flags) if (!f) return false;
+        for (uint8_t f : flags) if (!f) return false;
         return true;
     };
 

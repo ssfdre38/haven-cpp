@@ -5,6 +5,8 @@
 #include <vector>
 #include <chrono>
 #include <filesystem>
+#include <cstdlib>
+#include <algorithm>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -71,15 +73,22 @@ public:
             }
 
             if (resp.empty()) {
-                // Try auto-spawning sd-server.exe in the background if available
-                STARTUPINFOA si = { sizeof(si) };
-                PROCESS_INFORMATION pi;
-                std::string sd_cmd = "C:\\Users\\admin\\stable-diffusion-cpp\\sd-server.exe -m C:\\Users\\admin\\stable-diffusion-cpp\\models\\DreamShaper8_LCM_q4_0.gguf --taesd C:\\Users\\admin\\stable-diffusion-cpp\\models\\taesd.safetensors --sampling-method lcm --steps 6 --cfg-scale 1.8 --listen-port 8085 --threads 8";
-                if (CreateProcessA(NULL, (char*)sd_cmd.c_str(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, "C:\\Users\\admin\\stable-diffusion-cpp", &si, &pi)) {
-                    CloseHandle(pi.hProcess);
-                    CloseHandle(pi.hThread);
-                    Sleep(3000);
-                    resp = http_post_json(L"127.0.0.1", 8085, L"/v1/images/generations", req_json);
+                // Try auto-spawning sd-server.exe in the background if configured via HAVEN_SD_DIR
+                const char* sd_dir_env = std::getenv("HAVEN_SD_DIR");
+                if (sd_dir_env && *sd_dir_env) {
+                    std::string sd_dir(sd_dir_env);
+                    STARTUPINFOA si{};
+                    si.cb = sizeof(si);
+                    PROCESS_INFORMATION pi{};
+                    std::string sd_cmd = "\"" + sd_dir + "\\sd-server.exe\" -m \"" + sd_dir + "\\models\\DreamShaper8_LCM_q4_0.gguf\" --taesd \"" + sd_dir + "\\models\\taesd.safetensors\" --sampling-method lcm --steps 6 --cfg-scale 1.8 --listen-port 8085 --threads 8";
+                    std::vector<char> cmd_buf(sd_cmd.begin(), sd_cmd.end());
+                    cmd_buf.push_back('\0');
+                    if (CreateProcessA(NULL, cmd_buf.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, sd_dir.c_str(), &si, &pi)) {
+                        CloseHandle(pi.hProcess);
+                        CloseHandle(pi.hThread);
+                        Sleep(3000);
+                        resp = http_post_json(L"127.0.0.1", 8085, L"/v1/images/generations", req_json);
+                    }
                 }
             }
 
@@ -113,10 +122,8 @@ public:
             std::string fname = ss.str();
 
             std::string uploads_dir = "wwwroot/uploads";
-            if (!std::filesystem::exists(uploads_dir)) {
-                uploads_dir = "C:\\Users\\admin\\source\\haven-cpp\\wwwroot\\uploads";
-            }
-            std::filesystem::create_directories(uploads_dir);
+            std::error_code dir_ec;
+            std::filesystem::create_directories(uploads_dir, dir_ec);
             std::string file_path = uploads_dir + "/" + fname;
 
             FILE* f = fopen(file_path.c_str(), "wb");

@@ -72,15 +72,15 @@ void Avx2Math::rms_norm(float* out, const float* x, const float* weight, int siz
     }
 }
 
-// Rotary Position Embeddings (RoPE) using Google Gemma HalfRope (SWA rope_dim=128 / Global rope_dim=256)
+// Rotary Position Embeddings (RoPE) supporting both NeoX split-half (Gemma/Qwen/Phi) and GGUF interleaved (Llama/Mistral)
 void Avx2Math::apply_rope(
     float* q, float* k,
     int head_dim, int num_heads, int num_kv_heads,
     int pos, float freq_base, float freq_scale, const float* freq_factors,
-    int rope_dim)
+    int rope_dim, bool neox_style)
 {
     if (!q || head_dim <= 0 || num_heads < 0 || num_kv_heads < 0) return;
-    if (rope_dim <= 0 || rope_dim > head_dim) rope_dim = head_dim / 2;
+    if (rope_dim <= 0 || rope_dim > head_dim) rope_dim = head_dim;
     const int num_pairs = rope_dim / 2;
     if (num_pairs <= 0 || freq_base <= 0.0f) return;
 
@@ -111,13 +111,24 @@ void Avx2Math::apply_rope(
     auto rotate_heads = [&](float* base, int count) {
         for (int h = 0; h < count; ++h) {
             float* head = base + static_cast<size_t>(h) * static_cast<size_t>(head_dim);
-            for (int i = 0; i < num_pairs; ++i) {
-                const float c = cos_ptr[i];
-                const float s = sin_ptr[i];
-                const float v0 = head[i];
-                const float v1 = head[i + num_pairs];
-                head[i]             = v0 * c - v1 * s;
-                head[i + num_pairs] = v0 * s + v1 * c;
+            if (neox_style) {
+                for (int i = 0; i < num_pairs; ++i) {
+                    const float c = cos_ptr[i];
+                    const float s = sin_ptr[i];
+                    const float v0 = head[i];
+                    const float v1 = head[i + num_pairs];
+                    head[i]             = v0 * c - v1 * s;
+                    head[i + num_pairs] = v0 * s + v1 * c;
+                }
+            } else {
+                for (int i = 0; i < num_pairs; ++i) {
+                    const float c = cos_ptr[i];
+                    const float s = sin_ptr[i];
+                    const float v0 = head[2 * i];
+                    const float v1 = head[2 * i + 1];
+                    head[2 * i]     = v0 * c - v1 * s;
+                    head[2 * i + 1] = v0 * s + v1 * c;
+                }
             }
         }
     };
@@ -146,7 +157,6 @@ void Avx2Math::softmax(float* x, int size) {
 // Fast AVX2 Q4_0 dot product (32 values per block)
 float Avx2Math::vec_dot_q4_0(int n, const block_q4_0* vx, const float* vy) {
     const int nb = n / 32;
-    float sumf = 0.0f;
     __m256 acc = _mm256_setzero_ps();
 
     for (int i = 0; i < nb; ++i) {
@@ -155,39 +165,41 @@ float Avx2Math::vec_dot_q4_0(int n, const block_q4_0* vx, const float* vy) {
         const uint8_t* q = vx[i].qs;
         const float* y = vy + i * 32;
 
+        // GGUF/ggml block_q4_0 split-half layout: low nibbles -> [0..15], high nibbles -> [16..31]
         for (int k = 0; k < 2; ++k) {
-            __m256 vy_k0 = _mm256_loadu_ps(y + k * 16 + 0);
-            __m256 vy_k1 = _mm256_loadu_ps(y + k * 16 + 8);
+            const int base = k * 8;
+            __m256 vy_lo = _mm256_loadu_ps(y + base);
+            __m256 vy_hi = _mm256_loadu_ps(y + 16 + base);
 
-            __m256 vx_k0 = _mm256_set_ps(
-                (float)(int8_t)((q[k * 8 + 3] >> 4) - 8),
-                (float)(int8_t)((q[k * 8 + 3] & 0x0F) - 8),
-                (float)(int8_t)((q[k * 8 + 2] >> 4) - 8),
-                (float)(int8_t)((q[k * 8 + 2] & 0x0F) - 8),
-                (float)(int8_t)((q[k * 8 + 1] >> 4) - 8),
-                (float)(int8_t)((q[k * 8 + 1] & 0x0F) - 8),
-                (float)(int8_t)((q[k * 8 + 0] >> 4) - 8),
-                (float)(int8_t)((q[k * 8 + 0] & 0x0F) - 8)
+            __m256 vx_lo = _mm256_set_ps(
+                static_cast<float>(static_cast<int>(q[base + 7] & 0x0F) - 8),
+                static_cast<float>(static_cast<int>(q[base + 6] & 0x0F) - 8),
+                static_cast<float>(static_cast<int>(q[base + 5] & 0x0F) - 8),
+                static_cast<float>(static_cast<int>(q[base + 4] & 0x0F) - 8),
+                static_cast<float>(static_cast<int>(q[base + 3] & 0x0F) - 8),
+                static_cast<float>(static_cast<int>(q[base + 2] & 0x0F) - 8),
+                static_cast<float>(static_cast<int>(q[base + 1] & 0x0F) - 8),
+                static_cast<float>(static_cast<int>(q[base + 0] & 0x0F) - 8)
+            );
+            __m256 vx_hi = _mm256_set_ps(
+                static_cast<float>(static_cast<int>(q[base + 7] >> 4) - 8),
+                static_cast<float>(static_cast<int>(q[base + 6] >> 4) - 8),
+                static_cast<float>(static_cast<int>(q[base + 5] >> 4) - 8),
+                static_cast<float>(static_cast<int>(q[base + 4] >> 4) - 8),
+                static_cast<float>(static_cast<int>(q[base + 3] >> 4) - 8),
+                static_cast<float>(static_cast<int>(q[base + 2] >> 4) - 8),
+                static_cast<float>(static_cast<int>(q[base + 1] >> 4) - 8),
+                static_cast<float>(static_cast<int>(q[base + 0] >> 4) - 8)
             );
 
-            __m256 vx_k1 = _mm256_set_ps(
-                (float)(int8_t)((q[k * 8 + 7] >> 4) - 8),
-                (float)(int8_t)((q[k * 8 + 7] & 0x0F) - 8),
-                (float)(int8_t)((q[k * 8 + 6] >> 4) - 8),
-                (float)(int8_t)((q[k * 8 + 6] & 0x0F) - 8),
-                (float)(int8_t)((q[k * 8 + 5] >> 4) - 8),
-                (float)(int8_t)((q[k * 8 + 5] & 0x0F) - 8),
-                (float)(int8_t)((q[k * 8 + 4] >> 4) - 8),
-                (float)(int8_t)((q[k * 8 + 4] & 0x0F) - 8)
-            );
-
-            acc = _mm256_fmadd_ps(_mm256_mul_ps(vx_k0, d_vec), vy_k0, acc);
-            acc = _mm256_fmadd_ps(_mm256_mul_ps(vx_k1, d_vec), vy_k1, acc);
+            acc = _mm256_fmadd_ps(_mm256_mul_ps(vx_lo, d_vec), vy_lo, acc);
+            acc = _mm256_fmadd_ps(_mm256_mul_ps(vx_hi, d_vec), vy_hi, acc);
         }
     }
 
     float buffer[8];
     _mm256_storeu_ps(buffer, acc);
+    float sumf = 0.0f;
     for (int j = 0; j < 8; ++j) sumf += buffer[j];
     return sumf;
 }
@@ -834,8 +846,8 @@ void Avx2Math::dequantize_row(float* out, const TensorDesc& weight, int row, int
             float d = fp16_to_fp32(row_blocks[b].d);
             for (int j = 0; j < 16; ++j) {
                 uint8_t byte = row_blocks[b].qs[j];
-                out[b * 32 + j * 2 + 0] = (float)(int8_t)((byte & 0x0F) - 8) * d;
-                out[b * 32 + j * 2 + 1] = (float)(int8_t)((byte >> 4) - 8) * d;
+                out[b * 32 + j]      = static_cast<float>(static_cast<int>(byte & 0x0F) - 8) * d;
+                out[b * 32 + 16 + j] = static_cast<float>(static_cast<int>(byte >> 4)   - 8) * d;
             }
         }
     }
@@ -1569,8 +1581,8 @@ static float dot_row_q4_0_q8(const void* data, size_t row, const Q8Act32& act, i
         const __m128i qb  = _mm_loadu_si128(reinterpret_cast<const __m128i*>(vx[i].qs));
         const __m128i qlo = _mm_and_si128(qb, mask_lo);
         const __m128i qhi = _mm_and_si128(_mm_srli_epi16(qb, 4), mask_lo);
-        // Interleave [lo0, hi0, lo1, hi1, ...] matching dequantize_row & vec_dot_q4_0
-        const __m256i q4 = mm256_concat_si128(_mm_unpacklo_epi8(qlo, qhi), _mm_unpackhi_epi8(qlo, qhi));
+        // GGUF split-half layout: [lo0..lo15, hi0..hi15] matching Q5_0/Q5_1/IQ4_NL
+        const __m256i q4 = mm256_concat_si128(qlo, qhi);
         const __m256i y0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(act.qs + static_cast<size_t>(i) * 32ULL));
         const __m256i p  = _mm256_madd_epi16(_mm256_maddubs_epi16(q4, y0), ones16);
         const float dw_dy = Avx2Math::fp16_to_fp32(vx[i].d) * act.d[i];
@@ -2296,7 +2308,7 @@ static inline void dot_q4_0_q8_32_xN(const void* data, size_t row, const Q8_32Ba
         const __m128i qb  = _mm_loadu_si128(reinterpret_cast<const __m128i*>(vx[i].qs));
         const __m128i qlo = _mm_and_si128(qb, mask_lo);
         const __m128i qhi = _mm_and_si128(_mm_srli_epi16(qb, 4), mask_lo);
-        const __m256i q4  = mm256_concat_si128(_mm_unpacklo_epi8(qlo, qhi), _mm_unpackhi_epi8(qlo, qhi));
+        const __m256i q4  = mm256_concat_si128(qlo, qhi);
 
         const int8_t*  yp = tile.qs.data()     + static_cast<size_t>(i) * 256ULL;
         const float*   dp = tile.d.data()      + static_cast<size_t>(i) * 8ULL;
@@ -2688,6 +2700,14 @@ void Avx2Math::add_bias(float* out, const TensorDesc& bias_tensor, int size) {
         }
         for (; i < size; ++i) {
             out[i] += fp16_to_fp32(b[i]);
+        }
+    } else if (bias_tensor.type == QuantType::BF16) {
+        const uint16_t* b = reinterpret_cast<const uint16_t*>(bias_tensor.data);
+        for (int i = 0; i < size; ++i) {
+            uint32_t u = static_cast<uint32_t>(b[i]) << 16;
+            float f = 0.0f;
+            std::memcpy(&f, &u, sizeof(f));
+            out[i] += f;
         }
     }
 }

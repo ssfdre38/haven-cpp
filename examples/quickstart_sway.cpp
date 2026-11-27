@@ -45,6 +45,6 @@ int main() {
     }
 
     std::cout << "\n[SUCCESS] Continuous Lorenz sway and respiration dynamics running smoothly!\n";
-    std::cout << "Integrate into your render loop via: auto output = engine.step(dt);\n";
+    std::cout << "Integrate into your render loop via: auto output = engine.update(dt);\n";
     return 0;
 }

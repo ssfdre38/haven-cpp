@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <algorithm>
+#include <cctype>
 
 namespace haven {
 
@@ -40,7 +41,41 @@ static std::string extract_json_field(const std::string& json, const std::string
     return "";
 }
 
-static bool resolve_workspace_path(const std::string& raw_input, std::filesystem::path& out_path, bool allow_root = false) {
+static bool is_protected_write_target(const std::filesystem::path& root, const std::filesystem::path& resolved) {
+    std::error_code ec;
+    std::filesystem::path rel = std::filesystem::relative(resolved, root, ec);
+    if (ec || rel.empty()) return true;
+
+    auto to_low = [](std::string s) {
+        for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return s;
+    };
+
+    std::string first_comp = to_low(rel.begin()->string());
+    if (first_comp == "plugins" || first_comp == "wwwroot" || first_comp == "modules" ||
+        first_comp == "build" || first_comp == ".git" || first_comp == ".github") {
+        return true;
+    }
+
+    std::string fname = to_low(resolved.filename().string());
+    if (fname == "mcp_servers.json" || fname == "models_config.json" ||
+        fname == "discord_config.json" || fname == "persona.json" ||
+        fname == "memories.json" || fname == "knowledge_graph.json" ||
+        fname.ends_with(".hmb")) {
+        return true;
+    }
+
+    std::string ext = to_low(resolved.extension().string());
+    if (ext == ".dll" || ext == ".so" || ext == ".dylib" || ext == ".exe" ||
+        ext == ".bat" || ext == ".cmd" || ext == ".ps1" || ext == ".sh" ||
+        ext == ".vbs" || ext == ".com" || ext == ".msi") {
+        return true;
+    }
+    return false;
+}
+
+static bool resolve_workspace_path(const std::string& raw_input, std::filesystem::path& out_path,
+                                   bool allow_root = false, bool for_write = false) {
     std::string s = raw_input;
     while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r' || s.front() == '\n' || s.front() == '"' || s.front() == '\'')) {
         s.erase(0, 1);
@@ -69,7 +104,7 @@ static bool resolve_workspace_path(const std::string& raw_input, std::filesystem
     const std::string& res_cmp = res_str;
 #endif
     if (res_cmp == root_cmp) {
-        if (!allow_root) return false;
+        if (!allow_root || for_write) return false;
         out_path = resolved;
         return true;
     }
@@ -78,6 +113,10 @@ static bool resolve_workspace_path(const std::string& raw_input, std::filesystem
     }
     char sep = res_cmp[root_cmp.size()];
     if (sep != '\\' && sep != '/') return false;
+
+    if (for_write && is_protected_write_target(root, resolved)) {
+        return false;
+    }
 
     out_path = resolved;
     return true;
@@ -177,8 +216,8 @@ public:
             }
 
             std::filesystem::path safe_path;
-            if (!resolve_workspace_path(path_str, safe_path)) {
-                output = "📁 [WorkspaceCoder] Blocked: Target write path must stay inside the active workspace directory.";
+            if (!resolve_workspace_path(path_str, safe_path, false, true)) {
+                output = "📁 [WorkspaceCoder] Blocked: Target write path must stay inside non-protected workspace directories (plugins/wwwroot/modules/configs/executables are protected).";
                 return true;
             }
 
@@ -223,8 +262,8 @@ public:
             }
 
             std::filesystem::path safe_path;
-            if (!resolve_workspace_path(path_str, safe_path) || !std::filesystem::exists(safe_path)) {
-                output = "📁 [WorkspaceCoder] Blocked or not found: Target patch file must exist inside the active workspace.";
+            if (!resolve_workspace_path(path_str, safe_path, false, true) || !std::filesystem::exists(safe_path)) {
+                output = "📁 [WorkspaceCoder] Blocked or not found: Target patch file must exist inside non-protected workspace paths.";
                 return true;
             }
             if (target.empty()) {
@@ -263,8 +302,8 @@ public:
 
         if (action == "create_directory") {
             std::filesystem::path safe_dir;
-            if (!resolve_workspace_path(payload, safe_dir)) {
-                output = "📁 [WorkspaceCoder] Blocked: Directory creation is confined to the active workspace.";
+            if (!resolve_workspace_path(payload, safe_dir, false, true)) {
+                output = "📁 [WorkspaceCoder] Blocked: Directory creation is confined to non-protected workspace paths.";
                 return true;
             }
 
@@ -280,8 +319,8 @@ public:
 
         if (action == "delete_file") {
             std::filesystem::path safe_path;
-            if (!resolve_workspace_path(payload, safe_path, false)) {
-                output = "📁 [WorkspaceCoder] Blocked: Deletion outside the active workspace or of workspace root is prohibited.";
+            if (!resolve_workspace_path(payload, safe_path, false, true)) {
+                output = "📁 [WorkspaceCoder] Blocked: Deletion outside the active workspace or of protected/root paths is prohibited.";
                 return true;
             }
 

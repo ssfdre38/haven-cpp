@@ -14,6 +14,7 @@ struct GatedKVCacheLayer {
     std::vector<float> salience_scores;  // [max_seq] Salience tracker per token position
     std::vector<bool> active_mask;       // [max_seq] Boolean active mask (true = active, false = pruned)
     int current_len = 0;
+    uint32_t kv_dim = 0;                 // Per-layer KV stride (differs between SWA and global layers)
 };
 
 class DynamicKVCacheManager {

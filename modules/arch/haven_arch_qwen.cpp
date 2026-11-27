@@ -1,4 +1,5 @@
 #include "haven/haven_module_abi.h"
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 
@@ -16,7 +17,18 @@ static const HavenModuleDescriptor kDesc = {
 };
 
 static bool str_contains(const char* haystack, const char* needle) {
-    return haystack && needle && std::strstr(haystack, needle) != nullptr;
+    if (!haystack || !needle) return false;
+    const size_t nlen = std::strlen(needle);
+    if (nlen == 0) return true;
+    for (const char* p = haystack; *p != '\0'; ++p) {
+        size_t i = 0;
+        while (i < nlen && p[i] != '\0' &&
+               std::tolower(static_cast<unsigned char>(p[i])) == std::tolower(static_cast<unsigned char>(needle[i]))) {
+            ++i;
+        }
+        if (i == nlen) return true;
+    }
+    return false;
 }
 
 } // namespace

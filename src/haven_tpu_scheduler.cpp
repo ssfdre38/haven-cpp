@@ -65,9 +65,12 @@ bool TpuContinuousBatchScheduler::start_with_backend(std::unique_ptr<ITpuBatchBa
                                                      const HavenTokenizer* tokenizer,
                                                      const PersonaSampler& template_sampler) {
     stop();
+    std::lock_guard<std::mutex> life_lk(lifecycle_mtx_);
     if (!backend || backend->batch_capacity() < 1 || backend->max_seq_len() < 2) {
         return false;
     }
+    cached_batch_cap_.store(backend->batch_capacity(), std::memory_order_release);
+    cached_max_seq_len_.store(backend->max_seq_len(), std::memory_order_release);
     backend_ = std::move(backend);
     tokenizer_ = tokenizer;
     template_sampler_ = template_sampler;
@@ -80,17 +83,23 @@ bool TpuContinuousBatchScheduler::start_with_backend(std::unique_ptr<ITpuBatchBa
     stat_slot_steps_sum_.store(0, std::memory_order_relaxed);
     stat_last_step_us_.store(0, std::memory_order_relaxed);
 
-    running_.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> q_lk(queue_mtx_);
+        running_.store(true, std::memory_order_release);
+    }
     worker_thread_ = std::thread(&TpuContinuousBatchScheduler::worker_loop, this);
     return true;
 }
 
 void TpuContinuousBatchScheduler::stop() {
-    if (running_.exchange(false, std::memory_order_acq_rel)) {
-        {
-            std::lock_guard<std::mutex> lk(queue_mtx_);
-            worker_cv_.notify_all();
-        }
+    std::lock_guard<std::mutex> life_lk(lifecycle_mtx_);
+    bool was_running = false;
+    {
+        std::lock_guard<std::mutex> lk(queue_mtx_);
+        was_running = running_.exchange(false, std::memory_order_acq_rel);
+        worker_cv_.notify_all();
+    }
+    if (was_running || worker_thread_.joinable()) {
         if (worker_thread_.joinable()) {
             worker_thread_.join();
         }
@@ -103,13 +112,14 @@ void TpuContinuousBatchScheduler::stop() {
         }
         stat_queued_requests_.store(0, std::memory_order_relaxed);
     }
+    cached_batch_cap_.store(0, std::memory_order_release);
     backend_.reset();
     tokenizer_ = nullptr;
 }
 
 bool TpuContinuousBatchScheduler::is_stop_token_id(uint32_t tok) const {
     if (tokenizer_) {
-        if (tokenizer_->is_stop_token(tok) || tok == tokenizer_->eos_token()) return true;
+        return tokenizer_->is_stop_token(tok) || tok == tokenizer_->eos_token();
     }
     return (tok == 1 || tok == 106 || tok == 212);
 }
@@ -142,10 +152,6 @@ bool TpuContinuousBatchScheduler::generate_streaming(const TpuGenerationRequest&
                                                      const std::function<bool(uint32_t token_id)>& on_token,
                                                      const std::function<bool()>& is_cancelled_fn,
                                                      std::string* err_out) {
-    if (!running_.load(std::memory_order_acquire) || !backend_) {
-        if (err_out) *err_out = "TPU continuous batch scheduler is not running.";
-        return false;
-    }
     if (req.prompt_tokens.empty()) {
         if (err_out) *err_out = "Prompt token sequence is empty.";
         return false;
@@ -154,17 +160,21 @@ bool TpuContinuousBatchScheduler::generate_streaming(const TpuGenerationRequest&
     auto ctx = std::make_shared<RequestContext>();
     ctx->request_id = next_request_id_.fetch_add(1, std::memory_order_relaxed);
     ctx->req = req;
-    const int max_ctx = backend_->max_seq_len();
-    const size_t max_prompt = static_cast<size_t>(std::max(1, max_ctx - 1));
-    if (ctx->req.prompt_tokens.size() > max_prompt) {
-        ctx->req.prompt_tokens.erase(
-            ctx->req.prompt_tokens.begin(),
-            ctx->req.prompt_tokens.begin() + static_cast<std::ptrdiff_t>(ctx->req.prompt_tokens.size() - max_prompt));
-    }
-    ctx->req.max_tokens = std::clamp(ctx->req.max_tokens, 1, max_ctx);
 
     {
         std::lock_guard<std::mutex> lk(queue_mtx_);
+        if (!running_.load(std::memory_order_acquire)) {
+            if (err_out) *err_out = "TPU continuous batch scheduler is not running.";
+            return false;
+        }
+        const int max_ctx = std::max(2, cached_max_seq_len_.load(std::memory_order_acquire));
+        const size_t max_prompt = static_cast<size_t>(std::max(1, max_ctx - 1));
+        if (ctx->req.prompt_tokens.size() > max_prompt) {
+            ctx->req.prompt_tokens.erase(
+                ctx->req.prompt_tokens.begin(),
+                ctx->req.prompt_tokens.begin() + static_cast<std::ptrdiff_t>(ctx->req.prompt_tokens.size() - max_prompt));
+        }
+        ctx->req.max_tokens = std::clamp(ctx->req.max_tokens, 1, max_ctx);
         pending_queue_.push_back(ctx);
         stat_queued_requests_.store(static_cast<int>(pending_queue_.size()), std::memory_order_relaxed);
     }
@@ -442,7 +452,7 @@ void TpuContinuousBatchScheduler::worker_loop() {
 
 TpuSchedulerStats TpuContinuousBatchScheduler::get_stats() const {
     TpuSchedulerStats st;
-    st.batch_capacity = backend_ ? backend_->batch_capacity() : 0;
+    st.batch_capacity = cached_batch_cap_.load(std::memory_order_acquire);
     st.active_slots = stat_active_slots_.load(std::memory_order_relaxed);
     st.queued_requests = stat_queued_requests_.load(std::memory_order_relaxed);
     st.total_requests_completed = stat_completed_.load(std::memory_order_relaxed);
