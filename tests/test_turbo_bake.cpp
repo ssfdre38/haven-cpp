@@ -122,10 +122,10 @@ static void test_norm_fold_hadamard_and_r2_math() {
         std::exit(1);
     }
 
-    // Compare Q8_K (per-32-elem dynamic-scale Q8KBatch) error BEFORE vs AFTER baking on the 662x spike!
+    // Compare raw uncompensated Q8 (extract_outliers=false) error BEFORE vs AFTER Hadamard baking on the 662x spike!
     Q8KBatch b_raw, b_baked;
-    Avx2Math::pack_q8k_batch(xn_raw.data(), D, D, 1, b_raw);
-    Avx2Math::pack_q8k_batch(xn_unit.data(), D, D, 1, b_baked);
+    Avx2Math::pack_q8k_batch(xn_raw.data(), D, D, 1, b_raw, false);
+    Avx2Math::pack_q8k_batch(xn_unit.data(), D, D, 1, b_baked, false);
 
     auto dequant_q8k_dot = [](const std::vector<float>& mat, const Q8KBatch& b, int rows, int cols) {
         std::vector<float> out(rows, 0.0f);

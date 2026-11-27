@@ -1177,7 +1177,103 @@ static inline int32_t hsum256_epi32(__m256i v) {
     return _mm_cvtsi128_si32(s);
 }
 
-void Avx2Math::quantize_q8_act(const float* x, int cols, Q8Act32& out) {
+// Exact scalar dequantizer for a single weight W[row, c] — used exclusively for sparse FP32 outlier compensation!
+template <QuantType QT>
+static inline float dequant_weight_elem(const void* data, size_t row, int cols, int c) {
+    if constexpr (QT == QuantType::IQ4_XS) {
+        const auto* blk = reinterpret_cast<const block_iq4_xs*>(data) + row * static_cast<size_t>(cols / 256) + static_cast<size_t>(c >> 8);
+        const int ib = (c & 255) >> 5;
+        const int j  = c & 31;
+        const int ls = ((blk->scales_l[ib >> 1] >> (4 * (ib & 1))) & 0x0F) | (((blk->scales_h >> (2 * ib)) & 3) << 4);
+        const uint8_t byte = blk->qs[(ib << 4) + (j & 15)];
+        const int nib = (j < 16) ? (byte & 0x0F) : (byte >> 4);
+        return Avx2Math::fp16_to_fp32(blk->d) * static_cast<float>(ls - 32) * static_cast<float>(kvalues_iq4nl[nib]);
+    } else if constexpr (QT == QuantType::IQ4_NL) {
+        const auto* blk = reinterpret_cast<const block_iq4_nl*>(data) + row * static_cast<size_t>(cols / 32) + static_cast<size_t>(c >> 5);
+        const int j = c & 31;
+        const uint8_t byte = blk->qs[j & 15];
+        const int nib = (j < 16) ? (byte & 0x0F) : (byte >> 4);
+        return Avx2Math::fp16_to_fp32(blk->d) * static_cast<float>(kvalues_iq4nl[nib]);
+    } else if constexpr (QT == QuantType::Q4_K) {
+        const auto* blk = reinterpret_cast<const block_q4_K*>(data) + row * static_cast<size_t>(cols / 256) + static_cast<size_t>(c >> 8);
+        const int sub = (c & 255) >> 5;
+        const int j = sub >> 1;
+        const int l = c & 31;
+        uint8_t sc, mn;
+        get_scale_min_k4(sub, blk->scales, &sc, &mn);
+        const uint8_t byte = blk->qs[(j << 5) + l];
+        const int q = (sub & 1) ? (byte >> 4) : (byte & 0x0F);
+        return Avx2Math::fp16_to_fp32(blk->d) * static_cast<float>(sc) * static_cast<float>(q)
+             - Avx2Math::fp16_to_fp32(blk->dmin) * static_cast<float>(mn);
+    } else if constexpr (QT == QuantType::Q5_K) {
+        const auto* blk = reinterpret_cast<const block_q5_K*>(data) + row * static_cast<size_t>(cols / 256) + static_cast<size_t>(c >> 8);
+        const int sub = (c & 255) >> 5;
+        const int j = sub >> 1;
+        const int l = c & 31;
+        uint8_t sc, mn;
+        get_scale_min_k4(sub, blk->scales, &sc, &mn);
+        const uint8_t byte = blk->qs[(j << 5) + l];
+        int q = (sub & 1) ? (byte >> 4) : (byte & 0x0F);
+        if (blk->qh[l] & static_cast<uint8_t>(1u << sub)) q += 16;
+        return Avx2Math::fp16_to_fp32(blk->d) * static_cast<float>(sc) * static_cast<float>(q)
+             - Avx2Math::fp16_to_fp32(blk->dmin) * static_cast<float>(mn);
+    } else if constexpr (QT == QuantType::Q6_K) {
+        const auto* blk = reinterpret_cast<const block_q6_K*>(data) + row * static_cast<size_t>(cols / 256) + static_cast<size_t>(c >> 8);
+        const int nc  = (c & 255) >> 7;
+        const int rem = c & 127;
+        const int grp = rem >> 5;
+        const int l   = rem & 31;
+        const int is  = l >> 4;
+        const uint8_t* ql = blk->ql + (nc << 6);
+        const uint8_t* qh = blk->qh + (nc << 5);
+        const int8_t*  sc = blk->scales + (nc << 3);
+        const uint8_t qb = ql[((grp & 1) << 5) + l];
+        const uint32_t nib = (grp >= 2) ? (qb >> 4) : (qb & 0x0Fu);
+        const uint32_t hi2 = (qh[l] >> (grp * 2)) & 3u;
+        const int q = static_cast<int>(nib | (hi2 << 4)) - 32;
+        return Avx2Math::fp16_to_fp32(blk->d) * static_cast<float>(sc[(grp << 1) + is]) * static_cast<float>(q);
+    } else if constexpr (QT == QuantType::Q5_1) {
+        const auto* blk = reinterpret_cast<const block_q5_1*>(data) + row * static_cast<size_t>(cols / 32) + static_cast<size_t>(c >> 5);
+        const int j = c & 31;
+        uint32_t qh = 0;
+        std::memcpy(&qh, blk->qh, sizeof(qh));
+        const uint8_t byte = blk->qs[j & 15];
+        const uint32_t nib = (j < 16) ? (byte & 0x0Fu) : (byte >> 4);
+        const uint32_t hi  = ((qh >> j) & 1u) << 4;
+        return Avx2Math::fp16_to_fp32(blk->d) * static_cast<float>(nib | hi) + Avx2Math::fp16_to_fp32(blk->m);
+    } else if constexpr (QT == QuantType::Q5_0) {
+        const auto* blk = reinterpret_cast<const block_q5_0*>(data) + row * static_cast<size_t>(cols / 32) + static_cast<size_t>(c >> 5);
+        const int j = c & 31;
+        uint32_t qh = 0;
+        std::memcpy(&qh, blk->qh, sizeof(qh));
+        const uint8_t byte = blk->qs[j & 15];
+        const uint32_t nib = (j < 16) ? (byte & 0x0Fu) : (byte >> 4);
+        const uint32_t hi  = ((qh >> j) & 1u) << 4;
+        return Avx2Math::fp16_to_fp32(blk->d) * static_cast<float>(static_cast<int>(nib | hi) - 16);
+    } else if constexpr (QT == QuantType::Q8_0) {
+        const auto* blk = reinterpret_cast<const block_q8_0*>(data) + row * static_cast<size_t>(cols / 32) + static_cast<size_t>(c >> 5);
+        return Avx2Math::fp16_to_fp32(blk->d) * static_cast<float>(blk->qs[c & 31]);
+    } else if constexpr (QT == QuantType::Q4_0) {
+        const auto* blk = reinterpret_cast<const block_q4_0*>(data) + row * static_cast<size_t>(cols / 32) + static_cast<size_t>(c >> 5);
+        const int j = c & 31;
+        const uint8_t byte = blk->qs[j & 15];
+        const int q = (j < 16) ? (byte & 0x0F) : (byte >> 4);
+        return Avx2Math::fp16_to_fp32(blk->d) * static_cast<float>(q - 8);
+    }
+    return 0.0f;
+}
+
+template <QuantType QT>
+static inline float dot_outliers(const void* data, size_t row, int cols, const Q8Outlier* outliers, int n_outliers) {
+    float acc = 0.0f;
+    for (int i = 0; i < n_outliers; ++i) {
+        acc += dequant_weight_elem<QT>(data, row, cols, outliers[i].col) * outliers[i].val;
+    }
+    return acc;
+}
+
+void Avx2Math::quantize_q8_act(const float* x, int cols, Q8Act32& out, bool extract_outliers) {
+    out.n_outliers = 0;
     if (!x || cols < 32) {
         out.nb = 0;
         return;
@@ -1206,18 +1302,53 @@ void Avx2Math::quantize_q8_act(const float* x, int cols, Q8Act32& out) {
 
     for (int b = 0; b < nb; ++b) {
         const float* xb = x + static_cast<size_t>(b) * 32ULL;
-        const __m256 x0 = _mm256_loadu_ps(xb + 0);
-        const __m256 x1 = _mm256_loadu_ps(xb + 8);
-        const __m256 x2 = _mm256_loadu_ps(xb + 16);
-        const __m256 x3 = _mm256_loadu_ps(xb + 24);
+        __m256 x0 = _mm256_loadu_ps(xb + 0);
+        __m256 x1 = _mm256_loadu_ps(xb + 8);
+        __m256 x2 = _mm256_loadu_ps(xb + 16);
+        __m256 x3 = _mm256_loadu_ps(xb + 24);
 
-        const __m256 m01 = _mm256_max_ps(_mm256_andnot_ps(sign_mask, x0), _mm256_andnot_ps(sign_mask, x1));
-        const __m256 m23 = _mm256_max_ps(_mm256_andnot_ps(sign_mask, x2), _mm256_andnot_ps(sign_mask, x3));
-        const __m256 m   = _mm256_max_ps(m01, m23);
+        const __m256 ax0 = _mm256_andnot_ps(sign_mask, x0);
+        const __m256 ax1 = _mm256_andnot_ps(sign_mask, x1);
+        const __m256 ax2 = _mm256_andnot_ps(sign_mask, x2);
+        const __m256 ax3 = _mm256_andnot_ps(sign_mask, x3);
+
+        const __m256 m = _mm256_max_ps(_mm256_max_ps(ax0, ax1), _mm256_max_ps(ax2, ax3));
         __m128 m128 = _mm_max_ps(_mm256_castps256_ps128(m), _mm256_extractf128_ps(m, 1));
         m128 = _mm_max_ps(m128, _mm_movehdup_ps(m128));
         m128 = _mm_max_ps(m128, _mm_movehl_ps(m128, m128));
-        const float max_abs = _mm_cvtss_f32(m128);
+        float max_abs = _mm_cvtss_f32(m128);
+
+        // Sparse Outlier-Split Q8: if 1-4 extreme channel spikes dominate a 32-elem block
+        // (max_abs > 25% of block L1 norm with non-zero siblings), peel them into exact FP32!
+        if (extract_outliers && max_abs > 1e-4f && out.n_outliers < Q8Act32::MAX_OUTLIERS) {
+            float sum_abs = hsum256_ps(_mm256_add_ps(_mm256_add_ps(ax0, ax1), _mm256_add_ps(ax2, ax3)));
+            if (max_abs * 4.0f > sum_abs && (sum_abs - max_abs) > 1e-6f) {
+                alignas(32) float tmp[32];
+                std::memcpy(tmp, xb, 32 * sizeof(float));
+                for (int peel = 0; peel < 4 && out.n_outliers < Q8Act32::MAX_OUTLIERS; ++peel) {
+                    if (!(max_abs > 1e-4f && max_abs * 4.0f > sum_abs && (sum_abs - max_abs) > 1e-6f)) break;
+                    int best_j = 0;
+                    float best_a = -1.0f;
+                    for (int j = 0; j < 32; ++j) {
+                        const float a = std::fabs(tmp[j]);
+                        if (a > best_a) { best_a = a; best_j = j; }
+                    }
+                    out.outliers[out.n_outliers++] = { b * 32 + best_j, tmp[best_j] };
+                    sum_abs -= best_a;
+                    tmp[best_j] = 0.0f;
+                    float next_max = 0.0f;
+                    for (int j = 0; j < 32; ++j) {
+                        const float a = std::fabs(tmp[j]);
+                        if (a > next_max) next_max = a;
+                    }
+                    max_abs = next_max;
+                }
+                x0 = _mm256_load_ps(tmp + 0);
+                x1 = _mm256_load_ps(tmp + 8);
+                x2 = _mm256_load_ps(tmp + 16);
+                x3 = _mm256_load_ps(tmp + 24);
+            }
+        }
 
         out.sumf[b] = hsum256_ps(_mm256_add_ps(_mm256_add_ps(x0, x1), _mm256_add_ps(x2, x3)));
 
@@ -1314,7 +1445,9 @@ static float dot_row_q6_K_q8(const void* data, size_t row, const Q8Act32& act, i
         }
         bias_total += d_w * block_bias;
     }
-    return hsum256_ps(_mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3))) - 32.0f * bias_total;
+    float res = hsum256_ps(_mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3))) - 32.0f * bias_total;
+    if (act.n_outliers > 0) res += dot_outliers<QuantType::Q6_K>(data, row, cols, act.outliers, act.n_outliers);
+    return res;
 }
 
 static float dot_row_iq4_xs_q8(const void* data, size_t row, const Q8Act32& act, int cols) {
@@ -1359,7 +1492,9 @@ static float dot_row_iq4_xs_q8(const void* data, size_t row, const Q8Act32& act,
             qs += 32;
         }
     }
-    return hsum256_ps(_mm256_add_ps(acc0, acc1));
+    float res = hsum256_ps(_mm256_add_ps(acc0, acc1));
+    if (act.n_outliers > 0) res += dot_outliers<QuantType::IQ4_XS>(data, row, cols, act.outliers, act.n_outliers);
+    return res;
 }
 
 static float dot_row_iq4_nl_q8(const void* data, size_t row, const Q8Act32& act, int cols) {
@@ -1397,7 +1532,9 @@ static float dot_row_iq4_nl_q8(const void* data, size_t row, const Q8Act32& act,
         acc0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(p0, ones16)),
                                _mm256_set1_ps(Avx2Math::fp16_to_fp32(vx[i].d) * act.d[i]), acc0);
     }
-    return hsum256_ps(_mm256_add_ps(acc0, acc1));
+    float res = hsum256_ps(_mm256_add_ps(acc0, acc1));
+    if (act.n_outliers > 0) res += dot_outliers<QuantType::IQ4_NL>(data, row, cols, act.outliers, act.n_outliers);
+    return res;
 }
 
 static float dot_row_q5_1_q8(const void* data, size_t row, const Q8Act32& act, int cols) {
@@ -1429,7 +1566,9 @@ static float dot_row_q5_1_q8(const void* data, size_t row, const Q8Act32& act, i
                               _mm256_set1_ps(Avx2Math::fp16_to_fp32(vx[i].d) * act.d[i]), acc);
         m_sum += Avx2Math::fp16_to_fp32(vx[i].m) * act.sumf[i];
     }
-    return hsum256_ps(acc) + m_sum;
+    float res = hsum256_ps(acc) + m_sum;
+    if (act.n_outliers > 0) res += dot_outliers<QuantType::Q5_1>(data, row, cols, act.outliers, act.n_outliers);
+    return res;
 }
 
 static float dot_row_q5_0_q8(const void* data, size_t row, const Q8Act32& act, int cols) {
@@ -1461,7 +1600,9 @@ static float dot_row_q5_0_q8(const void* data, size_t row, const Q8Act32& act, i
         acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(dw_dy), acc);
         bias_sum += dw_dy * static_cast<float>(static_cast<int32_t>(act.bsum[2 * i]) + static_cast<int32_t>(act.bsum[2 * i + 1]));
     }
-    return hsum256_ps(acc) - 16.0f * bias_sum;
+    float res = hsum256_ps(acc) - 16.0f * bias_sum;
+    if (act.n_outliers > 0) res += dot_outliers<QuantType::Q5_0>(data, row, cols, act.outliers, act.n_outliers);
+    return res;
 }
 
 static float dot_row_q4_K_q8(const void* data, size_t row, const Q8Act32& act, int cols) {
@@ -1506,7 +1647,9 @@ static float dot_row_q4_K_q8(const void* data, size_t row, const Q8Act32& act, i
             q += 32;
         }
     }
-    return hsum256_ps(_mm256_add_ps(acc0, acc1)) - min_total;
+    float res = hsum256_ps(_mm256_add_ps(acc0, acc1)) - min_total;
+    if (act.n_outliers > 0) res += dot_outliers<QuantType::Q4_K>(data, row, cols, act.outliers, act.n_outliers);
+    return res;
 }
 
 static float dot_row_q5_K_q8(const void* data, size_t row, const Q8Act32& act, int cols) {
@@ -1561,7 +1704,9 @@ static float dot_row_q5_K_q8(const void* data, size_t row, const Q8Act32& act, i
             u2 <<= 2;
         }
     }
-    return hsum256_ps(_mm256_add_ps(acc0, acc1)) - min_total;
+    float res = hsum256_ps(_mm256_add_ps(acc0, acc1)) - min_total;
+    if (act.n_outliers > 0) res += dot_outliers<QuantType::Q5_K>(data, row, cols, act.outliers, act.n_outliers);
+    return res;
 }
 
 static float dot_row_q8_0_q8(const void* data, size_t row, const Q8Act32& act, int cols) {
@@ -1591,7 +1736,9 @@ static float dot_row_q8_0_q8(const void* data, size_t row, const Q8Act32& act, i
         acc0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(p0, ones16)),
                                _mm256_set1_ps(Avx2Math::fp16_to_fp32(vx[i].d) * act.d[i]), acc0);
     }
-    return hsum256_ps(_mm256_add_ps(acc0, acc1));
+    float res = hsum256_ps(_mm256_add_ps(acc0, acc1));
+    if (act.n_outliers > 0) res += dot_outliers<QuantType::Q8_0>(data, row, cols, act.outliers, act.n_outliers);
+    return res;
 }
 
 static float dot_row_q4_0_q8(const void* data, size_t row, const Q8Act32& act, int cols) {
@@ -1614,7 +1761,9 @@ static float dot_row_q4_0_q8(const void* data, size_t row, const Q8Act32& act, i
         acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(dw_dy), acc);
         bias_sum += dw_dy * static_cast<float>(static_cast<int32_t>(act.bsum[2 * i]) + static_cast<int32_t>(act.bsum[2 * i + 1]));
     }
-    return hsum256_ps(acc) - 8.0f * bias_sum;
+    float res = hsum256_ps(acc) - 8.0f * bias_sum;
+    if (act.n_outliers > 0) res += dot_outliers<QuantType::Q4_0>(data, row, cols, act.outliers, act.n_outliers);
+    return res;
 }
 
 Avx2Math::DotRowQ8Fn Avx2Math::get_dot_row_q8_fn(QuantType type, int cols) {
@@ -1703,79 +1852,49 @@ void Avx2Math::gemv_slice(float* y, const TensorDesc& weight, size_t row_offset,
 // across an entire S-token prompt prefill chunk (~217-247 GMAC/s on 6-core Xeon).
 // ============================================================================
 
-void Avx2Math::pack_q8k_batch(const float* X, int stride_x, int cols, int n_tokens, Q8KBatch& out) {
+void Avx2Math::pack_q8k_batch(const float* X, int stride_x, int cols, int n_tokens, Q8KBatch& out, bool extract_outliers) {
     out.nb256 = (cols >= 256) ? (cols / 256) : 0;
     out.n_tokens = (n_tokens > 0 && out.nb256 > 0) ? n_tokens : 0;
     out.tiles.clear();
     if (!X || out.n_tokens == 0) return;
 
     const int n_tiles = (n_tokens + 7) / 8;
+    const int nb32 = out.nb256 * 8;
     out.tiles.resize(static_cast<size_t>(n_tiles));
 
-    const __m256 sign_mask = _mm256_set1_ps(-0.0f);
-    const __m256 v127  = _mm256_set1_ps(127.0f);
-    const __m256 vn127 = _mm256_set1_ps(-127.0f);
-
+    Q8Act32 tmp;
     for (int g = 0; g < n_tiles; ++g) {
         auto& tile = out.tiles[static_cast<size_t>(g)];
         const int t_base = g * 8;
         const int n_tok = std::min(8, n_tokens - t_base);
         tile.n_tok = n_tok;
-        tile.qs.assign(static_cast<size_t>(out.nb256) * 8ULL * 8ULL * 32ULL, 0);
-        tile.d.assign(static_cast<size_t>(out.nb256) * 8ULL * 8ULL, 0.0f);
-        tile.sumf.assign(static_cast<size_t>(out.nb256) * 8ULL * 8ULL, 0.0f);
-        tile.bsum16.assign(static_cast<size_t>(out.nb256) * 8ULL * 8ULL * 2ULL, 0);
+        tile.has_outliers = false;
+        tile.qs.assign(static_cast<size_t>(nb32) * 8ULL * 32ULL, 0);
+        tile.d.assign(static_cast<size_t>(nb32) * 8ULL, 0.0f);
+        tile.sumf.assign(static_cast<size_t>(nb32) * 8ULL, 0.0f);
+        tile.bsum16.assign(static_cast<size_t>(nb32) * 8ULL * 2ULL, 0);
 
         for (int t = 0; t < n_tok; ++t) {
-            const float* xt = X + static_cast<size_t>(t_base + t) * static_cast<size_t>(stride_x);
-            for (int sb = 0; sb < out.nb256; ++sb) {
-                const float* xb = xt + static_cast<size_t>(sb) * 256ULL;
-                for (int ib = 0; ib < 8; ++ib) {
-                    const size_t sub_idx = static_cast<size_t>(sb) * 8ULL + static_cast<size_t>(ib);
-                    const float* xg = xb + static_cast<size_t>(ib) * 32ULL;
-                    const __m256 x0 = _mm256_loadu_ps(xg + 0);
-                    const __m256 x1 = _mm256_loadu_ps(xg + 8);
-                    const __m256 x2 = _mm256_loadu_ps(xg + 16);
-                    const __m256 x3 = _mm256_loadu_ps(xg + 24);
-                    tile.sumf[sub_idx * 8ULL + static_cast<size_t>(t)] =
-                        hsum256_ps(_mm256_add_ps(_mm256_add_ps(x0, x1), _mm256_add_ps(x2, x3)));
-
-                    __m256 mmax = _mm256_max_ps(
-                        _mm256_max_ps(_mm256_andnot_ps(sign_mask, x0), _mm256_andnot_ps(sign_mask, x1)),
-                        _mm256_max_ps(_mm256_andnot_ps(sign_mask, x2), _mm256_andnot_ps(sign_mask, x3)));
-                    __m128 m128 = _mm_max_ps(_mm256_castps256_ps128(mmax), _mm256_extractf128_ps(mmax, 1));
-                    m128 = _mm_max_ps(m128, _mm_movehdup_ps(m128));
-                    m128 = _mm_max_ps(m128, _mm_movehl_ps(m128, m128));
-                    const float max_abs = _mm_cvtss_f32(m128);
-                    if (max_abs < 1e-30f) {
-                        tile.d[sub_idx * 8ULL + static_cast<size_t>(t)] = 0.0f;
-                        continue;
-                    }
-                    // Independent per-32-element dynamic scale prevents cross-sub-block outlier crushing!
-                    tile.d[sub_idx * 8ULL + static_cast<size_t>(t)] = max_abs / 127.0f;
-                    const __m256 vid = _mm256_set1_ps(127.0f / max_abs);
-
-                    const __m256i i0 = _mm256_cvtps_epi32(_mm256_min_ps(_mm256_max_ps(_mm256_mul_ps(x0, vid), vn127), v127));
-                    const __m256i i1 = _mm256_cvtps_epi32(_mm256_min_ps(_mm256_max_ps(_mm256_mul_ps(x1, vid), vn127), v127));
-                    const __m256i i2 = _mm256_cvtps_epi32(_mm256_min_ps(_mm256_max_ps(_mm256_mul_ps(x2, vid), vn127), v127));
-                    const __m256i i3 = _mm256_cvtps_epi32(_mm256_min_ps(_mm256_max_ps(_mm256_mul_ps(x3, vid), vn127), v127));
-                    const __m256i s01 = _mm256_permute4x64_epi64(_mm256_packs_epi32(i0, i1), 0xD8);
-                    const __m256i s23 = _mm256_permute4x64_epi64(_mm256_packs_epi32(i2, i3), 0xD8);
-                    const __m256i q8  = _mm256_permute4x64_epi64(_mm256_packs_epi16(s01, s23), 0xD8);
-                    _mm256_storeu_si256(
-                        reinterpret_cast<__m256i*>(tile.qs.data() + (sub_idx * 8ULL + static_cast<size_t>(t)) * 32ULL),
-                        q8);
-
-                    int16_t* bs_sub = tile.bsum16.data() + (sub_idx * 8ULL + static_cast<size_t>(t)) * 2ULL;
-                    bs_sub[0] = static_cast<int16_t>(hsum256_epi32(_mm256_add_epi32(i0, i1)));
-                    bs_sub[1] = static_cast<int16_t>(hsum256_epi32(_mm256_add_epi32(i2, i3)));
-                }
+            quantize_q8_act(X + static_cast<size_t>(t_base + t) * static_cast<size_t>(stride_x), cols, tmp, extract_outliers);
+            tile.n_outliers[t] = tmp.n_outliers;
+            if (tmp.n_outliers > 0) {
+                tile.has_outliers = true;
+                std::memcpy(tile.outliers[t], tmp.outliers, static_cast<size_t>(tmp.n_outliers) * sizeof(Q8Outlier));
+            }
+            for (int sub = 0; sub < nb32; ++sub) {
+                const size_t idx = static_cast<size_t>(sub) * 8ULL + static_cast<size_t>(t);
+                std::memcpy(tile.qs.data() + idx * 32ULL, tmp.qs + static_cast<size_t>(sub) * 32ULL, 32);
+                tile.d[idx]    = tmp.d[sub];
+                tile.sumf[idx] = tmp.sumf[sub];
+                tile.bsum16[idx * 2ULL + 0] = tmp.bsum[2 * sub + 0];
+                tile.bsum16[idx * 2ULL + 1] = tmp.bsum[2 * sub + 1];
             }
         }
+        for (int t = n_tok; t < 8; ++t) tile.n_outliers[t] = 0;
     }
 }
 
-void Avx2Math::pack_q8_32_batch(const float* X, int stride_x, int cols, int n_tokens, Q8_32Batch& out) {
+void Avx2Math::pack_q8_32_batch(const float* X, int stride_x, int cols, int n_tokens, Q8_32Batch& out, bool extract_outliers) {
     out.nb32 = (cols >= 32) ? (cols / 32) : 0;
     out.n_tokens = (n_tokens > 0 && out.nb32 > 0) ? n_tokens : 0;
     out.tiles.clear();
@@ -1790,13 +1909,19 @@ void Avx2Math::pack_q8_32_batch(const float* X, int stride_x, int cols, int n_to
         const int t_base = g * 8;
         const int n_tok = std::min(8, n_tokens - t_base);
         tile.n_tok = n_tok;
+        tile.has_outliers = false;
         tile.qs.assign(static_cast<size_t>(out.nb32) * 8ULL * 32ULL, 0);
         tile.d.assign(static_cast<size_t>(out.nb32) * 8ULL, 0.0f);
         tile.sumf.assign(static_cast<size_t>(out.nb32) * 8ULL, 0.0f);
         tile.bsum32.assign(static_cast<size_t>(out.nb32) * 8ULL, 0);
 
         for (int t = 0; t < n_tok; ++t) {
-            quantize_q8_act(X + static_cast<size_t>(t_base + t) * static_cast<size_t>(stride_x), cols, tmp);
+            quantize_q8_act(X + static_cast<size_t>(t_base + t) * static_cast<size_t>(stride_x), cols, tmp, extract_outliers);
+            tile.n_outliers[t] = tmp.n_outliers;
+            if (tmp.n_outliers > 0) {
+                tile.has_outliers = true;
+                std::memcpy(tile.outliers[t], tmp.outliers, static_cast<size_t>(tmp.n_outliers) * sizeof(Q8Outlier));
+            }
             for (int b = 0; b < out.nb32; ++b) {
                 std::memcpy(tile.qs.data() + (static_cast<size_t>(b) * 8ULL + static_cast<size_t>(t)) * 32ULL,
                             tmp.qs + static_cast<size_t>(b) * 32ULL, 32);
@@ -1806,6 +1931,7 @@ void Avx2Math::pack_q8_32_batch(const float* X, int stride_x, int cols, int n_to
                     static_cast<int16_t>(static_cast<int32_t>(tmp.bsum[2 * b]) + static_cast<int32_t>(tmp.bsum[2 * b + 1]));
             }
         }
+        for (int t = n_tok; t < 8; ++t) tile.n_outliers[t] = 0;
     }
 }
 
@@ -2326,7 +2452,7 @@ static inline int l2_adaptive_row_tile(size_t rbytes) {
     return (rt >= 8) ? rt : 8;
 }
 
-template <typename Dot4Fn, typename Dot8Fn>
+template <QuantType QT, typename Dot4Fn, typename Dot8Fn>
 static void run_gemm_q8k_tiled(float* Y, int stride_y, const void* wdata, size_t row_offset,
                                const Q8KBatch& batch, int rows, size_t rbytes, bool parallel,
                                Dot4Fn dot4, Dot8Fn dot8) {
@@ -2334,6 +2460,7 @@ static void run_gemm_q8k_tiled(float* Y, int stride_y, const void* wdata, size_t
     const int num_rtiles = (rows + row_tile - 1) / row_tile;
     const int n_tiles = static_cast<int>(batch.tiles.size());
     const int nb256 = batch.nb256;
+    const int cols = nb256 * 256;
 
     #pragma omp parallel for if(parallel && rows >= 32) schedule(static)
     for (int rt = 0; rt < num_rtiles; ++rt) {
@@ -2345,16 +2472,32 @@ static void run_gemm_q8k_tiled(float* Y, int stride_y, const void* wdata, size_t
             const int n_tok = tile.n_tok;
             if (n_tok <= 4) {
                 for (int r = r0; r < r1; ++r) {
+                    const size_t wrow = row_offset + static_cast<size_t>(r);
                     float tmp[4];
-                    dot4(wdata, row_offset + static_cast<size_t>(r), tile, nb256, tmp);
+                    dot4(wdata, wrow, tile, nb256, tmp);
+                    if (tile.has_outliers) {
+                        for (int t = 0; t < n_tok; ++t) {
+                            if (tile.n_outliers[t] > 0) {
+                                tmp[t] += dot_outliers<QT>(wdata, wrow, cols, tile.outliers[t], tile.n_outliers[t]);
+                            }
+                        }
+                    }
                     for (int t = 0; t < n_tok; ++t) {
                         Y[static_cast<size_t>(t_base + t) * static_cast<size_t>(stride_y) + static_cast<size_t>(r)] = tmp[t];
                     }
                 }
             } else {
                 for (int r = r0; r < r1; ++r) {
+                    const size_t wrow = row_offset + static_cast<size_t>(r);
                     float tmp[8];
-                    dot8(wdata, row_offset + static_cast<size_t>(r), tile, nb256, tmp);
+                    dot8(wdata, wrow, tile, nb256, tmp);
+                    if (tile.has_outliers) {
+                        for (int t = 0; t < n_tok; ++t) {
+                            if (tile.n_outliers[t] > 0) {
+                                tmp[t] += dot_outliers<QT>(wdata, wrow, cols, tile.outliers[t], tile.n_outliers[t]);
+                            }
+                        }
+                    }
                     for (int t = 0; t < n_tok; ++t) {
                         Y[static_cast<size_t>(t_base + t) * static_cast<size_t>(stride_y) + static_cast<size_t>(r)] = tmp[t];
                     }
@@ -2364,7 +2507,7 @@ static void run_gemm_q8k_tiled(float* Y, int stride_y, const void* wdata, size_t
     }
 }
 
-template <typename Dot4Fn, typename Dot8Fn>
+template <QuantType QT, typename Dot4Fn, typename Dot8Fn>
 static void run_gemm_q8_32_tiled(float* Y, int stride_y, const void* wdata, size_t row_offset,
                                  const Q8_32Batch& batch, int rows, size_t rbytes, bool parallel,
                                  Dot4Fn dot4, Dot8Fn dot8) {
@@ -2372,6 +2515,7 @@ static void run_gemm_q8_32_tiled(float* Y, int stride_y, const void* wdata, size
     const int num_rtiles = (rows + row_tile - 1) / row_tile;
     const int n_tiles = static_cast<int>(batch.tiles.size());
     const int nb32 = batch.nb32;
+    const int cols = nb32 * 32;
 
     #pragma omp parallel for if(parallel && rows >= 32) schedule(static)
     for (int rt = 0; rt < num_rtiles; ++rt) {
@@ -2383,16 +2527,32 @@ static void run_gemm_q8_32_tiled(float* Y, int stride_y, const void* wdata, size
             const int n_tok = tile.n_tok;
             if (n_tok <= 4) {
                 for (int r = r0; r < r1; ++r) {
+                    const size_t wrow = row_offset + static_cast<size_t>(r);
                     float tmp[4];
-                    dot4(wdata, row_offset + static_cast<size_t>(r), tile, nb32, tmp);
+                    dot4(wdata, wrow, tile, nb32, tmp);
+                    if (tile.has_outliers) {
+                        for (int t = 0; t < n_tok; ++t) {
+                            if (tile.n_outliers[t] > 0) {
+                                tmp[t] += dot_outliers<QT>(wdata, wrow, cols, tile.outliers[t], tile.n_outliers[t]);
+                            }
+                        }
+                    }
                     for (int t = 0; t < n_tok; ++t) {
                         Y[static_cast<size_t>(t_base + t) * static_cast<size_t>(stride_y) + static_cast<size_t>(r)] = tmp[t];
                     }
                 }
             } else {
                 for (int r = r0; r < r1; ++r) {
+                    const size_t wrow = row_offset + static_cast<size_t>(r);
                     float tmp[8];
-                    dot8(wdata, row_offset + static_cast<size_t>(r), tile, nb32, tmp);
+                    dot8(wdata, wrow, tile, nb32, tmp);
+                    if (tile.has_outliers) {
+                        for (int t = 0; t < n_tok; ++t) {
+                            if (tile.n_outliers[t] > 0) {
+                                tmp[t] += dot_outliers<QT>(wdata, wrow, cols, tile.outliers[t], tile.n_outliers[t]);
+                            }
+                        }
+                    }
                     for (int t = 0; t < n_tok; ++t) {
                         Y[static_cast<size_t>(t_base + t) * static_cast<size_t>(stride_y) + static_cast<size_t>(r)] = tmp[t];
                     }
@@ -2494,10 +2654,10 @@ void Avx2Math::gemm_slice_q8k(float* Y, int stride_y, const TensorDesc& weight, 
         }
     }
     switch (weight.type) {
-        case QuantType::IQ4_XS: run_gemm_q8k_tiled(Y, stride_y, weight.data, row_offset, batch, rows, rb, parallel, dot_iq4_xs_q8k_xN<4>, dot_iq4_xs_q8k_xN<8>); break;
-        case QuantType::Q4_K:   run_gemm_q8k_tiled(Y, stride_y, weight.data, row_offset, batch, rows, rb, parallel, dot_q4_K_q8k_xN<4>,   dot_q4_K_q8k_xN<8>);   break;
-        case QuantType::Q5_K:   run_gemm_q8k_tiled(Y, stride_y, weight.data, row_offset, batch, rows, rb, parallel, dot_q5_K_q8k_xN<4>,   dot_q5_K_q8k_xN<8>);   break;
-        case QuantType::Q6_K:   run_gemm_q8k_tiled(Y, stride_y, weight.data, row_offset, batch, rows, rb, parallel, dot_q6_K_q8k_xN<4>,   dot_q6_K_q8k_xN<8>);   break;
+        case QuantType::IQ4_XS: run_gemm_q8k_tiled<QuantType::IQ4_XS>(Y, stride_y, weight.data, row_offset, batch, rows, rb, parallel, dot_iq4_xs_q8k_xN<4>, dot_iq4_xs_q8k_xN<8>); break;
+        case QuantType::Q4_K:   run_gemm_q8k_tiled<QuantType::Q4_K>(Y, stride_y, weight.data, row_offset, batch, rows, rb, parallel, dot_q4_K_q8k_xN<4>,   dot_q4_K_q8k_xN<8>);   break;
+        case QuantType::Q5_K:   run_gemm_q8k_tiled<QuantType::Q5_K>(Y, stride_y, weight.data, row_offset, batch, rows, rb, parallel, dot_q5_K_q8k_xN<4>,   dot_q5_K_q8k_xN<8>);   break;
+        case QuantType::Q6_K:   run_gemm_q8k_tiled<QuantType::Q6_K>(Y, stride_y, weight.data, row_offset, batch, rows, rb, parallel, dot_q6_K_q8k_xN<4>,   dot_q6_K_q8k_xN<8>);   break;
         default: break;
     }
 }
@@ -2515,11 +2675,11 @@ void Avx2Math::gemm_slice_q8_32(float* Y, int stride_y, const TensorDesc& weight
         }
     }
     switch (weight.type) {
-        case QuantType::IQ4_NL: run_gemm_q8_32_tiled(Y, stride_y, weight.data, row_offset, batch, rows, rb, parallel, dot_iq4_nl_q8_32_xN<4>, dot_iq4_nl_q8_32_xN<8>); break;
-        case QuantType::Q5_1:   run_gemm_q8_32_tiled(Y, stride_y, weight.data, row_offset, batch, rows, rb, parallel, dot_q5_1_q8_32_xN<4>,   dot_q5_1_q8_32_xN<8>);   break;
-        case QuantType::Q5_0:   run_gemm_q8_32_tiled(Y, stride_y, weight.data, row_offset, batch, rows, rb, parallel, dot_q5_0_q8_32_xN<4>,   dot_q5_0_q8_32_xN<8>);   break;
-        case QuantType::Q8_0:   run_gemm_q8_32_tiled(Y, stride_y, weight.data, row_offset, batch, rows, rb, parallel, dot_q8_0_q8_32_xN<4>,   dot_q8_0_q8_32_xN<8>);   break;
-        case QuantType::Q4_0:   run_gemm_q8_32_tiled(Y, stride_y, weight.data, row_offset, batch, rows, rb, parallel, dot_q4_0_q8_32_xN<4>,   dot_q4_0_q8_32_xN<8>);   break;
+        case QuantType::IQ4_NL: run_gemm_q8_32_tiled<QuantType::IQ4_NL>(Y, stride_y, weight.data, row_offset, batch, rows, rb, parallel, dot_iq4_nl_q8_32_xN<4>, dot_iq4_nl_q8_32_xN<8>); break;
+        case QuantType::Q5_1:   run_gemm_q8_32_tiled<QuantType::Q5_1>(Y, stride_y, weight.data, row_offset, batch, rows, rb, parallel, dot_q5_1_q8_32_xN<4>,   dot_q5_1_q8_32_xN<8>);   break;
+        case QuantType::Q5_0:   run_gemm_q8_32_tiled<QuantType::Q5_0>(Y, stride_y, weight.data, row_offset, batch, rows, rb, parallel, dot_q5_0_q8_32_xN<4>,   dot_q5_0_q8_32_xN<8>);   break;
+        case QuantType::Q8_0:   run_gemm_q8_32_tiled<QuantType::Q8_0>(Y, stride_y, weight.data, row_offset, batch, rows, rb, parallel, dot_q8_0_q8_32_xN<4>,   dot_q8_0_q8_32_xN<8>);   break;
+        case QuantType::Q4_0:   run_gemm_q8_32_tiled<QuantType::Q4_0>(Y, stride_y, weight.data, row_offset, batch, rows, rb, parallel, dot_q4_0_q8_32_xN<4>,   dot_q4_0_q8_32_xN<8>);   break;
         default: break;
     }
 }
@@ -2594,11 +2754,309 @@ void Avx2Math::gemm(float* Y, int stride_y, const TensorDesc& weight,
     gemm_slice(Y, stride_y, weight, 0, X, stride_x, n_tokens, rows, cols, true);
 }
 
+// ============================================================================
+// High-Throughput 1x4 / 1x8 Register-Tiled Exact FP32-Activation Quantized GEMM
+// Unpacks each quantized weight block ONCE per 8 (or 4) tokens while keeping
+// activations in exact IEEE FP32 (zero Q8 quantization error, 3-5x faster --exact!).
+// ============================================================================
+
+#define HAVEN_F32_FMA8(VW, OFF) do { \
+    const __m256 _w = (VW); \
+    const size_t _o = static_cast<size_t>(OFF); \
+    a0 = _mm256_fmadd_ps(_w, _mm256_loadu_ps(xp[0] + _o), a0); \
+    a1 = _mm256_fmadd_ps(_w, _mm256_loadu_ps(xp[1] + _o), a1); \
+    a2 = _mm256_fmadd_ps(_w, _mm256_loadu_ps(xp[2] + _o), a2); \
+    a3 = _mm256_fmadd_ps(_w, _mm256_loadu_ps(xp[3] + _o), a3); \
+    if constexpr (NTok > 4) { \
+        a4 = _mm256_fmadd_ps(_w, _mm256_loadu_ps(xp[4] + _o), a4); \
+        a5 = _mm256_fmadd_ps(_w, _mm256_loadu_ps(xp[5] + _o), a5); \
+        a6 = _mm256_fmadd_ps(_w, _mm256_loadu_ps(xp[6] + _o), a6); \
+        a7 = _mm256_fmadd_ps(_w, _mm256_loadu_ps(xp[7] + _o), a7); \
+    } \
+} while (0)
+
+template <int NTok>
+static inline void dot_iq4_xs_f32_xN(const void* data, size_t row, const float* const* xp, int cols, float* res) {
+    const int nb = cols / 256;
+    const auto* vx = reinterpret_cast<const block_iq4_xs*>(data) + row * static_cast<size_t>(nb);
+    const __m128i lut = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_iq4nl));
+    const __m128i mask_lo = _mm_set1_epi8(0x0F);
+    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(), a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+    __m256 a4 = _mm256_setzero_ps(), a5 = _mm256_setzero_ps(), a6 = _mm256_setzero_ps(), a7 = _mm256_setzero_ps();
+
+    for (int b = 0; b < nb; ++b) {
+        const float d = Avx2Math::fp16_to_fp32(vx[b].d);
+        const uint16_t sh = vx[b].scales_h;
+        const uint8_t* sl = vx[b].scales_l;
+        const uint8_t* qs = vx[b].qs;
+        for (int ib = 0; ib < 8; ++ib) {
+            const int ls = ((sl[ib >> 1] >> (4 * (ib & 1))) & 0x0F) | (((sh >> (2 * ib)) & 3) << 4);
+            const __m256 vdl = _mm256_set1_ps(d * static_cast<float>(ls - 32));
+            const __m128i qb  = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qs + (ib << 4)));
+            const __m128i qlo = _mm_shuffle_epi8(lut, _mm_and_si128(qb, mask_lo));
+            const __m128i qhi = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(qb, 4), mask_lo));
+            const int off = (b << 8) + (ib << 5);
+            HAVEN_F32_FMA8(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(qlo)), vdl), off + 0);
+            HAVEN_F32_FMA8(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(qlo, 8))), vdl), off + 8);
+            HAVEN_F32_FMA8(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(qhi)), vdl), off + 16);
+            HAVEN_F32_FMA8(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(qhi, 8))), vdl), off + 24);
+        }
+    }
+    res[0] = hsum256_ps(a0); res[1] = hsum256_ps(a1); res[2] = hsum256_ps(a2); res[3] = hsum256_ps(a3);
+    if constexpr (NTok > 4) {
+        res[4] = hsum256_ps(a4); res[5] = hsum256_ps(a5); res[6] = hsum256_ps(a6); res[7] = hsum256_ps(a7);
+    }
+}
+
+template <int NTok>
+static inline void dot_iq4_nl_f32_xN(const void* data, size_t row, const float* const* xp, int cols, float* res) {
+    const int nb = cols / 32;
+    const auto* vx = reinterpret_cast<const block_iq4_nl*>(data) + row * static_cast<size_t>(nb);
+    const __m128i lut = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_iq4nl));
+    const __m128i mask_lo = _mm_set1_epi8(0x0F);
+    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(), a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+    __m256 a4 = _mm256_setzero_ps(), a5 = _mm256_setzero_ps(), a6 = _mm256_setzero_ps(), a7 = _mm256_setzero_ps();
+
+    for (int b = 0; b < nb; ++b) {
+        const __m256 vd = _mm256_set1_ps(Avx2Math::fp16_to_fp32(vx[b].d));
+        const __m128i qb  = _mm_loadu_si128(reinterpret_cast<const __m128i*>(vx[b].qs));
+        const __m128i qlo = _mm_shuffle_epi8(lut, _mm_and_si128(qb, mask_lo));
+        const __m128i qhi = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(qb, 4), mask_lo));
+        const int off = b << 5;
+        HAVEN_F32_FMA8(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(qlo)), vd), off + 0);
+        HAVEN_F32_FMA8(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(qlo, 8))), vd), off + 8);
+        HAVEN_F32_FMA8(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(qhi)), vd), off + 16);
+        HAVEN_F32_FMA8(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(qhi, 8))), vd), off + 24);
+    }
+    res[0] = hsum256_ps(a0); res[1] = hsum256_ps(a1); res[2] = hsum256_ps(a2); res[3] = hsum256_ps(a3);
+    if constexpr (NTok > 4) {
+        res[4] = hsum256_ps(a4); res[5] = hsum256_ps(a5); res[6] = hsum256_ps(a6); res[7] = hsum256_ps(a7);
+    }
+}
+
+template <int NTok>
+static inline void dot_q4_K_f32_xN(const void* data, size_t row, const float* const* xp, int cols, float* res) {
+    const int nb = cols / 256;
+    const auto* vx = reinterpret_cast<const block_q4_K*>(data) + row * static_cast<size_t>(nb);
+    const __m128i mask_lo = _mm_set1_epi8(0x0F);
+    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(), a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+    __m256 a4 = _mm256_setzero_ps(), a5 = _mm256_setzero_ps(), a6 = _mm256_setzero_ps(), a7 = _mm256_setzero_ps();
+
+    for (int b = 0; b < nb; ++b) {
+        const float d = Avx2Math::fp16_to_fp32(vx[b].d);
+        const float dmin = Avx2Math::fp16_to_fp32(vx[b].dmin);
+        const uint8_t* q = vx[b].qs;
+        uint8_t sc, mn;
+        for (int j = 0; j < 4; ++j) {
+            get_scale_min_k4(2 * j,     vx[b].scales, &sc, &mn);
+            const __m256 vd1 = _mm256_set1_ps(d * static_cast<float>(sc));
+            const __m256 vm1 = _mm256_set1_ps(dmin * static_cast<float>(mn));
+            get_scale_min_k4(2 * j + 1, vx[b].scales, &sc, &mn);
+            const __m256 vd2 = _mm256_set1_ps(d * static_cast<float>(sc));
+            const __m256 vm2 = _mm256_set1_ps(dmin * static_cast<float>(mn));
+            const int base = (b << 8) + (j << 6);
+            for (int k = 0; k < 4; ++k) {
+                const int off = k << 3;
+                const __m128i qb  = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(q + off));
+                const __m128i qlo = _mm_and_si128(qb, mask_lo);
+                const __m128i qhi = _mm_and_si128(_mm_srli_epi16(qb, 4), mask_lo);
+                HAVEN_F32_FMA8(_mm256_fmsub_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(qlo)), vd1, vm1), base + off);
+                HAVEN_F32_FMA8(_mm256_fmsub_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(qhi)), vd2, vm2), base + 32 + off);
+            }
+            q += 32;
+        }
+    }
+    res[0] = hsum256_ps(a0); res[1] = hsum256_ps(a1); res[2] = hsum256_ps(a2); res[3] = hsum256_ps(a3);
+    if constexpr (NTok > 4) {
+        res[4] = hsum256_ps(a4); res[5] = hsum256_ps(a5); res[6] = hsum256_ps(a6); res[7] = hsum256_ps(a7);
+    }
+}
+
+template <int NTok>
+static inline void dot_q5_K_f32_xN(const void* data, size_t row, const float* const* xp, int cols, float* res) {
+    const int nb = cols / 256;
+    const auto* vx = reinterpret_cast<const block_q5_K*>(data) + row * static_cast<size_t>(nb);
+    const __m128i mask_lo = _mm_set1_epi8(0x0F);
+    const __m128i val16   = _mm_set1_epi8(0x10);
+    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(), a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+    __m256 a4 = _mm256_setzero_ps(), a5 = _mm256_setzero_ps(), a6 = _mm256_setzero_ps(), a7 = _mm256_setzero_ps();
+
+    for (int b = 0; b < nb; ++b) {
+        const float d = Avx2Math::fp16_to_fp32(vx[b].d);
+        const float dmin = Avx2Math::fp16_to_fp32(vx[b].dmin);
+        const uint8_t* ql = vx[b].qs;
+        const uint8_t* qh = vx[b].qh;
+        uint8_t sc, mn;
+        uint8_t u1 = 1, u2 = 2;
+        for (int j = 0; j < 4; ++j) {
+            get_scale_min_k4(2 * j,     vx[b].scales, &sc, &mn);
+            const __m256 vd1 = _mm256_set1_ps(d * static_cast<float>(sc));
+            const __m256 vm1 = _mm256_set1_ps(dmin * static_cast<float>(mn));
+            get_scale_min_k4(2 * j + 1, vx[b].scales, &sc, &mn);
+            const __m256 vd2 = _mm256_set1_ps(d * static_cast<float>(sc));
+            const __m256 vm2 = _mm256_set1_ps(dmin * static_cast<float>(mn));
+            const __m128i vu1 = _mm_set1_epi8(static_cast<char>(u1));
+            const __m128i vu2 = _mm_set1_epi8(static_cast<char>(u2));
+            const int base = (b << 8) + (j << 6);
+            for (int k = 0; k < 4; ++k) {
+                const int off = k << 3;
+                const __m128i qb  = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(ql + off));
+                const __m128i qhb = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qh + off));
+                const __m128i h1  = _mm_and_si128(_mm_cmpeq_epi8(_mm_and_si128(qhb, vu1), vu1), val16);
+                const __m128i h2  = _mm_and_si128(_mm_cmpeq_epi8(_mm_and_si128(qhb, vu2), vu2), val16);
+                const __m128i q1  = _mm_or_si128(_mm_and_si128(qb, mask_lo), h1);
+                const __m128i q2  = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(qb, 4), mask_lo), h2);
+                HAVEN_F32_FMA8(_mm256_fmsub_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(q1)), vd1, vm1), base + off);
+                HAVEN_F32_FMA8(_mm256_fmsub_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(q2)), vd2, vm2), base + 32 + off);
+            }
+            ql += 32;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+    res[0] = hsum256_ps(a0); res[1] = hsum256_ps(a1); res[2] = hsum256_ps(a2); res[3] = hsum256_ps(a3);
+    if constexpr (NTok > 4) {
+        res[4] = hsum256_ps(a4); res[5] = hsum256_ps(a5); res[6] = hsum256_ps(a6); res[7] = hsum256_ps(a7);
+    }
+}
+
+template <int NTok>
+static inline void dot_q6_K_f32_xN(const void* data, size_t row, const float* const* xp, int cols, float* res) {
+    const int nb = cols / 256;
+    const auto* vx = reinterpret_cast<const block_q6_K*>(data) + row * static_cast<size_t>(nb);
+    const __m128i mask_lo4 = _mm_set1_epi8(0x0F);
+    const __m128i mask_hi2 = _mm_set1_epi8(0x30);
+    const __m256i bias32   = _mm256_set1_epi32(32);
+    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(), a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+    __m256 a4 = _mm256_setzero_ps(), a5 = _mm256_setzero_ps(), a6 = _mm256_setzero_ps(), a7 = _mm256_setzero_ps();
+
+    for (int b = 0; b < nb; ++b) {
+        const float d = Avx2Math::fp16_to_fp32(vx[b].d);
+        const uint8_t* ql = vx[b].ql;
+        const uint8_t* qh = vx[b].qh;
+        const int8_t*  sc = vx[b].scales;
+        for (int n_chunk = 0; n_chunk < 256; n_chunk += 128) {
+            for (int k = 0; k < 4; ++k) {
+                const int is = (k < 2) ? 0 : 1;
+                const int l_base = k << 3;
+                const int base = (b << 8) + n_chunk + l_base;
+                const __m128i ql0 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(ql + l_base));
+                const __m128i ql1 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(ql + l_base + 32));
+                const __m128i qhb = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qh + l_base));
+                const __m128i q1b = _mm_or_si128(_mm_and_si128(ql0, mask_lo4), _mm_and_si128(_mm_slli_epi16(qhb, 4), mask_hi2));
+                const __m128i q2b = _mm_or_si128(_mm_and_si128(ql1, mask_lo4), _mm_and_si128(_mm_slli_epi16(qhb, 2), mask_hi2));
+                const __m128i q3b = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(ql0, 4), mask_lo4), _mm_and_si128(qhb, mask_hi2));
+                const __m128i q4b = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(ql1, 4), mask_lo4), _mm_and_si128(_mm_srli_epi16(qhb, 2), mask_hi2));
+                HAVEN_F32_FMA8(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(q1b), bias32)), _mm256_set1_ps(d * static_cast<float>(sc[is + 0]))), base + 0);
+                HAVEN_F32_FMA8(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(q2b), bias32)), _mm256_set1_ps(d * static_cast<float>(sc[is + 2]))), base + 32);
+                HAVEN_F32_FMA8(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(q3b), bias32)), _mm256_set1_ps(d * static_cast<float>(sc[is + 4]))), base + 64);
+                HAVEN_F32_FMA8(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(q4b), bias32)), _mm256_set1_ps(d * static_cast<float>(sc[is + 6]))), base + 96);
+            }
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+    }
+    res[0] = hsum256_ps(a0); res[1] = hsum256_ps(a1); res[2] = hsum256_ps(a2); res[3] = hsum256_ps(a3);
+    if constexpr (NTok > 4) {
+        res[4] = hsum256_ps(a4); res[5] = hsum256_ps(a5); res[6] = hsum256_ps(a6); res[7] = hsum256_ps(a7);
+    }
+}
+
+template <int NTok>
+static inline void dot_q8_0_f32_xN(const void* data, size_t row, const float* const* xp, int cols, float* res) {
+    const int nb = cols / 32;
+    const auto* vx = reinterpret_cast<const block_q8_0*>(data) + row * static_cast<size_t>(nb);
+    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(), a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+    __m256 a4 = _mm256_setzero_ps(), a5 = _mm256_setzero_ps(), a6 = _mm256_setzero_ps(), a7 = _mm256_setzero_ps();
+
+    for (int b = 0; b < nb; ++b) {
+        const __m256 vd = _mm256_set1_ps(Avx2Math::fp16_to_fp32(vx[b].d));
+        const __m128i q0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(vx[b].qs));
+        const __m128i q1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(vx[b].qs + 16));
+        const int off = b << 5;
+        HAVEN_F32_FMA8(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q0)), vd), off + 0);
+        HAVEN_F32_FMA8(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(q0, 8))), vd), off + 8);
+        HAVEN_F32_FMA8(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q1)), vd), off + 16);
+        HAVEN_F32_FMA8(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(q1, 8))), vd), off + 24);
+    }
+    res[0] = hsum256_ps(a0); res[1] = hsum256_ps(a1); res[2] = hsum256_ps(a2); res[3] = hsum256_ps(a3);
+    if constexpr (NTok > 4) {
+        res[4] = hsum256_ps(a4); res[5] = hsum256_ps(a5); res[6] = hsum256_ps(a6); res[7] = hsum256_ps(a7);
+    }
+}
+
+template <int NTok>
+static inline void dot_q4_0_f32_xN(const void* data, size_t row, const float* const* xp, int cols, float* res) {
+    const int nb = cols / 32;
+    const auto* vx = reinterpret_cast<const block_q4_0*>(data) + row * static_cast<size_t>(nb);
+    const __m128i mask_lo = _mm_set1_epi8(0x0F);
+    const __m256i bias8   = _mm256_set1_epi32(8);
+    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(), a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+    __m256 a4 = _mm256_setzero_ps(), a5 = _mm256_setzero_ps(), a6 = _mm256_setzero_ps(), a7 = _mm256_setzero_ps();
+
+    for (int b = 0; b < nb; ++b) {
+        const __m256 vd = _mm256_set1_ps(Avx2Math::fp16_to_fp32(vx[b].d));
+        const __m128i qb  = _mm_loadu_si128(reinterpret_cast<const __m128i*>(vx[b].qs));
+        const __m128i qlo = _mm_and_si128(qb, mask_lo);
+        const __m128i qhi = _mm_and_si128(_mm_srli_epi16(qb, 4), mask_lo);
+        const int off = b << 5;
+        HAVEN_F32_FMA8(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(qlo), bias8)), vd), off + 0);
+        HAVEN_F32_FMA8(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(qlo, 8)), bias8)), vd), off + 8);
+        HAVEN_F32_FMA8(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(qhi), bias8)), vd), off + 16);
+        HAVEN_F32_FMA8(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(qhi, 8)), bias8)), vd), off + 24);
+    }
+    res[0] = hsum256_ps(a0); res[1] = hsum256_ps(a1); res[2] = hsum256_ps(a2); res[3] = hsum256_ps(a3);
+    if constexpr (NTok > 4) {
+        res[4] = hsum256_ps(a4); res[5] = hsum256_ps(a5); res[6] = hsum256_ps(a6); res[7] = hsum256_ps(a7);
+    }
+}
+
+#undef HAVEN_F32_FMA8
+
+template <typename Dot4Fn, typename Dot8Fn>
+static void run_gemm_quant_f32_tiled(float* Y, int stride_y, const void* wdata, size_t row_offset,
+                                     const float* X, int stride_x, int n_tokens, int rows, int cols,
+                                     size_t rbytes, bool parallel, Dot4Fn dot4, Dot8Fn dot8) {
+    const int row_tile = l2_adaptive_row_tile(rbytes);
+    const int num_rtiles = (rows + row_tile - 1) / row_tile;
+
+    #pragma omp parallel for if(parallel && rows >= 32) schedule(static)
+    for (int rt = 0; rt < num_rtiles; ++rt) {
+        const int r0 = rt * row_tile;
+        const int r1 = std::min(rows, r0 + row_tile);
+        for (int t0 = 0; t0 < n_tokens; t0 += 8) {
+            const int n_tok = std::min(8, n_tokens - t0);
+            const float* xp[8];
+            for (int t = 0; t < n_tok; ++t) xp[t] = X + static_cast<size_t>(t0 + t) * static_cast<size_t>(stride_x);
+            for (int t = n_tok; t < 8; ++t) xp[t] = xp[0];
+
+            if (n_tok <= 4) {
+                for (int r = r0; r < r1; ++r) {
+                    float res[4];
+                    dot4(wdata, row_offset + static_cast<size_t>(r), xp, cols, res);
+                    for (int t = 0; t < n_tok; ++t) {
+                        Y[static_cast<size_t>(t0 + t) * static_cast<size_t>(stride_y) + static_cast<size_t>(r)] = res[t];
+                    }
+                }
+            } else {
+                for (int r = r0; r < r1; ++r) {
+                    float res[8];
+                    dot8(wdata, row_offset + static_cast<size_t>(r), xp, cols, res);
+                    for (int t = 0; t < n_tok; ++t) {
+                        Y[static_cast<size_t>(t0 + t) * static_cast<size_t>(stride_y) + static_cast<size_t>(r)] = res[t];
+                    }
+                }
+            }
+        }
+    }
+}
+
 void Avx2Math::gemm_slice_f32(float* Y, int stride_y, const TensorDesc& weight, size_t row_offset,
                               const float* X, int stride_x, int n_tokens, int rows, int cols, bool parallel) {
     if (!Y || !weight.data || !X || n_tokens <= 0 || rows <= 0 || cols <= 0) return;
+    const size_t rb = row_bytes(weight.type, cols);
     if (weight.size_bytes > 0) {
-        const size_t rb = row_bytes(weight.type, cols);
         if (rb == 0 || row_offset + static_cast<size_t>(rows) > weight.size_bytes / rb) {
             for (int t = 0; t < n_tokens; ++t) {
                 std::memset(Y + static_cast<size_t>(t) * static_cast<size_t>(stride_y), 0, static_cast<size_t>(rows) * sizeof(float));
@@ -2630,7 +3088,20 @@ void Avx2Math::gemm_slice_f32(float* Y, int stride_y, const TensorDesc& weight, 
         return;
     }
 
-    // Quantized weights with exact FP32 activations: iterate row-outer so each compressed weight row stays hot in L1/L2!
+    // Register-tiled 1x4 / 1x8 exact FP32-activation quantized GEMM (zero Q8 quantization error, 8x weight reuse!)
+    if ((cols % 256) == 0 && cols >= 256) {
+        if (weight.type == QuantType::IQ4_XS) { run_gemm_quant_f32_tiled(Y, stride_y, weight.data, row_offset, X, stride_x, n_tokens, rows, cols, rb, parallel, dot_iq4_xs_f32_xN<4>, dot_iq4_xs_f32_xN<8>); return; }
+        if (weight.type == QuantType::Q4_K)   { run_gemm_quant_f32_tiled(Y, stride_y, weight.data, row_offset, X, stride_x, n_tokens, rows, cols, rb, parallel, dot_q4_K_f32_xN<4>,   dot_q4_K_f32_xN<8>);   return; }
+        if (weight.type == QuantType::Q5_K)   { run_gemm_quant_f32_tiled(Y, stride_y, weight.data, row_offset, X, stride_x, n_tokens, rows, cols, rb, parallel, dot_q5_K_f32_xN<4>,   dot_q5_K_f32_xN<8>);   return; }
+        if (weight.type == QuantType::Q6_K)   { run_gemm_quant_f32_tiled(Y, stride_y, weight.data, row_offset, X, stride_x, n_tokens, rows, cols, rb, parallel, dot_q6_K_f32_xN<4>,   dot_q6_K_f32_xN<8>);   return; }
+    }
+    if ((cols % 32) == 0 && cols >= 32) {
+        if (weight.type == QuantType::IQ4_NL) { run_gemm_quant_f32_tiled(Y, stride_y, weight.data, row_offset, X, stride_x, n_tokens, rows, cols, rb, parallel, dot_iq4_nl_f32_xN<4>, dot_iq4_nl_f32_xN<8>); return; }
+        if (weight.type == QuantType::Q8_0)   { run_gemm_quant_f32_tiled(Y, stride_y, weight.data, row_offset, X, stride_x, n_tokens, rows, cols, rb, parallel, dot_q8_0_f32_xN<4>,   dot_q8_0_f32_xN<8>);   return; }
+        if (weight.type == QuantType::Q4_0)   { run_gemm_quant_f32_tiled(Y, stride_y, weight.data, row_offset, X, stride_x, n_tokens, rows, cols, rb, parallel, dot_q4_0_f32_xN<4>,   dot_q4_0_f32_xN<8>);   return; }
+    }
+
+    // Fallback for remaining rare formats (e.g. Q3_K, Q5_0, Q5_1)
     #pragma omp parallel for if(parallel && rows >= 16) schedule(static)
     for (int r = 0; r < rows; ++r) {
         const size_t wrow = row_offset + static_cast<size_t>(r);

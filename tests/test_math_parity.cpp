@@ -10,6 +10,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -355,6 +357,17 @@ static int test_quant_gemv_parity() {
     x[19]  =  42.0f;
     x[277] = -38.5f;
 
+    // Build 11-token activation matrix (exercises both 1x8 full tiles and 1x4 tail tiles!)
+    constexpr int S_batch = 11;
+    std::vector<float> X(static_cast<size_t>(S_batch) * static_cast<size_t>(cols));
+    for (int t = 0; t < S_batch; ++t) {
+        float* xt = X.data() + static_cast<size_t>(t) * static_cast<size_t>(cols);
+        for (int c = 0; c < cols; ++c) xt[c] = (t == 0) ? x[c] : dist(rng);
+        // Inject extreme outlier spikes into every token (42x .. 662x)
+        xt[(19 + t * 37) % cols]  = (t % 2 == 0) ? 42.0f : -662.0f;
+        xt[(277 + t * 53) % cols] = -38.5f;
+    }
+
     auto run_format = [&](const char* name, QuantType qtype, const void* data, size_t nbytes) -> int {
         TensorDesc td;
         td.name = name;
@@ -363,43 +376,62 @@ static int test_quant_gemv_parity() {
         td.size_bytes = nbytes;
         td.shape = {static_cast<uint64_t>(cols), static_cast<uint64_t>(rows)};
 
-        // Golden FP64 reference via exact dequantize_row
-        std::vector<double> ref(rows, 0.0);
+        // Golden FP64 reference across all S_batch tokens via exact dequantize_row
+        std::vector<double> ref_all(static_cast<size_t>(S_batch) * static_cast<size_t>(rows), 0.0);
         std::vector<float> row_f32(cols);
         for (int r = 0; r < rows; ++r) {
             Avx2Math::dequantize_row(row_f32.data(), td, r, cols);
-            double acc = 0.0;
-            for (int c = 0; c < cols; ++c) {
-                acc += static_cast<double>(row_f32[c]) * static_cast<double>(x[c]);
+            for (int t = 0; t < S_batch; ++t) {
+                const float* xt = X.data() + static_cast<size_t>(t) * static_cast<size_t>(cols);
+                double acc = 0.0;
+                for (int c = 0; c < cols; ++c) {
+                    acc += static_cast<double>(row_f32[c]) * static_cast<double>(xt[c]);
+                }
+                ref_all[static_cast<size_t>(t) * static_cast<size_t>(rows) + static_cast<size_t>(r)] = acc;
             }
-            ref[r] = acc;
         }
 
-        // Fast Q8 GEMV (Avx2Math::gemv)
+        // 1. Fast Q8 + Outlier-Split GEMV (token 0) and GEMM (S=3 1x4 & S=11 1x8+1x4)
         std::vector<float> y_fast(rows, 0.0f);
         Avx2Math::gemv(y_fast.data(), td, x.data(), rows, cols);
+        std::vector<float> Y_fast(static_cast<size_t>(S_batch) * static_cast<size_t>(rows), 0.0f);
+        Avx2Math::gemm(Y_fast.data(), rows, td, X.data(), cols, S_batch, rows, cols);
 
-        // Exact FP32-activation GEMV (Avx2Math::gemv_f32)
+        // 2. Exact FP32-activation GEMV (token 0) and 1x4/1x8 register-tiled GEMM (S=3 & S=11)
         std::vector<float> y_f32(rows, 0.0f);
         Avx2Math::gemv_f32(y_f32.data(), td, x.data(), rows, cols);
+        std::vector<float> Y_f32_3(3ULL * static_cast<size_t>(rows), 0.0f);
+        std::vector<float> Y_f32(static_cast<size_t>(S_batch) * static_cast<size_t>(rows), 0.0f);
+        Avx2Math::gemm_f32(Y_f32_3.data(), rows, td, X.data(), cols, 3, rows, cols);
+        Avx2Math::gemm_f32(Y_f32.data(), rows, td, X.data(), cols, S_batch, rows, cols);
 
-        const double cos_fast = cosine_f64_vs_f32(ref.data(), y_fast.data(), rows);
-        const double err_fast = max_abs_f64_vs_f32(ref.data(), y_fast.data(), rows);
-        const double cos_f32  = cosine_f64_vs_f32(ref.data(), y_f32.data(), rows);
-        const double err_f32  = max_abs_f64_vs_f32(ref.data(), y_f32.data(), rows);
+        const double cos_fast    = cosine_f64_vs_f32(ref_all.data(), y_fast.data(), rows);
+        const double err_fast    = max_abs_f64_vs_f32(ref_all.data(), y_fast.data(), rows);
+        const double cos_f32     = cosine_f64_vs_f32(ref_all.data(), y_f32.data(), rows);
+        const double err_f32     = max_abs_f64_vs_f32(ref_all.data(), y_f32.data(), rows);
+        const double cos_gemm3   = cosine_f64_vs_f32(ref_all.data(), Y_f32_3.data(), 3ULL * static_cast<size_t>(rows));
+        const double cos_gemm11  = cosine_f64_vs_f32(ref_all.data(), Y_f32.data(), static_cast<size_t>(S_batch) * static_cast<size_t>(rows));
+        const double cos_q8_eq   = cosine_f32(y_fast.data(), Y_fast.data(), rows);
+        const double cos_q8_all  = cosine_f64_vs_f32(ref_all.data(), Y_fast.data(), static_cast<size_t>(S_batch) * static_cast<size_t>(rows));
 
-        std::cout << "  [GEMV " << std::left << std::setw(7) << name << std::right
-                  << " w/ 42x spike] Q8_cos=" << std::fixed << std::setprecision(7) << cos_fast
+        std::cout << "  [GEMV/M " << std::left << std::setw(6) << name << std::right
+                  << " 42-662x] Q8=" << std::fixed << std::setprecision(7) << cos_fast
                   << " (err=" << std::scientific << std::setprecision(2) << err_fast << ")"
-                  << " | gemv_f32_cos=" << std::fixed << std::setprecision(9) << cos_f32
-                  << " (err=" << std::scientific << std::setprecision(2) << err_f32 << ")\n";
+                  << " | Q8_S11=" << std::fixed << std::setprecision(7) << cos_q8_all
+                  << " | F32_1x8=" << std::setprecision(9) << cos_gemm11
+                  << " (err=" << std::scientific << std::setprecision(2) << err_f32 << ")"
+                  << " | v==m:" << std::fixed << std::setprecision(7) << cos_q8_eq << "\n";
 
         HAVEN_CHECK(cos_f32 > 0.9999999, "Exact gemv_f32 cosine fell below 0.9999999");
-        HAVEN_CHECK(cos_fast > 0.999, "Fast Q8 GEMV cosine fell below 0.999");
+        HAVEN_CHECK(cos_gemm3 > 0.9999999, "Exact gemm_f32 (1x4 tile) cosine fell below 0.9999999");
+        HAVEN_CHECK(cos_gemm11 > 0.9999999, "Exact gemm_f32 (1x8+1x4 tile) cosine fell below 0.9999999");
+        HAVEN_CHECK(cos_fast > 0.99995, "Outlier-split Q8 GEMV cosine fell below 0.99995 under 42x spike");
+        HAVEN_CHECK(cos_q8_all > 0.99995, "Outlier-split Q8 GEMM cosine fell below 0.99995 under 662x spike");
+        HAVEN_CHECK(cos_q8_eq > 0.9999999, "Fast Q8 GEMV vs GEMM token-0 diverged!");
         return 0;
     };
 
-    // Synthesize valid blocks for IQ4_XS, IQ4_NL, Q6_K, Q4_K, Q4_0, Q8_0
+    // Synthesize valid blocks for ALL 9 integer-Q8/FP32-tiled formats: IQ4_XS, IQ4_NL, Q6_K, Q5_K, Q4_K, Q5_1, Q5_0, Q4_0, Q8_0
     {
         std::vector<block_iq4_xs> blk(rows * (cols / 256));
         for (auto& b : blk) {
@@ -429,6 +461,17 @@ static int test_quant_gemv_parity() {
         if (run_format("Q6_K", QuantType::Q6_K, blk.data(), blk.size() * sizeof(block_q6_K)) != 0) return 1;
     }
     {
+        std::vector<block_q5_K> blk(rows * (cols / 256));
+        for (auto& b : blk) {
+            b.d = f32_to_f16(0.014f);
+            b.dmin = f32_to_f16(0.009f);
+            for (int i = 0; i < 12; ++i) b.scales[i] = static_cast<uint8_t>(rng() & 0xFFu);
+            for (int i = 0; i < 32; ++i) b.qh[i] = static_cast<uint8_t>(rng() & 0xFFu);
+            for (int i = 0; i < 128; ++i) b.qs[i] = static_cast<uint8_t>(rng() & 0xFFu);
+        }
+        if (run_format("Q5_K", QuantType::Q5_K, blk.data(), blk.size() * sizeof(block_q5_K)) != 0) return 1;
+    }
+    {
         std::vector<block_q4_K> blk(rows * (cols / 256));
         for (auto& b : blk) {
             b.d = f32_to_f16(0.02f);
@@ -437,6 +480,25 @@ static int test_quant_gemv_parity() {
             for (int i = 0; i < 128; ++i) b.qs[i] = static_cast<uint8_t>(rng() & 0xFFu);
         }
         if (run_format("Q4_K", QuantType::Q4_K, blk.data(), blk.size() * sizeof(block_q4_K)) != 0) return 1;
+    }
+    {
+        std::vector<block_q5_1> blk(rows * (cols / 32));
+        for (auto& b : blk) {
+            b.d = f32_to_f16(0.018f);
+            b.m = f32_to_f16(-0.08f);
+            for (int i = 0; i < 4; ++i) b.qh[i] = static_cast<uint8_t>(rng() & 0xFFu);
+            for (int i = 0; i < 16; ++i) b.qs[i] = static_cast<uint8_t>(rng() & 0xFFu);
+        }
+        if (run_format("Q5_1", QuantType::Q5_1, blk.data(), blk.size() * sizeof(block_q5_1)) != 0) return 1;
+    }
+    {
+        std::vector<block_q5_0> blk(rows * (cols / 32));
+        for (auto& b : blk) {
+            b.d = f32_to_f16(0.02f);
+            for (int i = 0; i < 4; ++i) b.qh[i] = static_cast<uint8_t>(rng() & 0xFFu);
+            for (int i = 0; i < 16; ++i) b.qs[i] = static_cast<uint8_t>(rng() & 0xFFu);
+        }
+        if (run_format("Q5_0", QuantType::Q5_0, blk.data(), blk.size() * sizeof(block_q5_0)) != 0) return 1;
     }
     {
         std::vector<block_q4_0> blk(rows * (cols / 32));
@@ -453,6 +515,277 @@ static int test_quant_gemv_parity() {
             for (int i = 0; i < 32; ++i) b.qs[i] = static_cast<int8_t>((static_cast<int>(rng() % 255)) - 127);
         }
         if (run_format("Q8_0", QuantType::Q8_0, blk.data(), blk.size() * sizeof(block_q8_0)) != 0) return 1;
+    }
+    return 0;
+}
+
+static int test_long_context_swa_and_sinks_parity() {
+    // 2048-token Sliding Window (win=512 + 4 Attention Sinks) + FP64 RoPE at pos=2047 vs Golden FP64 reference
+    constexpr int TOTAL_SEQ = 2048;
+    constexpr int WIN = 512;
+    constexpr int SINKS = 4;
+    constexpr int HD = 256;
+    std::mt19937 rng(98765);
+    std::normal_distribution<float> dist(0.0f, 0.35f);
+
+    std::vector<float> q(HD);
+    std::vector<float> K(static_cast<size_t>(TOTAL_SEQ) * HD);
+    std::vector<float> V(static_cast<size_t>(TOTAL_SEQ) * HD);
+    for (float& v : q) v = dist(rng);
+    for (float& v : K) v = dist(rng);
+    for (float& v : V) v = dist(rng);
+
+    // Apply RoPE at long positions 0..2047 (testing sinks at 0..3 + far window 1536..2047)
+    Avx2Math::apply_rope(q.data(), nullptr, HD, 1, 0, TOTAL_SEQ - 1, 1000000.0f, 1.0f, nullptr, HD, true);
+    for (int p = 0; p < TOTAL_SEQ; ++p) {
+        if (p < SINKS || p >= TOTAL_SEQ - WIN) {
+            Avx2Math::apply_rope(K.data() + static_cast<size_t>(p) * HD, nullptr, HD, 1, 0, p, 1000000.0f, 1.0f, nullptr, HD, true);
+        }
+    }
+
+    std::vector<int> indices;
+    indices.reserve(SINKS + WIN);
+    for (int p = 0; p < SINKS; ++p) indices.push_back(p);
+    for (int p = TOTAL_SEQ - WIN; p < TOTAL_SEQ; ++p) indices.push_back(p);
+
+    const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(HD)));
+    const float softcap = 50.0f;
+
+    std::vector<float> out_prod(HD, 0.0f);
+    FlashAttentionCpu::compute_tiled_attention(
+        q.data(), K.data(), V.data(), indices.data(),
+        static_cast<uint32_t>(indices.size()), HD, HD, 0, scale, softcap, out_prod.data());
+
+    // Golden FP64 reference over the exact same sink+window index set
+    std::vector<double> scores(indices.size(), 0.0);
+    double max_s = -1e300;
+    for (size_t idx = 0; idx < indices.size(); ++idx) {
+        const float* kt = K.data() + static_cast<size_t>(indices[idx]) * HD;
+        double dot = 0.0;
+        for (int d = 0; d < HD; ++d) dot += static_cast<double>(q[d]) * static_cast<double>(kt[d]);
+        dot *= static_cast<double>(scale);
+        dot = static_cast<double>(softcap) * std::tanh(dot / static_cast<double>(softcap));
+        scores[idx] = dot;
+        if (dot > max_s) max_s = dot;
+    }
+    double denom = 0.0;
+    for (double& s : scores) { s = std::exp(s - max_s); denom += s; }
+    std::vector<double> out_ref(HD, 0.0);
+    for (size_t idx = 0; idx < indices.size(); ++idx) {
+        const double w = scores[idx] / denom;
+        const float* vt = V.data() + static_cast<size_t>(indices[idx]) * HD;
+        for (int d = 0; d < HD; ++d) out_ref[d] += w * static_cast<double>(vt[d]);
+    }
+
+    const double cos_v = cosine_f64_vs_f32(out_ref.data(), out_prod.data(), HD);
+    const double err_v = max_abs_f64_vs_f32(out_ref.data(), out_prod.data(), HD);
+    std::cout << "  [LongCtx SWA pos=2047 +4sinks] cosine=" << std::fixed << std::setprecision(9) << cos_v
+              << " | max_abs=" << std::scientific << std::setprecision(3) << err_v << "\n";
+    HAVEN_CHECK(cos_v > 0.9999999 && err_v < 2e-6, "Long-context SWA + sinks attention drifted from FP64 reference");
+    return 0;
+}
+
+static int test_multi_arch_e2e_exact_vs_fast() {
+    // End-to-end quantized GGUF parity across non-Gemma architectures:
+    //   1. Llama-3 (Interleaved RoPE, SiLU, untied output, Q8_0 weights, 55x norm spike)
+    //   2. Qwen-2.5 (NeoX RoPE, QKV biases, SiLU, Q4_0 weights, 55x norm spike)
+    //   3. Mistral (Sliding Window SWA=8 + sinks, SiLU, Q8_0 weights, 55x norm spike)
+    struct ArchSpec {
+        const char* label;
+        const char* arch;
+        uint32_t gguf_qtype; // 8=Q8_0, 2=Q4_0
+        bool qkv_bias;
+        uint32_t swa_win;
+    };
+    const ArchSpec specs[3] = {
+        {"Llama-3-Q8_0",  "llama",   8u, false, 0u},
+        {"Qwen-2.5-Q4_0", "qwen2",   2u, true,  0u},
+        {"Mistral-SWA",   "mistral", 8u, false, 8u},
+    };
+
+    constexpr uint32_t V = 64, D = 256, F = 256, L = 2, NH = 4, NKV = 2, HD = 64;
+    constexpr uint32_t QDIM = NH * HD, KVDIM = NKV * HD;
+    const std::vector<uint32_t> prompt = {1, 5, 12, 7, 31, 44, 19, 28, 3, 52, 14, 9}; // S=12 (exercises 1x8 + 1x4 tiles + SWA>8!)
+
+    auto quantize_matrix = [](const std::vector<float>& src, uint32_t qtype) -> std::vector<uint8_t> {
+        const size_t nb = src.size() / 32;
+        if (qtype == 8u) {
+            std::vector<uint8_t> buf(nb * sizeof(block_q8_0));
+            auto* dst = reinterpret_cast<block_q8_0*>(buf.data());
+            for (size_t b = 0; b < nb; ++b) {
+                float ma = 0.0f;
+                for (int i = 0; i < 32; ++i) ma = std::max(ma, std::fabs(src[b * 32 + i]));
+                const float d = (ma > 1e-12f) ? (ma / 127.0f) : 0.0f;
+                dst[b].d = f32_to_f16(d);
+                const float inv_d = (d > 0.0f) ? (1.0f / d) : 0.0f;
+                for (int i = 0; i < 32; ++i) {
+                    int q = std::clamp(static_cast<int>(std::lrint(src[b * 32 + i] * inv_d)), -127, 127);
+                    dst[b].qs[i] = static_cast<int8_t>(q);
+                }
+            }
+            return buf;
+        } else {
+            std::vector<uint8_t> buf(nb * sizeof(block_q4_0));
+            auto* dst = reinterpret_cast<block_q4_0*>(buf.data());
+            for (size_t b = 0; b < nb; ++b) {
+                float ma = 0.0f;
+                for (int i = 0; i < 32; ++i) ma = std::max(ma, std::fabs(src[b * 32 + i]));
+                const float d = (ma > 1e-12f) ? (ma / 7.0f) : 0.0f;
+                dst[b].d = f32_to_f16(d);
+                const float inv_d = (d > 0.0f) ? (1.0f / d) : 0.0f;
+                for (int j = 0; j < 16; ++j) {
+                    int q0 = std::clamp(static_cast<int>(std::lrint(src[b * 32 + j] * inv_d)) + 8, 0, 15);
+                    int q1 = std::clamp(static_cast<int>(std::lrint(src[b * 32 + 16 + j] * inv_d)) + 8, 0, 15);
+                    dst[b].qs[j] = static_cast<uint8_t>((q0 & 0x0F) | ((q1 & 0x0F) << 4));
+                }
+            }
+            return buf;
+        }
+    };
+
+    for (const auto& sp : specs) {
+        const auto tmp_path = std::filesystem::temp_directory_path() / (std::string("haven_parity_") + sp.arch + ".gguf");
+        {
+            struct TOut { std::string name; std::vector<uint64_t> dims; uint32_t type; std::vector<uint8_t> bytes; };
+            std::vector<TOut> ts;
+            auto gen_f32 = [](size_t n, int seed, float sc) {
+                std::mt19937 grng(static_cast<uint32_t>(seed * 2654435761u));
+                std::normal_distribution<float> gd(0.0f, sc);
+                std::vector<float> v(n);
+                for (size_t i = 0; i < n; ++i) v[i] = gd(grng);
+                return v;
+            };
+            auto push_f32 = [&](const std::string& name, std::vector<uint64_t> dims, const std::vector<float>& v) {
+                std::vector<uint8_t> b(v.size() * sizeof(float));
+                std::memcpy(b.data(), v.data(), b.size());
+                ts.push_back({name, std::move(dims), 0u, std::move(b)});
+            };
+            auto push_q = [&](const std::string& name, std::vector<uint64_t> dims, const std::vector<float>& v) {
+                ts.push_back({name, std::move(dims), sp.gguf_qtype, quantize_matrix(v, sp.gguf_qtype)});
+            };
+
+            push_q("token_embd.weight", {D, V}, gen_f32(static_cast<size_t>(D) * V, 3, 0.25f));
+            push_f32("output_norm.weight", {D}, std::vector<float>(D, 1.0f));
+            push_q("output.weight", {D, V}, gen_f32(static_cast<size_t>(D) * V, 5, 0.12f));
+
+            for (uint32_t l = 0; l < L; ++l) {
+                const std::string p = "blk." + std::to_string(l) + ".";
+                std::vector<float> an(D, 1.0f), fn(D, 1.0f);
+                for (uint32_t i = 0; i < D; ++i) {
+                    // Inject 55x channel spikes on un-baked stock weights to test Outlier-Split Q8 end-to-end
+                    an[i] = (i == 19) ? 55.0f : (0.9f + 0.15f * std::cos(static_cast<float>(i + l)));
+                    fn[i] = (i == 73) ? 55.0f : (1.0f + 0.15f * std::sin(static_cast<float>(i + l)));
+                }
+                push_f32(p + "attn_norm.weight", {D}, an);
+                push_q(p + "attn_q.weight", {D, QDIM},  gen_f32(static_cast<size_t>(D) * QDIM,  11 + static_cast<int>(l), 0.05f));
+                push_q(p + "attn_k.weight", {D, KVDIM}, gen_f32(static_cast<size_t>(D) * KVDIM, 17 + static_cast<int>(l), 0.05f));
+                push_q(p + "attn_v.weight", {D, KVDIM}, gen_f32(static_cast<size_t>(D) * KVDIM, 23 + static_cast<int>(l), 0.05f));
+                if (sp.qkv_bias) {
+                    push_f32(p + "attn_q.bias", {QDIM},  gen_f32(QDIM,  43 + static_cast<int>(l), 0.04f));
+                    push_f32(p + "attn_k.bias", {KVDIM}, gen_f32(KVDIM, 47 + static_cast<int>(l), 0.04f));
+                    push_f32(p + "attn_v.bias", {KVDIM}, gen_f32(KVDIM, 53 + static_cast<int>(l), 0.04f));
+                }
+                push_q(p + "attn_output.weight", {QDIM, D}, gen_f32(static_cast<size_t>(QDIM) * D, 29 + static_cast<int>(l), 0.05f));
+                push_f32(p + "ffn_norm.weight", {D}, fn);
+                push_q(p + "ffn_gate.weight", {D, F}, gen_f32(static_cast<size_t>(D) * F, 31 + static_cast<int>(l), 0.05f));
+                push_q(p + "ffn_up.weight",   {D, F}, gen_f32(static_cast<size_t>(D) * F, 37 + static_cast<int>(l), 0.05f));
+                push_q(p + "ffn_down.weight", {F, D}, gen_f32(static_cast<size_t>(F) * D, 41 + static_cast<int>(l), 0.05f));
+            }
+
+            std::ofstream f(tmp_path, std::ios::binary | std::ios::trunc);
+            auto wu32 = [&](uint32_t v) { f.write(reinterpret_cast<const char*>(&v), 4); };
+            auto wu64 = [&](uint64_t v) { f.write(reinterpret_cast<const char*>(&v), 8); };
+            auto wstr = [&](const std::string& s) { wu64(s.size()); f.write(s.data(), static_cast<std::streamsize>(s.size())); };
+            auto kv_str = [&](const std::string& k, const std::string& v) { wstr(k); wu32(8); wstr(v); };
+            auto kv_u32 = [&](const std::string& k, uint32_t v) { wstr(k); wu32(4); wu32(v); };
+            auto kv_f32 = [&](const std::string& k, float v) { wstr(k); wu32(6); f.write(reinterpret_cast<const char*>(&v), 4); };
+
+            const std::string ap(sp.arch);
+            const uint64_t n_kv = 11 + (sp.swa_win > 0 ? 1 : 0);
+            wu32(0x46554747u); wu32(3); wu64(ts.size()); wu64(n_kv);
+            kv_str("general.architecture", ap);
+            kv_u32(ap + ".block_count", L);
+            kv_u32(ap + ".context_length", 128);
+            kv_u32(ap + ".embedding_length", D);
+            kv_u32(ap + ".feed_forward_length", F);
+            kv_u32(ap + ".attention.head_count", NH);
+            kv_u32(ap + ".attention.head_count_kv", NKV);
+            kv_u32(ap + ".attention.key_length", HD);
+            kv_f32(ap + ".attention.layer_norm_rms_epsilon", 1e-5f);
+            kv_f32(ap + ".rope.freq_base", 500000.0f);
+            if (sp.swa_win > 0) kv_u32(ap + ".attention.sliding_window", sp.swa_win);
+            wstr("tokenizer.ggml.tokens"); wu32(9); wu32(8); wu64(V);
+            for (uint32_t i = 0; i < V; ++i) wstr("t" + std::to_string(i));
+
+            uint64_t off = 0;
+            for (const auto& t : ts) {
+                wstr(t.name);
+                wu32(static_cast<uint32_t>(t.dims.size()));
+                for (uint64_t d : t.dims) wu64(d);
+                wu32(t.type);
+                wu64(off);
+                off += ((t.bytes.size() + 31ULL) / 32ULL) * 32ULL;
+            }
+            auto pad32 = [&]() {
+                uint64_t p = static_cast<uint64_t>(f.tellp());
+                uint64_t pad = (32ULL - (p % 32ULL)) % 32ULL;
+                if (pad) {
+                    std::vector<uint8_t> z(pad, 0);
+                    f.write(reinterpret_cast<const char*>(z.data()), static_cast<std::streamsize>(pad));
+                }
+            };
+            pad32();
+            for (const auto& t : ts) {
+                f.write(reinterpret_cast<const char*>(t.bytes.data()), static_cast<std::streamsize>(t.bytes.size()));
+                pad32();
+            }
+        }
+
+        int status = 0;
+        {
+            HavenEngine eng;
+            if (!eng.load_model(tmp_path.string())) {
+                std::cerr << "[FAIL] Failed to load synthetic GGUF: " << sp.label << "\n";
+                status = 1;
+            } else {
+                std::vector<float> lg_es(V), lg_eb(V), lg_fs(V), lg_fb(V);
+                eng.set_exact_math(true);
+                eng.get_kv_cache().reset();
+                for (size_t i = 0; i < prompt.size(); ++i)
+                    eng.forward(prompt[i], static_cast<int>(i), (i + 1 == prompt.size()) ? lg_es.data() : nullptr);
+                eng.get_kv_cache().reset();
+                eng.forward_batch(prompt.data(), static_cast<int>(prompt.size()), 0, lg_eb.data());
+
+                eng.set_exact_math(false);
+                eng.get_kv_cache().reset();
+                for (size_t i = 0; i < prompt.size(); ++i)
+                    eng.forward(prompt[i], static_cast<int>(i), (i + 1 == prompt.size()) ? lg_fs.data() : nullptr);
+                eng.get_kv_cache().reset();
+                eng.forward_batch(prompt.data(), static_cast<int>(prompt.size()), 0, lg_fb.data());
+
+                const double cos_eb  = cosine_f32(lg_es.data(), lg_eb.data(), V);
+                const double cos_fs  = cosine_f32(lg_es.data(), lg_fs.data(), V);
+                const double cos_fb  = cosine_f32(lg_es.data(), lg_fb.data(), V);
+                const double cos_f_s_b = cosine_f32(lg_fs.data(), lg_fb.data(), V);
+                const auto t_es = std::max_element(lg_es.begin(), lg_es.end()) - lg_es.begin();
+                const auto t_eb = std::max_element(lg_eb.begin(), lg_eb.end()) - lg_eb.begin();
+                const auto t_fb = std::max_element(lg_fb.begin(), lg_fb.end()) - lg_fb.begin();
+
+                std::cout << "  [MultiArch " << std::left << std::setw(13) << sp.label << std::right
+                          << " 55x] exact_s==b:" << std::fixed << std::setprecision(9) << cos_eb
+                          << " | fast_s:" << std::setprecision(7) << cos_fs
+                          << " | fast_b:" << cos_fb
+                          << " | fs==fb:" << cos_f_s_b
+                          << " | Top1:" << (t_es == t_eb && t_es == t_fb ? "MATCH" : "DIFF") << "\n";
+                if (cos_eb <= 0.9999999 || cos_fs <= 0.9999 || cos_fb <= 0.9999 || cos_f_s_b <= 0.999999 || t_es != t_eb || t_es != t_fb) {
+                    std::cerr << "[FAIL] Multi-arch parity regression on " << sp.label << "\n";
+                    status = 1;
+                }
+            }
+        }
+        std::error_code ec;
+        std::filesystem::remove(tmp_path, ec);
+        if (status != 0) return status;
     }
     return 0;
 }
@@ -638,6 +971,8 @@ int main(int argc, char** argv) {
     if (test_softmax_and_flash_attention(strict) != 0) return 1;
     if (test_fwht_and_activations() != 0) return 1;
     if (test_quant_gemv_parity() != 0) return 1;
+    if (test_long_context_swa_and_sinks_parity() != 0) return 1;
+    if (test_multi_arch_e2e_exact_vs_fast() != 0) return 1;
 #ifdef HAVEN_HAS_TPU
     if (test_tpu_w4_quantizer_quality(strict) != 0) return 1;
 #endif

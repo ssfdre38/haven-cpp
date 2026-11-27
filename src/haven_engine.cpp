@@ -945,16 +945,16 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
                         }
                     }
 
-                    // Fused per-expert activation + parallel per-expert Q8 quantization (all K_used experts in parallel!)
+                    // Fused per-expert activation (exact FP64) + parallel per-expert Q8 quantization (all K_used experts in parallel!)
                     #pragma omp for schedule(static)
                     for (int k = 0; k < K_used; ++k) {
                         float* base = moe_gate_up_scratch_.data() + static_cast<size_t>(k) * static_cast<size_t>(two_F);
                         for (int j = 0; j < F_exp; ++j) {
-                            const float g = base[j];
-                            const float act = use_gelu
-                                ? (0.5f * g * (1.0f + std::tanh(0.7978845608f * (g + 0.044715f * g * g * g))))
-                                : (g / (1.0f + std::exp(-g)));
-                            base[j] = act * base[F_exp + j];
+                            const double gd = static_cast<double>(base[j]);
+                            const double act = use_gelu
+                                ? (0.5 * gd * (1.0 + std::tanh(0.79788456080286535588 * (gd + 0.044715 * gd * gd * gd))))
+                                : (gd / (1.0 + std::exp(-gd)));
+                            base[j] = static_cast<float>(act * static_cast<double>(base[F_exp + j]));
                         }
                         if (cfg.turbo_hadamard_moe_down > 0 && (F_exp % static_cast<int>(cfg.turbo_hadamard_moe_down)) == 0) {
                             Avx2Math::fwht_block_inplace(base, F_exp, static_cast<int>(cfg.turbo_hadamard_moe_down));

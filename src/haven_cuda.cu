@@ -1747,7 +1747,74 @@ __global__ void k_moe_gu_act_grouped(const uint8_t* __restrict__ Wgu, QuantType 
     const QuantType qt_eff_u = fused_gu ? qt_gu : qt_u;
     const int nb32_d = D >> 5;
 
-    if (qt_eff_g == QuantType::IQ4_XS && qt_eff_u == QuantType::IQ4_XS) {
+    if (qt_eff_g == QuantType::IQ4_XS && qt_eff_u == QuantType::IQ4_XS && !x_q8) {
+        // Exact FP32-Activation 8-token register-tiled IQ4_XS Gate+Up+Act (8x VRAM & LUT reuse, zero Q8 error!)
+        const int lut_i = static_cast<int>(d_kvalues_iq4nl[lane & 15]);
+        const int nb = D >> 8;
+        const int ib = lane >> 2;
+        const int t  = lane & 3;
+
+        for (int m = start; m < end; m += 8) {
+            const int T = min(8, end - m);
+            int toks[8];
+            float acc_g[8], acc_u[8];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                toks[i] = (i < T) ? sorted_tok[m + i] : 0;
+                acc_g[i] = 0.0f;
+                acc_u[i] = 0.0f;
+            }
+
+            for (int b = 0; b < nb; ++b) {
+                const block_iq4_xs* bg = reinterpret_cast<const block_iq4_xs*>(row_g + static_cast<size_t>(b) * sizeof(block_iq4_xs));
+                const float dg = d_fp16_to_f32(bg->d) * static_cast<float>((((bg->scales_l[ib >> 1] >> (4 * (ib & 1))) & 0x0F) | (((bg->scales_h >> (2 * ib)) & 3) << 4)) - 32);
+                const uint32_t qg = *reinterpret_cast<const uint32_t*>(bg->qs + (lane << 2));
+                const float gw0 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (qg >>  0) & 0x0Fu));
+                const float gw1 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (qg >>  8) & 0x0Fu));
+                const float gw2 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (qg >> 16) & 0x0Fu));
+                const float gw3 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (qg >> 24) & 0x0Fu));
+                const float gh0 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (qg >>  4) & 0x0Fu));
+                const float gh1 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (qg >> 12) & 0x0Fu));
+                const float gh2 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (qg >> 20) & 0x0Fu));
+                const float gh3 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (qg >> 28) & 0x0Fu));
+
+                const block_iq4_xs* bu = reinterpret_cast<const block_iq4_xs*>(row_u + static_cast<size_t>(b) * sizeof(block_iq4_xs));
+                const float du = d_fp16_to_f32(bu->d) * static_cast<float>((((bu->scales_l[ib >> 1] >> (4 * (ib & 1))) & 0x0F) | (((bu->scales_h >> (2 * ib)) & 3) << 4)) - 32);
+                const uint32_t qu = *reinterpret_cast<const uint32_t*>(bu->qs + (lane << 2));
+                const float uw0 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (qu >>  0) & 0x0Fu));
+                const float uw1 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (qu >>  8) & 0x0Fu));
+                const float uw2 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (qu >> 16) & 0x0Fu));
+                const float uw3 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (qu >> 24) & 0x0Fu));
+                const float uh0 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (qu >>  4) & 0x0Fu));
+                const float uh1 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (qu >> 12) & 0x0Fu));
+                const float uh2 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (qu >> 20) & 0x0Fu));
+                const float uh3 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (qu >> 28) & 0x0Fu));
+
+                const size_t x_off = static_cast<size_t>((b << 8) + (ib << 5));
+                for (int i = 0; i < T; ++i) {
+                    const float4* x4 = reinterpret_cast<const float4*>(x_f32 + static_cast<size_t>(toks[i]) * static_cast<size_t>(D) + x_off);
+                    const float4 xlo = x4[t], xhi = x4[t + 4];
+                    float sg = fmaf(gw0, xlo.x, fmaf(gw1, xlo.y, fmaf(gw2, xlo.z, gw3 * xlo.w)));
+                    sg       = fmaf(gh0, xhi.x, fmaf(gh1, xhi.y, fmaf(gh2, xhi.z, fmaf(gh3, xhi.w, sg))));
+                    float su = fmaf(uw0, xlo.x, fmaf(uw1, xlo.y, fmaf(uw2, xlo.z, uw3 * xlo.w)));
+                    su       = fmaf(uh0, xhi.x, fmaf(uh1, xhi.y, fmaf(uh2, xhi.z, fmaf(uh3, xhi.w, su))));
+                    acc_g[i] = fmaf(dg, sg, acc_g[i]);
+                    acc_u[i] = fmaf(du, su, acc_u[i]);
+                }
+            }
+
+            for (int i = 0; i < T; ++i) {
+                const float g = warp_reduce_sum(acc_g[i]);
+                const float u = warp_reduce_sum(acc_u[i]);
+                if (lane == 0) {
+                    const int tok = toks[i];
+                    const int slot = sorted_slot[m + i];
+                    const float act = use_gelu ? d_gelu_tanh(g) : d_silu(g);
+                    act_out[(static_cast<size_t>(tok) * static_cast<size_t>(K_used) + static_cast<size_t>(slot)) * static_cast<size_t>(F_exp) + static_cast<size_t>(r)] = act * u;
+                }
+            }
+        }
+    } else if (qt_eff_g == QuantType::IQ4_XS && qt_eff_u == QuantType::IQ4_XS) {
         const int lut_i = static_cast<int>(d_kvalues_iq4nl[lane & 15]);
         const int nb = D >> 8;
         const int ib = lane >> 2;
@@ -1822,7 +1889,7 @@ __global__ void k_moe_gu_act_grouped(const uint8_t* __restrict__ Wgu, QuantType 
         for (int m = start; m < end; ++m) {
             const int tok = sorted_tok[m];
             const int slot = sorted_slot[m];
-            const block_q8_1_gpu* xq_s = x_q8 + static_cast<size_t>(tok) * static_cast<size_t>(nb32_d);
+            const block_q8_1_gpu* xq_s = x_q8 ? (x_q8 + static_cast<size_t>(tok) * static_cast<size_t>(nb32_d)) : nullptr;
             const float* xf_s = x_f32 + static_cast<size_t>(tok) * static_cast<size_t>(D);
             const float g = warp_dot_any_q8(row_g, qt_eff_g, xq_s, xf_s, D, lane);
             const float u = warp_dot_any_q8(row_u, qt_eff_u, xq_s, xf_s, D, lane);
@@ -1857,7 +1924,110 @@ __global__ void k_moe_down_grouped(const uint8_t* __restrict__ Wdn, QuantType qt
     const uint8_t* row_dn = Wdn + (static_cast<size_t>(e) * static_cast<size_t>(D) + static_cast<size_t>(d)) * rb_dn;
     const int nb32_f = F_exp >> 5;
 
-    if (qt_dn == QuantType::IQ4_NL) {
+    if (qt_dn == QuantType::IQ4_NL && !act_q8) {
+        // Exact FP32-Activation 8-token register-tiled IQ4_NL MoE Down
+        const int lut_i = static_cast<int>(d_kvalues_iq4nl[lane & 15]);
+        const int nb = F_exp >> 5;
+        const int b_off = lane >> 2;
+        const int t = lane & 3;
+        const int n_iters = (nb + 7) >> 3;
+
+        for (int m = start; m < end; m += 8) {
+            const int T = min(8, end - m);
+            size_t slot_f32[8];
+            float acc[8];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                slot_f32[i] = (i < T)
+                    ? (static_cast<size_t>(sorted_tok[m + i]) * static_cast<size_t>(K_used) + static_cast<size_t>(sorted_slot[m + i])) * static_cast<size_t>(F_exp)
+                    : 0;
+                acc[i] = 0.0f;
+            }
+            for (int it = 0; it < n_iters; ++it) {
+                const int b = (it << 3) + b_off;
+                const bool active = (b < nb);
+                uint32_t q4 = 0u;
+                float dw = 0.0f;
+                if (active) {
+                    const block_iq4_nl* blk = reinterpret_cast<const block_iq4_nl*>(row_dn + static_cast<size_t>(b) * sizeof(block_iq4_nl));
+                    dw = d_fp16_to_f32(blk->d);
+                    memcpy(&q4, blk->qs + (t << 2), sizeof(uint32_t));
+                }
+                const float w0 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (q4 >>  0) & 0x0Fu));
+                const float w1 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (q4 >>  8) & 0x0Fu));
+                const float w2 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 16) & 0x0Fu));
+                const float w3 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 24) & 0x0Fu));
+                const float h0 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (q4 >>  4) & 0x0Fu));
+                const float h1 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 12) & 0x0Fu));
+                const float h2 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 20) & 0x0Fu));
+                const float h3 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 28) & 0x0Fu));
+                if (active) {
+                    const size_t x_off = static_cast<size_t>(b << 5);
+                    for (int i = 0; i < T; ++i) {
+                        const float4* x4 = reinterpret_cast<const float4*>(act_f32 + slot_f32[i] + x_off);
+                        const float4 xlo = x4[t], xhi = x4[t + 4];
+                        float sub = fmaf(w0, xlo.x, fmaf(w1, xlo.y, fmaf(w2, xlo.z, w3 * xlo.w)));
+                        sub       = fmaf(h0, xhi.x, fmaf(h1, xhi.y, fmaf(h2, xhi.z, fmaf(h3, xhi.w, sub))));
+                        acc[i] = fmaf(dw, sub, acc[i]);
+                    }
+                }
+            }
+            for (int i = 0; i < T; ++i) {
+                const float dot = warp_reduce_sum(acc[i]);
+                if (lane == 0) {
+                    const int tok = sorted_tok[m + i];
+                    atomicAdd(&out[static_cast<size_t>(tok) * static_cast<size_t>(D) + static_cast<size_t>(d)], sorted_w[m + i] * dot);
+                }
+            }
+        }
+    } else if (qt_dn == QuantType::IQ4_XS && !act_q8) {
+        // Exact FP32-Activation 8-token register-tiled IQ4_XS MoE Down
+        const int lut_i = static_cast<int>(d_kvalues_iq4nl[lane & 15]);
+        const int nb = F_exp >> 8;
+        const int ib = lane >> 2;
+        const int t  = lane & 3;
+
+        for (int m = start; m < end; m += 8) {
+            const int T = min(8, end - m);
+            size_t slot_f32[8];
+            float acc[8];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                slot_f32[i] = (i < T)
+                    ? (static_cast<size_t>(sorted_tok[m + i]) * static_cast<size_t>(K_used) + static_cast<size_t>(sorted_slot[m + i])) * static_cast<size_t>(F_exp)
+                    : 0;
+                acc[i] = 0.0f;
+            }
+            for (int b = 0; b < nb; ++b) {
+                const block_iq4_xs* blk = reinterpret_cast<const block_iq4_xs*>(row_dn + static_cast<size_t>(b) * sizeof(block_iq4_xs));
+                const float dl = d_fp16_to_f32(blk->d) * static_cast<float>((((blk->scales_l[ib >> 1] >> (4 * (ib & 1))) & 0x0F) | (((blk->scales_h >> (2 * ib)) & 3) << 4)) - 32);
+                const uint32_t q4 = *reinterpret_cast<const uint32_t*>(blk->qs + (lane << 2));
+                const float w0 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (q4 >>  0) & 0x0Fu));
+                const float w1 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (q4 >>  8) & 0x0Fu));
+                const float w2 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 16) & 0x0Fu));
+                const float w3 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 24) & 0x0Fu));
+                const float h0 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (q4 >>  4) & 0x0Fu));
+                const float h1 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 12) & 0x0Fu));
+                const float h2 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 20) & 0x0Fu));
+                const float h3 = static_cast<float>(__shfl_sync(0xFFFFFFFFu, lut_i, (q4 >> 28) & 0x0Fu));
+                const size_t x_off = static_cast<size_t>((b << 8) + (ib << 5));
+                for (int i = 0; i < T; ++i) {
+                    const float4* x4 = reinterpret_cast<const float4*>(act_f32 + slot_f32[i] + x_off);
+                    const float4 xlo = x4[t], xhi = x4[t + 4];
+                    float sub = fmaf(w0, xlo.x, fmaf(w1, xlo.y, fmaf(w2, xlo.z, w3 * xlo.w)));
+                    sub       = fmaf(h0, xhi.x, fmaf(h1, xhi.y, fmaf(h2, xhi.z, fmaf(h3, xhi.w, sub))));
+                    acc[i] = fmaf(dl, sub, acc[i]);
+                }
+            }
+            for (int i = 0; i < T; ++i) {
+                const float dot = warp_reduce_sum(acc[i]);
+                if (lane == 0) {
+                    const int tok = sorted_tok[m + i];
+                    atomicAdd(&out[static_cast<size_t>(tok) * static_cast<size_t>(D) + static_cast<size_t>(d)], sorted_w[m + i] * dot);
+                }
+            }
+        }
+    } else if (qt_dn == QuantType::IQ4_NL) {
         const int lut_i = static_cast<int>(d_kvalues_iq4nl[lane & 15]);
         const int nb = F_exp >> 5;
         const int b_off = lane >> 2;
@@ -1968,7 +2138,8 @@ __global__ void k_moe_down_grouped(const uint8_t* __restrict__ Wdn, QuantType qt
             const int tok = sorted_tok[m];
             const int slot = sorted_slot[m];
             const size_t slot_idx = static_cast<size_t>(tok) * static_cast<size_t>(K_used) + static_cast<size_t>(slot);
-            const float dot = warp_dot_any_q8(row_dn, qt_dn, act_q8 + slot_idx * static_cast<size_t>(nb32_f), act_f32 + slot_idx * static_cast<size_t>(F_exp), F_exp, lane);
+            const block_q8_1_gpu* aq_s = act_q8 ? (act_q8 + slot_idx * static_cast<size_t>(nb32_f)) : nullptr;
+            const float dot = warp_dot_any_q8(row_dn, qt_dn, aq_s, act_f32 + slot_idx * static_cast<size_t>(F_exp), F_exp, lane);
             if (lane == 0) {
                 atomicAdd(&out[static_cast<size_t>(tok) * static_cast<size_t>(D) + static_cast<size_t>(d)], sorted_w[m] * dot);
             }
@@ -2568,9 +2739,13 @@ struct HavenCudaEngine::Impl {
                     launch_fwht(d_moe_norm, S * D, static_cast<int>(mc.turbo_hadamard_moe_in));
                 }
 
-                if (!exact_fp32_act && S >= 8 && E <= 256) {
-                    quantize_q8(d_moe_norm, d_x_q8, S * D);
-                    // Grouped 8-token register-tiled MoE prefill (zero host sync, 8x weight & LUT reuse!)
+                if (S >= 8 && E <= 256) {
+                    const block_q8_1_gpu* xq_grp = nullptr;
+                    if (!exact_fp32_act) {
+                        quantize_q8(d_moe_norm, d_x_q8, S * D);
+                        xq_grp = d_x_q8;
+                    }
+                    // Grouped 8-token register-tiled MoE prefill (zero host sync, 8x weight & LUT reuse in both Q8 & exact F32-act!)
                     k_moe_bucket_sort<<<1, 256, 0, stream>>>(
                         d_moe_idx, d_moe_w, S, K_used, E,
                         d_moe_exp_offsets, d_moe_sorted_tok, d_moe_sorted_slot, d_moe_sorted_w);
@@ -2579,18 +2754,22 @@ struct HavenCudaEngine::Impl {
                         gl.moe_gu.ptr, gl.moe_gu.type, gl.moe_gu.row_bytes,
                         gl.moe_g.ptr,  gl.moe_g.type,  gl.moe_g.row_bytes,
                         gl.moe_u.ptr,  gl.moe_u.type,  gl.moe_u.row_bytes,
-                        d_x_q8, d_moe_norm,
+                        xq_grp, d_moe_norm,
                         d_moe_exp_offsets, d_moe_sorted_tok, d_moe_sorted_slot,
                         d_moe_act, K_used, F_exp, D, gl.fused_moe_gu, use_gelu);
                     if (mc.turbo_hadamard_moe_down > 0 && (F_exp % static_cast<int>(mc.turbo_hadamard_moe_down)) == 0) {
                         launch_fwht(d_moe_act, S * K_used * F_exp, static_cast<int>(mc.turbo_hadamard_moe_down));
                     }
-                    quantize_q8(d_moe_act, d_moe_act_q8, S * K_used * F_exp);
+                    const block_q8_1_gpu* aq_grp = nullptr;
+                    if (!exact_fp32_act) {
+                        quantize_q8(d_moe_act, d_moe_act_q8, S * K_used * F_exp);
+                        aq_grp = d_moe_act_q8;
+                    }
                     cudaMemsetAsync(d_moe_out, 0, static_cast<size_t>(S) * static_cast<size_t>(D) * sizeof(float), stream);
                     dim3 dn_grid((D + 3) >> 2, static_cast<unsigned int>(E), 1);
                     k_moe_down_grouped<<<dn_grid, 128, 0, stream>>>(
                         gl.moe_dn.ptr, gl.moe_dn.type, gl.moe_dn.row_bytes,
-                        d_moe_act_q8, d_moe_act,
+                        aq_grp, d_moe_act,
                         d_moe_exp_offsets, d_moe_sorted_tok, d_moe_sorted_slot, d_moe_sorted_w,
                         d_moe_out, K_used, F_exp, D);
                 } else {
