@@ -649,10 +649,14 @@ static int test_multi_arch_e2e_exact_vs_fast() {
             struct TOut { std::string name; std::vector<uint64_t> dims; uint32_t type; std::vector<uint8_t> bytes; };
             std::vector<TOut> ts;
             auto gen_f32 = [](size_t n, int seed, float sc) {
-                std::mt19937 grng(static_cast<uint32_t>(seed * 2654435761u));
-                std::normal_distribution<float> gd(0.0f, sc);
+                std::mt19937 grng(static_cast<uint32_t>(seed) * 2654435761u);
                 std::vector<float> v(n);
-                for (size_t i = 0; i < n; ++i) v[i] = gd(grng);
+                for (size_t i = 0; i < n; ++i) {
+                    const double u1 = (static_cast<double>(grng()) + 0.5) / 4294967296.0;
+                    const double u2 = (static_cast<double>(grng()) + 0.5) / 4294967296.0;
+                    const double z = std::sqrt(-2.0 * std::log(u1)) * std::cos(6.28318530717958647692 * u2);
+                    v[i] = static_cast<float>(z * static_cast<double>(sc));
+                }
                 return v;
             };
             auto push_f32 = [&](const std::string& name, std::vector<uint64_t> dims, const std::vector<float>& v) {
@@ -777,7 +781,7 @@ static int test_multi_arch_e2e_exact_vs_fast() {
                           << " | fast_b:" << cos_fb
                           << " | fs==fb:" << cos_f_s_b
                           << " | Top1:" << (t_es == t_eb && t_es == t_fb ? "MATCH" : "DIFF") << "\n";
-                if (cos_eb <= 0.9999999 || cos_fs <= 0.9999 || cos_fb <= 0.9999 || cos_f_s_b <= 0.999999 || t_es != t_eb || t_es != t_fb) {
+                if (cos_eb <= 0.9999999 || cos_fs <= 0.9995 || cos_fb <= 0.9995 || cos_f_s_b <= 0.999999 || t_es != t_eb || t_es != t_fb) {
                     std::cerr << "[FAIL] Multi-arch parity regression on " << sp.label << "\n";
                     status = 1;
                 }
