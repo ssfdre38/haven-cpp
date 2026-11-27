@@ -30,12 +30,14 @@ public:
     bool is_initialized() const override { return initialized_; }
 
     bool initialize(HavenEngine& host, const SessionConfig& cfg) override {
-        (void)cfg;
         host_ = &host;
+        host_->set_exact_math(cfg.exact_math);
         initialized_ = true;
         metrics_ = {};
         metrics_.backend = BackendKind::CPU_AVX2;
-        metrics_.device_summary = "Bare-Metal AVX2/FMA C++20 CPU";
+        metrics_.device_summary = cfg.exact_math
+            ? "Bare-Metal AVX2/FMA C++20 CPU (Exact FP32-Act + FP64 Norms/RoPE/Attn)"
+            : "Bare-Metal AVX2/FMA C++20 CPU";
         last_error_.clear();
         return true;
     }
@@ -130,6 +132,10 @@ public:
         ccfg.max_seq_len = cfg.max_seq_len;
         ccfg.max_prefill_chunk = cfg.max_prefill_chunk;
         ccfg.use_cuda_graph = cfg.use_cuda_graph;
+        ccfg.exact_fp32_activations = cfg.exact_math;
+        ccfg.fp32_kv_cache = cfg.fp32_kv_cache || cfg.exact_math;
+        ccfg.fp32_prefill = cfg.fp32_prefill || cfg.exact_math;
+        ccfg.host_resident_pleias = cfg.host_resident_pleias;
         ccfg.verbose = cfg.verbose;
 
         if (!cuda_.initialize(host, ccfg)) {

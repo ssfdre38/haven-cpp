@@ -86,6 +86,7 @@ struct TpuGemma4Config {
     bool use_int8_weights = false; // false = BF16, true = W8A16/W8A8 INT8 + Block-256 Hadamard MoE (~2x HBM3 BW)
     bool use_int4_weights = false; // true = Native Packed W4A16 Group-128 INT4 (4.25 bpw projections + W8 vocab; overrides use_int8_weights)
     bool use_fp8_kv = false;       // false = BF16 KV cache, true = Scale-Free FP8 E4M3FN KV cache (50% KV HBM3 BW, zero scales, unlocks B=256!)
+    bool use_f32_kv = false;       // true = Full IEEE FP32 KV cache in HBM3 (zero BF16/FP8 KV truncation; ignored if use_fp8_kv == true)
     bool return_full_logits = false; // true = return [B, vocab] F32 logits, false = on-chip argmax [B] i32 (4B/slot PCIe)
     bool use_onchip_embeddings = false; // true = upload only [B, S] i32 token IDs & gather embeddings on-chip in HBM3
     bool donate_kv_cache = true;   // Emit tf.aliasing_output on KV cache buffers for zero-copy in-place HBM3 updates

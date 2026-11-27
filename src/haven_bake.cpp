@@ -202,8 +202,36 @@ static bool is_float_type(QuantType t) {
     return t == QuantType::F32 || t == QuantType::BF16 || t == QuantType::F16;
 }
 
-// Decode a tensor (BF16, F16, or F32) into FP32 buffer
-static bool decode_tensor_f32(std::ifstream& f, const InputTensor& t, std::vector<float>& out) {
+// Exact IEEE FP64 Orthonormal Block Fast Walsh-Hadamard Transform for lossless master-weight baking
+static void fwht_block_inplace_f64(double* x, int n, int block_size) {
+    if (!x || n <= 0 || block_size < 2 || (block_size & (block_size - 1)) != 0 || (n % block_size) != 0) {
+        return;
+    }
+    const double inv_sqrt_b = 1.0 / std::sqrt(static_cast<double>(block_size));
+    const int n_blocks = n / block_size;
+    for (int blk = 0; blk < n_blocks; ++blk) {
+        double* base = x + static_cast<size_t>(blk) * static_cast<size_t>(block_size);
+        for (int h = 1; h < block_size; h <<= 1) {
+            const int step = h << 1;
+            for (int i = 0; i < block_size; i += step) {
+                double* p0 = base + i;
+                double* p1 = base + i + h;
+                for (int j = 0; j < h; ++j) {
+                    const double a = p0[j];
+                    const double b = p1[j];
+                    p0[j] = a + b;
+                    p1[j] = a - b;
+                }
+            }
+        }
+        for (int i = 0; i < block_size; ++i) {
+            base[i] *= inv_sqrt_b;
+        }
+    }
+}
+
+// Decode a tensor (BF16, F16, or F32) directly into exact FP64 buffer
+static bool decode_tensor_f64(std::ifstream& f, const InputTensor& t, std::vector<double>& out) {
     uint64_t ne = 1;
     for (uint64_t d : t.dims) ne *= d;
     out.resize(static_cast<size_t>(ne));
@@ -211,22 +239,28 @@ static bool decode_tensor_f32(std::ifstream& f, const InputTensor& t, std::vecto
     f.seekg(static_cast<std::streamoff>(t.abs_offset), std::ios::beg);
     if (!f) return false;
 
+    const int64_t n_i = static_cast<int64_t>(ne);
     if (t.type == QuantType::F32) {
-        return read_exact(f, out.data(), static_cast<size_t>(ne) * sizeof(float));
+        std::vector<float> tmp(static_cast<size_t>(ne));
+        if (!read_exact(f, tmp.data(), static_cast<size_t>(ne) * sizeof(float))) return false;
+        #pragma omp parallel for schedule(static) if(n_i >= 65536)
+        for (int64_t i = 0; i < n_i; ++i) {
+            out[static_cast<size_t>(i)] = static_cast<double>(tmp[static_cast<size_t>(i)]);
+        }
+        return true;
     }
     if (t.type == QuantType::BF16 || t.type == QuantType::F16) {
         std::vector<uint16_t> raw(static_cast<size_t>(ne));
         if (!read_exact(f, raw.data(), static_cast<size_t>(ne) * sizeof(uint16_t))) return false;
-        const int64_t n_i = static_cast<int64_t>(ne);
         if (t.type == QuantType::BF16) {
             #pragma omp parallel for schedule(static) if(n_i >= 65536)
             for (int64_t i = 0; i < n_i; ++i) {
-                out[static_cast<size_t>(i)] = Avx2Math::bf16_to_fp32(raw[static_cast<size_t>(i)]);
+                out[static_cast<size_t>(i)] = static_cast<double>(Avx2Math::bf16_to_fp32(raw[static_cast<size_t>(i)]));
             }
         } else {
             #pragma omp parallel for schedule(static) if(n_i >= 65536)
             for (int64_t i = 0; i < n_i; ++i) {
-                out[static_cast<size_t>(i)] = Avx2Math::fp16_to_fp32(raw[static_cast<size_t>(i)]);
+                out[static_cast<size_t>(i)] = static_cast<double>(Avx2Math::fp16_to_fp32(raw[static_cast<size_t>(i)]));
             }
         }
         return true;
@@ -234,22 +268,27 @@ static bool decode_tensor_f32(std::ifstream& f, const InputTensor& t, std::vecto
     return false;
 }
 
-// Encode FP32 buffer back to its original float format (BF16 / F16 / F32) and stream to output file
-static bool encode_and_write_f32(std::ofstream& out_f, QuantType type, const std::vector<float>& data) {
+// Encode exact FP64 buffer back to its original float format (BF16 / F16 / F32 RNE) and stream to output file
+static bool encode_and_write_f64(std::ofstream& out_f, QuantType type, const std::vector<double>& data) {
+    const int64_t n_i = static_cast<int64_t>(data.size());
     if (type == QuantType::F32) {
-        return write_exact(out_f, data.data(), data.size() * sizeof(float));
+        std::vector<float> tmp(data.size());
+        #pragma omp parallel for schedule(static) if(n_i >= 65536)
+        for (int64_t i = 0; i < n_i; ++i) {
+            tmp[static_cast<size_t>(i)] = static_cast<float>(data[static_cast<size_t>(i)]);
+        }
+        return write_exact(out_f, tmp.data(), tmp.size() * sizeof(float));
     }
     std::vector<uint16_t> raw(data.size());
-    const int64_t n_i = static_cast<int64_t>(data.size());
     if (type == QuantType::BF16) {
         #pragma omp parallel for schedule(static) if(n_i >= 65536)
         for (int64_t i = 0; i < n_i; ++i) {
-            raw[static_cast<size_t>(i)] = fp32_to_bf16_rne(data[static_cast<size_t>(i)]);
+            raw[static_cast<size_t>(i)] = fp32_to_bf16_rne(static_cast<float>(data[static_cast<size_t>(i)]));
         }
     } else if (type == QuantType::F16) {
         #pragma omp parallel for schedule(static) if(n_i >= 65536)
         for (int64_t i = 0; i < n_i; ++i) {
-            raw[static_cast<size_t>(i)] = fp32_to_fp16_rne(data[static_cast<size_t>(i)]);
+            raw[static_cast<size_t>(i)] = fp32_to_fp16_rne(static_cast<float>(data[static_cast<size_t>(i)]));
         }
     } else {
         return false;
@@ -272,12 +311,12 @@ static bool stream_copy_raw(std::ifstream& in_f, uint64_t abs_offset, uint64_t n
     return true;
 }
 
-static double compute_crest_factor(const std::vector<float>& v) {
+static double compute_crest_factor(const std::vector<double>& v) {
     if (v.empty()) return 0.0;
     double sum_sq = 0.0;
     double max_abs = 0.0;
-    for (float x : v) {
-        double a = std::fabs(static_cast<double>(x));
+    for (double x : v) {
+        double a = std::fabs(x);
         if (a > max_abs) max_abs = a;
         sum_sq += a * a;
     }
@@ -667,17 +706,17 @@ int main(int argc, char** argv) {
         }
     }
 
-    // 3. Pre-load small 1D norm & scale vectors (~5 MB RAM) needed for folding
-    std::unordered_map<std::string, std::vector<float>> vec_cache;
-    auto load_small_vec = [&](const std::string& name) -> const std::vector<float>* {
+    // 3. Pre-load small 1D norm & scale vectors (~5 MB RAM) in exact FP64 for lossless folding
+    std::unordered_map<std::string, std::vector<double>> vec_cache;
+    auto load_small_vec = [&](const std::string& name) -> const std::vector<double>* {
         auto cit = vec_cache.find(name);
         if (cit != vec_cache.end()) return &cit->second;
         auto it = name_to_idx.find(name);
         if (it == name_to_idx.end()) return nullptr;
         const auto& t = tensors[it->second];
         if (!is_float_type(t.type)) return nullptr;
-        std::vector<float> v;
-        if (!decode_tensor_f32(shard_files[t.shard_idx], t, v)) return nullptr;
+        std::vector<double> v;
+        if (!decode_tensor_f64(shard_files[t.shard_idx], t, v)) return nullptr;
         auto [ins, _] = vec_cache.emplace(name, std::move(v));
         return &ins->second;
     };
@@ -851,9 +890,9 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        // Load tensor as FP32, apply exact linear algebra, re-encode back to original float dtype
-        std::vector<float> buf;
-        if (!decode_tensor_f32(shard_files[t.shard_idx], t, buf)) {
+        // Load tensor in exact FP64, apply lossless linear algebra, RNE-encode back to original float dtype
+        std::vector<double> buf;
+        if (!decode_tensor_f64(shard_files[t.shard_idx], t, buf)) {
             std::cerr << "ERROR: Failed decoding tensor " << t.name << "\n";
             return 1;
         }
@@ -866,7 +905,7 @@ int main(int argc, char** argv) {
 
         if ((fold_norms && (suf == "attn_norm.weight" || suf == "ffn_norm.weight" || suf == "pre_ffw_norm_2.weight")) ||
             (fold_scales && (suf == "ffn_gate_inp.scale" || suf == "ffn_down_exps.scale"))) {
-            std::fill(buf.begin(), buf.end(), 1.0f);
+            std::fill(buf.begin(), buf.end(), 1.0);
         } else {
             double c_before = compute_crest_factor(buf);
 
@@ -875,44 +914,44 @@ int main(int argc, char** argv) {
                 const auto* g = fold_norms ? load_small_vec(p + "attn_norm.weight") : nullptr;
                 #pragma omp parallel for schedule(static)
                 for (int64_t r = 0; r < n_rows; ++r) {
-                    float* row = buf.data() + static_cast<size_t>(r) * static_cast<size_t>(ne0);
+                    double* row = buf.data() + static_cast<size_t>(r) * static_cast<size_t>(ne0);
                     if (g && static_cast<int64_t>(g->size()) == ne0) {
                         for (int64_t c = 0; c < ne0; ++c) row[c] *= (*g)[static_cast<size_t>(c)];
                     }
-                    if (h_qkv > 0) Avx2Math::fwht_block_inplace(row, static_cast<int>(ne0), static_cast<int>(h_qkv));
+                    if (h_qkv > 0) fwht_block_inplace_f64(row, static_cast<int>(ne0), static_cast<int>(h_qkv));
                 }
             } else if (is_turbo && (suf == "ffn_gate.weight" || suf == "ffn_up.weight")) {
                 const auto* g = fold_norms ? load_small_vec(p + "ffn_norm.weight") : nullptr;
                 #pragma omp parallel for schedule(static)
                 for (int64_t r = 0; r < n_rows; ++r) {
-                    float* row = buf.data() + static_cast<size_t>(r) * static_cast<size_t>(ne0);
+                    double* row = buf.data() + static_cast<size_t>(r) * static_cast<size_t>(ne0);
                     if (g && static_cast<int64_t>(g->size()) == ne0) {
                         for (int64_t c = 0; c < ne0; ++c) row[c] *= (*g)[static_cast<size_t>(c)];
                     }
-                    if (h_ffn > 0) Avx2Math::fwht_block_inplace(row, static_cast<int>(ne0), static_cast<int>(h_ffn));
+                    if (h_ffn > 0) fwht_block_inplace_f64(row, static_cast<int>(ne0), static_cast<int>(h_ffn));
                 }
             } else if (is_turbo && h_ffn_dn > 0 && suf == "ffn_down.weight") {
                 #pragma omp parallel for schedule(static)
                 for (int64_t r = 0; r < n_rows; ++r) {
-                    float* row = buf.data() + static_cast<size_t>(r) * static_cast<size_t>(ne0);
-                    Avx2Math::fwht_block_inplace(row, static_cast<int>(ne0), static_cast<int>(h_ffn_dn));
+                    double* row = buf.data() + static_cast<size_t>(r) * static_cast<size_t>(ne0);
+                    fwht_block_inplace_f64(row, static_cast<int>(ne0), static_cast<int>(h_ffn_dn));
                 }
             } else if (is_turbo && h_moe_in > 0 &&
                        (suf == "ffn_gate_up_exps.weight" || suf == "ffn_gate_exps.weight" || suf == "ffn_up_exps.weight")) {
                 const auto* g = fold_norms ? load_small_vec(p + "pre_ffw_norm_2.weight") : nullptr;
                 #pragma omp parallel for schedule(static)
                 for (int64_t r = 0; r < n_rows; ++r) {
-                    float* row = buf.data() + static_cast<size_t>(r) * static_cast<size_t>(ne0);
+                    double* row = buf.data() + static_cast<size_t>(r) * static_cast<size_t>(ne0);
                     if (g && static_cast<int64_t>(g->size()) == ne0) {
                         for (int64_t c = 0; c < ne0; ++c) row[c] *= (*g)[static_cast<size_t>(c)];
                     }
-                    Avx2Math::fwht_block_inplace(row, static_cast<int>(ne0), static_cast<int>(h_moe_in));
+                    fwht_block_inplace_f64(row, static_cast<int>(ne0), static_cast<int>(h_moe_in));
                 }
             } else if (fold_scales && suf == "ffn_gate_inp.weight") {
                 const auto* rs = load_small_vec(p + "ffn_gate_inp.scale");
                 if (rs && static_cast<int64_t>(rs->size()) == ne0) {
                     for (int64_t r = 0; r < n_rows; ++r) {
-                        float* row = buf.data() + static_cast<size_t>(r) * static_cast<size_t>(ne0);
+                        double* row = buf.data() + static_cast<size_t>(r) * static_cast<size_t>(ne0);
                         for (int64_t c = 0; c < ne0; ++c) row[c] *= (*rs)[static_cast<size_t>(c)];
                     }
                 }
@@ -921,16 +960,16 @@ int main(int argc, char** argv) {
                 const int64_t rows_per_exp = (t.dims.size() >= 3 && t.dims[2] > 0) ? static_cast<int64_t>(t.dims[1]) : n_rows;
                 #pragma omp parallel for schedule(static)
                 for (int64_t r = 0; r < n_rows; ++r) {
-                    float* row = buf.data() + static_cast<size_t>(r) * static_cast<size_t>(ne0);
+                    double* row = buf.data() + static_cast<size_t>(r) * static_cast<size_t>(ne0);
                     if (ds && rows_per_exp > 0) {
                         size_t e = static_cast<size_t>(r / rows_per_exp);
                         if (e < ds->size()) {
-                            const float sc = (*ds)[e];
+                            const double sc = (*ds)[e];
                             for (int64_t c = 0; c < ne0; ++c) row[c] *= sc;
                         }
                     }
                     if (is_turbo && h_moe_dn > 0) {
-                        Avx2Math::fwht_block_inplace(row, static_cast<int>(ne0), static_cast<int>(h_moe_dn));
+                        fwht_block_inplace_f64(row, static_cast<int>(ne0), static_cast<int>(h_moe_dn));
                     }
                 }
             }
@@ -942,13 +981,13 @@ int main(int argc, char** argv) {
                 // Left-multiply each output head block [hd, ne0] by H_hd along the vertical (output) dimension
                 #pragma omp parallel for schedule(static)
                 for (int64_t c = 0; c < ne0; ++c) {
-                    std::vector<float> col(static_cast<size_t>(hd));
+                    std::vector<double> col(static_cast<size_t>(hd));
                     for (int h = 0; h < n_kv_h; ++h) {
                         const int64_t r0 = static_cast<int64_t>(h) * hd;
                         for (int i = 0; i < hd; ++i) {
                             col[static_cast<size_t>(i)] = buf[static_cast<size_t>(r0 + i) * static_cast<size_t>(ne0) + static_cast<size_t>(c)];
                         }
-                        Avx2Math::fwht_block_inplace(col.data(), hd, hd);
+                        fwht_block_inplace_f64(col.data(), hd, hd);
                         for (int i = 0; i < hd; ++i) {
                             buf[static_cast<size_t>(r0 + i) * static_cast<size_t>(ne0) + static_cast<size_t>(c)] = col[static_cast<size_t>(i)];
                         }
@@ -958,8 +997,8 @@ int main(int argc, char** argv) {
                 const int hd = layer_hd[lu];
                 #pragma omp parallel for schedule(static)
                 for (int64_t r = 0; r < n_rows; ++r) {
-                    float* row = buf.data() + static_cast<size_t>(r) * static_cast<size_t>(ne0);
-                    Avx2Math::fwht_block_inplace(row, static_cast<int>(ne0), hd);
+                    double* row = buf.data() + static_cast<size_t>(r) * static_cast<size_t>(ne0);
+                    fwht_block_inplace_f64(row, static_cast<int>(ne0), hd);
                 }
             }
 
@@ -971,7 +1010,7 @@ int main(int argc, char** argv) {
             }
         }
 
-        if (!encode_and_write_f32(out_f, t.type, buf)) {
+        if (!encode_and_write_f64(out_f, t.type, buf)) {
             std::cerr << "ERROR: Failed writing transformed tensor " << t.name << "\n";
             return 1;
         }

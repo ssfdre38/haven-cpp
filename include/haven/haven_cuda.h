@@ -11,9 +11,13 @@ namespace haven {
 
 struct CudaEngineConfig {
     int device_id = 0;
-    int max_seq_len = 2048;        // Static FP16 KV cache capacity per KV-owning layer
-    int max_prefill_chunk = 512;   // Max tokens per cuBLAS FP16 Tensor Core / grouped MoE prefill chunk
-    bool use_cuda_graph = true;    // Single-shot CUDA Graph capture for zero-launch-overhead B=1 decode
+    int max_seq_len = 2048;              // Static KV cache capacity per KV-owning layer
+    int max_prefill_chunk = 512;         // Max tokens per cuBLAS prefill / grouped MoE chunk
+    bool use_cuda_graph = true;          // Single-shot CUDA Graph capture for zero-launch-overhead B=1 decode
+    bool exact_fp32_activations = false; // Zero-quantization FP32-act GEMV (weights stay 4-bit in VRAM, zero Q8_1 error!)
+    bool fp32_kv_cache = false;          // Store K/V cache in full FP32 instead of FP16 (zero KV mantissa truncation!)
+    bool fp32_prefill = false;           // Dequantize W -> F32 + strict FP32 cuBLAS SGEMM prefill (zero FP16 truncation!)
+    bool host_resident_pleias = false;   // Keep Pleias per_layer_token_embd on host RAM (~2.1 GiB VRAM saved on E4B!)
     bool verbose = false;
 };
 

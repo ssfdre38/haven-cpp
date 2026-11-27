@@ -154,6 +154,10 @@ public:
     float get_speculative_acceptance_rate() const { return speculative_engine_.get_acceptance_rate(); }
     void set_speculative_enabled(bool enabled) { speculative_enabled_ = enabled; }
     bool is_speculative_enabled() const { return speculative_enabled_; }
+    // Exact FP32-Activation Math Mode: bypasses 8-bit Q8Act32 activation quantization across all projections
+    // while keeping weights compressed in native GGUF blocks (targets 0.999999+ / 1.0000 parity).
+    void set_exact_math(bool enabled) { exact_math_mode_ = enabled; }
+    bool is_exact_math() const { return exact_math_mode_; }
     SpeculativeEngine& get_speculative_engine() { return speculative_engine_; }
     const SpeculativeEngine& get_speculative_engine() const { return speculative_engine_; }
     std::string get_json_telemetry(int pos, uint32_t token) const { return telemetry_engine_.to_json_telemetry(pos, token); }
@@ -218,6 +222,7 @@ private:
     YaRNScaler yarn_scaler_;
     SpeculativeEngine speculative_engine_;
     bool speculative_enabled_ = false;
+    bool exact_math_mode_ = false;
     FlashAttentionCpu flash_attn_;
     ChunkedPrefillScheduler chunked_prefill_;
     
@@ -296,6 +301,7 @@ HAVEN_API size_t haven_prune_kv_cache(void* engine);
 HAVEN_API float  haven_get_attention_entropy(void* engine);
 HAVEN_API void   haven_set_persona(void* engine, const float* persona_vector, int dim);
 HAVEN_API void   haven_set_yarn_scale(void* engine, float scale);
+HAVEN_API void   haven_set_exact_math(void* engine, bool enabled);
 HAVEN_API uint64_t haven_fork_sequence(void* engine, uint64_t parent_id, uint64_t child_id);
 HAVEN_API float  haven_get_speculative_rate(void* engine);
 HAVEN_API void   haven_forward(void* engine, uint32_t token, int pos, float* out_logits, uint32_t active_cluster);

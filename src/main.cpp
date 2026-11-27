@@ -220,6 +220,8 @@ int main(int argc, char** argv) {
     bool run_benchmark = false;
     bool use_cuda_gpu = false;
     bool force_cpu = false;
+    bool exact_math = false;
+    bool host_pleias = false;
     bool inspect_only = false;
     bool inspect_json = false;
 
@@ -231,6 +233,10 @@ int main(int argc, char** argv) {
             use_cuda_gpu = true;
         } else if (arg == "--cpu") {
             force_cpu = true;
+        } else if (arg == "--exact") {
+            exact_math = true;
+        } else if (arg == "--host-pleias") {
+            host_pleias = true;
         } else if (arg == "--inspect" || arg == "-i") {
             inspect_only = true;
         } else if (arg == "--inspect-json") {
@@ -244,6 +250,8 @@ int main(int argc, char** argv) {
                       << "  --inspect-json  Machine-readable JSON output for --inspect\n"
                       << "  --gpu, --cuda   Accelerate interactive chat with native zero-compile CUDA backend\n"
                       << "  --cpu           Force native AVX2+FMA CPU backend\n"
+                      << "  --exact         Enable exact FP32-activation math (+ FP32 KV/prefill on CUDA) for 0.999999+ parity\n"
+                      << "  --host-pleias   Keep Gemma 4 Pleias token table on host RAM (~2.1 GiB VRAM saved on E4B)\n"
                       << "  --bench, -b     Run 12-system enterprise benchmark suite\n"
                       << "  --tpu, -t       Run TPU fabric & Pathways asynchronous accelerator benchmark\n"
                       << "  --help, -h      Display this help menu\n";
@@ -313,6 +321,8 @@ int main(int argc, char** argv) {
     // Unified 4-call Compute Session driven directly by HavenModelIntelligence
     haven::SessionConfig scfg;
     scfg.max_seq_len = 4096;
+    scfg.exact_math = exact_math;
+    scfg.host_resident_pleias = host_pleias;
     if (!intel_ready) {
         intel_plan.selected_backend = use_cuda_gpu ? haven::BackendKind::CUDA_NATIVE : haven::BackendKind::CPU_AVX2;
     }

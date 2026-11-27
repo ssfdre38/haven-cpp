@@ -241,11 +241,12 @@ static int run_synthetic_multi_arch_ir_suite() {
         std::vector<int> replicas = test_r8 ? std::vector<int>{1, 4, 8} : std::vector<int>{1, 4};
         for (int R : replicas) {
             for (int B : {1, 16, 128}) {
-                // Precision modes: 0=BF16, 1=INT8, 2=INT8+FP8KV, 3=W4A16-INT4
-                for (int mode = 0; mode < 4; ++mode) {
+                // Precision modes: 0=BF16, 1=INT8, 2=INT8+FP8KV, 3=W4A16-INT4, 4=BF16+F32KV
+                for (int mode = 0; mode < 5; ++mode) {
                     const bool i8     = (mode == 1 || mode == 2);
                     const bool i4     = (mode == 3);
                     const bool kv_fp8 = (mode == 2);
+                    const bool kv_f32 = (mode == 4);
                     TpuGemma4Config cfg;
                     cfg.batch_size = B;
                     cfg.max_seq_len = 2048;
@@ -254,10 +255,11 @@ static int run_synthetic_multi_arch_ir_suite() {
                     cfg.use_int8_weights = i8;
                     cfg.use_int4_weights = i4;
                     cfg.use_fp8_kv = kv_fp8;
+                    cfg.use_f32_kv = kv_f32;
                     cfg.use_onchip_embeddings = true;
                     cfg.return_full_logits = (B == 1);
 
-                    const char* mstr = i4 ? " W4A16" : (i8 ? (kv_fp8 ? " INT8+FP8KV" : " INT8") : " BF16");
+                    const char* mstr = i4 ? " W4A16" : (i8 ? (kv_fp8 ? " INT8+FP8KV" : " INT8") : (kv_f32 ? " BF16+F32KV" : " BF16"));
 
                     // 1. Decode graph (per-slot scatter when B > 1)
                     std::string dec_ir = HavenTpuGemma4Engine::emit_stablehlo_mlir(ac.mc, cfg, 1, false);
@@ -280,7 +282,7 @@ static int run_synthetic_multi_arch_ir_suite() {
                 }
             }
         }
-        std::cout << "  [PASS] " << ac.name << " (R=" << (test_r8 ? "1,4,8" : "1,4") << " | B=1,16,128 | BF16,INT8,INT8+FP8KV,W4A16 | Decode + Slot-Prefill S=8,16,32,128)\n";
+        std::cout << "  [PASS] " << ac.name << " (R=" << (test_r8 ? "1,4,8" : "1,4") << " | B=1,16,128 | BF16,BF16+F32KV,INT8,INT8+FP8KV,W4A16 | Decode + Slot-Prefill S=8,16,32,128)\n";
     }
 
     std::cout << "ALL " << total_checks << " SYNTHETIC MULTI-ARCH STABLEHLO GRAPHS VERIFIED!\n";

@@ -380,7 +380,7 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
     if (token_embd_tensor_ && token < cfg.vocab_size) {
         Avx2Math::dequantize_row(embedding_scratch_.data(), *token_embd_tensor_, static_cast<int>(token), static_cast<int>(cfg.embedding_dim));
         if (cfg.is_gemma) {
-            float emb_scale = std::sqrt((float)cfg.embedding_dim);
+            const float emb_scale = static_cast<float>(std::sqrt(static_cast<double>(cfg.embedding_dim)));
             for (size_t i = 0; i < cfg.embedding_dim; ++i) {
                 embedding_scratch_[i] *= emb_scale;
             }
@@ -395,22 +395,26 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
     if (per_layer_token_embd_tensor_ && token < cfg.vocab_size && !per_layer_emb_scratch_.empty()) {
         Avx2Math::dequantize_row(per_layer_emb_scratch_.data(), *per_layer_token_embd_tensor_, static_cast<int>(token), (int)per_layer_emb_scratch_.size());
         
-        const float tok_scale = std::sqrt(256.0f); // sqrt(n_embd_per_layer) = 16.0f
+        const float tok_scale = 16.0f; // sqrt(n_embd_per_layer) = sqrt(256) = 16.0f exact
         for (size_t i = 0; i < per_layer_emb_scratch_.size(); ++i) {
             per_layer_emb_scratch_[i] *= tok_scale;
         }
 
         if (per_layer_model_proj_tensor_ && !per_layer_proj_scratch_.empty()) {
-            Avx2Math::gemv(per_layer_proj_scratch_.data(), *per_layer_model_proj_tensor_, embedding_scratch_.data(), (int)per_layer_proj_scratch_.size(), cfg.embedding_dim);
+            if (exact_math_mode_) {
+                Avx2Math::gemv_f32(per_layer_proj_scratch_.data(), *per_layer_model_proj_tensor_, embedding_scratch_.data(), (int)per_layer_proj_scratch_.size(), cfg.embedding_dim);
+            } else {
+                Avx2Math::gemv(per_layer_proj_scratch_.data(), *per_layer_model_proj_tensor_, embedding_scratch_.data(), (int)per_layer_proj_scratch_.size(), cfg.embedding_dim);
+            }
             
-            float proj_scale = 1.0f / std::sqrt((float)cfg.embedding_dim);
+            const float proj_scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(cfg.embedding_dim)));
             for (size_t i = 0; i < per_layer_proj_scratch_.size(); ++i) {
                 per_layer_proj_scratch_[i] *= proj_scale;
             }
             
             const float* proj_norm_w = safe_f32_weights(per_layer_proj_norm_tensor_, 256);
             
-            const float input_scale = 1.0f / std::sqrt(2.0f);
+            const float input_scale = static_cast<float>(1.0 / std::sqrt(2.0));
             for (uint32_t l = 0; l < cfg.num_layers; ++l) {
                 float* p_slice = per_layer_proj_scratch_.data() + l * 256;
                 float* e_slice = per_layer_emb_scratch_.data() + l * 256;
@@ -465,8 +469,8 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         const float attn_scale = cfg.is_gemma4
             ? 1.0f
             : (cfg.query_pre_attn_scalar > 0.0f
-                ? (1.0f / std::sqrt(cfg.query_pre_attn_scalar))
-                : (1.0f / std::sqrt((float)actual_head_dim)));
+                ? static_cast<float>(1.0 / std::sqrt(static_cast<double>(cfg.query_pre_attn_scalar)))
+                : static_cast<float>(1.0 / std::sqrt(static_cast<double>(actual_head_dim))));
         const int gqa_ratio = std::max(1u, cfg.num_heads / std::max(1u, layer_n_kv_heads));
 
         // 2a. Pre-Attention RMSNorm (+ optional Gemma 4.5 Turbo Block-FWHT)
@@ -499,7 +503,7 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         const Avx2Math::DotRowQ8Fn k_fn = k_ok ? Avx2Math::get_dot_row_q8_fn(eff_k->type, D_emb) : nullptr;
         const Avx2Math::DotRowQ8Fn v_fn = v_ok ? Avx2Math::get_dot_row_q8_fn(eff_v->type, D_emb) : nullptr;
 
-        if (q_ok && q_fn && (!eff_k || (k_ok && k_fn)) && (!eff_v || (v_ok && v_fn))) {
+        if (!exact_math_mode_ && q_ok && q_fn && (!eff_k || (k_ok && k_fn)) && (!eff_v || (v_ok && v_fn))) {
             Q8Act32 qkv_act;
             Avx2Math::quantize_q8_act(norm_scratch_.data(), D_emb, qkv_act);
             const int n_k = eff_k ? kv_dim : 0;
@@ -530,22 +534,26 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
                 std::memcpy(v_scratch_.data(), k_scratch_.data(), static_cast<size_t>(kv_dim) * sizeof(float));
             }
         } else {
+            auto run_gemv = [&](float* dst, const TensorDesc& w, const float* src, int rows, int cols) {
+                if (exact_math_mode_) Avx2Math::gemv_f32(dst, w, src, rows, cols);
+                else                  Avx2Math::gemv(dst, w, src, rows, cols);
+            };
             if (lt.attn_q) {
-                Avx2Math::gemv(q_scratch_.data(), *lt.attn_q, norm_scratch_.data(), q_dim, D_emb);
+                run_gemv(q_scratch_.data(), *lt.attn_q, norm_scratch_.data(), q_dim, D_emb);
                 if (lt.attn_q_bias) Avx2Math::add_bias(q_scratch_.data(), *lt.attn_q_bias, q_dim);
             } else {
                 for (int i = 0; i < q_dim; ++i) q_scratch_[i] = norm_scratch_[i % cfg.embedding_dim];
             }
 
             if (eff_k) {
-                Avx2Math::gemv(k_scratch_.data(), *eff_k, norm_scratch_.data(), kv_dim, D_emb);
+                run_gemv(k_scratch_.data(), *eff_k, norm_scratch_.data(), kv_dim, D_emb);
                 if (lt.attn_k_bias) Avx2Math::add_bias(k_scratch_.data(), *lt.attn_k_bias, kv_dim);
             } else if (!is_shared_kv) {
                 for (int i = 0; i < kv_dim; ++i) k_scratch_[i] = norm_scratch_[i % cfg.embedding_dim];
             }
 
             if (eff_v) {
-                Avx2Math::gemv(v_scratch_.data(), *eff_v, norm_scratch_.data(), kv_dim, D_emb);
+                run_gemv(v_scratch_.data(), *eff_v, norm_scratch_.data(), kv_dim, D_emb);
                 if (lt.attn_v_bias) Avx2Math::add_bias(v_scratch_.data(), *lt.attn_v_bias, kv_dim);
             } else if (eff_k) {
                 // Gemma 4 k_eq_v: V shares raw K projection prior to K-norm and RoPE
@@ -655,7 +663,8 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
 
         // 2f. Attention Output Projection
         if (lt.attn_output) {
-            Avx2Math::gemv(attn_out_scratch_.data(), *lt.attn_output, attn_heads_out_scratch_.data(), cfg.embedding_dim, q_dim);
+            if (exact_math_mode_) Avx2Math::gemv_f32(attn_out_scratch_.data(), *lt.attn_output, attn_heads_out_scratch_.data(), cfg.embedding_dim, q_dim);
+            else                  Avx2Math::gemv(attn_out_scratch_.data(), *lt.attn_output, attn_heads_out_scratch_.data(), cfg.embedding_dim, q_dim);
         } else {
             for (size_t i = 0; i < cfg.embedding_dim; ++i) attn_out_scratch_[i] = attn_heads_out_scratch_[i % q_dim];
         }
@@ -698,7 +707,7 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
             const Avx2Math::DotRowQ8Fn ffn_u_fn = ffn_u_ok ? Avx2Math::get_dot_row_q8_fn(lt.ffn_up->type,   D_emb) : nullptr;
             const Avx2Math::DotRowQ8Fn ffn_d_fn = ffn_d_ok ? Avx2Math::get_dot_row_q8_fn(lt.ffn_down->type, F_hid) : nullptr;
 
-            if (ffn_g_fn && ffn_u_fn && ffn_d_fn) {
+            if (!exact_math_mode_ && ffn_g_fn && ffn_u_fn && ffn_d_fn) {
                 Q8Act32 ffn_in_act;
                 Q8Act32 ffn_mid_act;
                 Avx2Math::quantize_q8_act(norm_scratch_.data(), D_emb, ffn_in_act);
@@ -714,9 +723,10 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
                     for (int r = 0; r < F_hid; ++r) {
                         const float g = ffn_g_fn(g_data, static_cast<size_t>(r), ffn_in_act, D_emb);
                         const float u = ffn_u_fn(u_data, static_cast<size_t>(r), ffn_in_act, D_emb);
+                        const double gd = static_cast<double>(g);
                         const float act = use_gelu
-                            ? (0.5f * g * (1.0f + std::tanh(0.7978845608f * (g + 0.044715f * g * g * g))))
-                            : (g / (1.0f + std::exp(-g)));
+                            ? static_cast<float>(0.5 * gd * (1.0 + std::tanh(0.79788456080286535588 * (gd + 0.044715 * gd * gd * gd))))
+                            : static_cast<float>(gd / (1.0 + std::exp(-gd)));
                         ffn_gate_scratch_[static_cast<size_t>(r)] = act * u;
                     }
 
@@ -734,9 +744,13 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
                     }
                 }
             } else {
+                auto run_gemv = [&](float* dst, const TensorDesc& w, const float* src, int rows, int cols) {
+                    if (exact_math_mode_) Avx2Math::gemv_f32(dst, w, src, rows, cols);
+                    else                  Avx2Math::gemv(dst, w, src, rows, cols);
+                };
                 if (lt.ffn_gate && lt.ffn_up) {
-                    Avx2Math::gemv(ffn_gate_scratch_.data(), *lt.ffn_gate, norm_scratch_.data(), F_hid, D_emb);
-                    Avx2Math::gemv(ffn_up_scratch_.data(), *lt.ffn_up, norm_scratch_.data(), F_hid, D_emb);
+                    run_gemv(ffn_gate_scratch_.data(), *lt.ffn_gate, norm_scratch_.data(), F_hid, D_emb);
+                    run_gemv(ffn_up_scratch_.data(), *lt.ffn_up, norm_scratch_.data(), F_hid, D_emb);
                     if (cfg.ffn_activation == FfnActivation::GELU) {
                         Avx2Math::gelu(ffn_gate_scratch_.data(), F_hid);
                     } else {
@@ -754,7 +768,7 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
                     if (cfg.turbo_hadamard_ffn_down > 0 && (F_hid % static_cast<int>(cfg.turbo_hadamard_ffn_down)) == 0) {
                         Avx2Math::fwht_block_inplace(ffn_gate_scratch_.data(), F_hid, static_cast<int>(cfg.turbo_hadamard_ffn_down));
                     }
-                    Avx2Math::gemv(ffn_down_scratch_.data(), *lt.ffn_down, ffn_gate_scratch_.data(), D_emb, F_hid);
+                    run_gemv(ffn_down_scratch_.data(), *lt.ffn_down, ffn_gate_scratch_.data(), D_emb, F_hid);
                 } else {
                     for (int i = 0; i < D_emb; ++i) ffn_down_scratch_[static_cast<size_t>(i)] = ffn_gate_scratch_[static_cast<size_t>(i % F_hid)] * 0.05f;
                 }
@@ -775,12 +789,13 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
 
             // Router input: parameter-free RMSNorm(attn_out) * (1 / sqrt(D)) * ffn_gate_inp.scale
             Avx2Math::rms_norm(moe_norm_scratch_.data(), embedding_scratch_.data(), default_norm_weights_.data(), D_emb, cfg.rms_norm_eps);
-            const float inv_sqrt_d = 1.0f / std::sqrt(static_cast<float>(cfg.embedding_dim));
+            const float inv_sqrt_d = static_cast<float>(1.0 / std::sqrt(static_cast<double>(cfg.embedding_dim)));
             const float* rscale = (!cfg.turbo_folded_scales && lt.ffn_gate_inp_scale) ? safe_f32_weights(lt.ffn_gate_inp_scale, cfg.embedding_dim) : nullptr;
             for (size_t i = 0; i < cfg.embedding_dim; ++i) {
                 moe_norm_scratch_[i] *= inv_sqrt_d * (rscale ? rscale[i] : 1.0f);
             }
-            Avx2Math::gemv(moe_router_scratch_.data(), *lt.ffn_gate_inp, moe_norm_scratch_.data(), E, D_emb);
+            // Always use exact FP32-activation GEMV for the sensitive E=128 MoE router (<30 us, prevents expert misrouting!)
+            Avx2Math::gemv_f32(moe_router_scratch_.data(), *lt.ffn_gate_inp, moe_norm_scratch_.data(), E, D_emb);
             Avx2Math::softmax(moe_router_scratch_.data(), E);
 
             // Stack-backed Top-K expert selection & renormalization (zero heap alloc for E <= 256, K_used <= 64)
@@ -795,9 +810,9 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
             std::partial_sort(exp_idx, exp_idx + K_used, exp_idx + E,
                 [&](int a, int b) { return moe_router_scratch_[static_cast<size_t>(a)] > moe_router_scratch_[static_cast<size_t>(b)]; });
 
-            float w_sum = 0.0f;
-            for (int k = 0; k < K_used; ++k) w_sum += moe_router_scratch_[static_cast<size_t>(exp_idx[k])];
-            if (w_sum < 6.103515625e-5f) w_sum = 6.103515625e-5f;
+            double w_sum = 0.0;
+            for (int k = 0; k < K_used; ++k) w_sum += static_cast<double>(moe_router_scratch_[static_cast<size_t>(exp_idx[k])]);
+            if (w_sum < 6.103515625e-5) w_sum = 6.103515625e-5;
 
             // Pre-FFN norm 2 on attn_out for sparse experts (fall back to ffn_norm for pure-MoE models without pre_ffw_norm_2)
             const TensorDesc* pre2_tensor = lt.pre_ffw_norm_2 ? lt.pre_ffw_norm_2 : lt.ffn_norm;
@@ -817,7 +832,7 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
             }
             for (int k = 0; k < K_used; ++k) {
                 const int e = exp_idx[k];
-                w_exp[k] = (moe_router_scratch_[static_cast<size_t>(e)] / w_sum) * (down_s ? down_s[e] : 1.0f);
+                w_exp[k] = static_cast<float>((static_cast<double>(moe_router_scratch_[static_cast<size_t>(e)]) / w_sum) * (down_s ? static_cast<double>(down_s[e]) : 1.0));
             }
 
             const size_t gu_stride = static_cast<size_t>(K_used) * static_cast<size_t>(2 * F_exp);
@@ -862,8 +877,8 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
                     ? Avx2Math::get_dot_row_q8_fn(lt.ffn_up_exps->type, D_int) : nullptr;
                 const Avx2Math::DotRowQ8Fn dn_fn = Avx2Math::get_dot_row_q8_fn(lt.ffn_down_exps->type, F_exp);
 
-                const bool use_q8_gu = lt.ffn_gate_up_exps ? (gu_fn != nullptr) : (g_exp_fn != nullptr && u_exp_fn != nullptr);
-                const bool use_q8_dn = (dn_fn != nullptr);
+                const bool use_q8_gu = !exact_math_mode_ && (lt.ffn_gate_up_exps ? (gu_fn != nullptr) : (g_exp_fn != nullptr && u_exp_fn != nullptr));
+                const bool use_q8_dn = !exact_math_mode_ && (dn_fn != nullptr);
 
                 Q8Act32 moe_in_act;
                 if (use_q8_gu) {
@@ -1025,7 +1040,7 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
             const Avx2Math::DotRowQ8Fn ig_fn = ig_ok ? Avx2Math::get_dot_row_q8_fn(lt.inp_gate->type, D_emb) : nullptr;
             const Avx2Math::DotRowQ8Fn pr_fn = pr_ok ? Avx2Math::get_dot_row_q8_fn(lt.proj->type, 256) : nullptr;
 
-            if (ig_fn && pr_fn) {
+            if (!exact_math_mode_ && ig_fn && pr_fn) {
                 Q8Act32 pl_in_act;
                 Q8Act32 pl_mid_act;
                 Avx2Math::quantize_q8_act(embedding_scratch_.data(), D_emb, pl_in_act);
@@ -1035,9 +1050,9 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
                 {
                     #pragma omp for schedule(static)
                     for (int i = 0; i < 256; ++i) {
-                        const float g = ig_fn(ig_data, static_cast<size_t>(i), pl_in_act, D_emb);
-                        const float cdf = 0.5f * (1.0f + std::tanh(0.7978845608f * (g + 0.044715f * g * g * g)));
-                        pleias_gate[i] = (g * cdf) * layer_emb_slice[i];
+                        const double g = static_cast<double>(ig_fn(ig_data, static_cast<size_t>(i), pl_in_act, D_emb));
+                        const double cdf = 0.5 * (1.0 + std::tanh(0.79788456080286535588 * (g + 0.044715 * g * g * g)));
+                        pleias_gate[i] = static_cast<float>((g * cdf) * static_cast<double>(layer_emb_slice[i]));
                     }
                     #pragma omp single
                     {
@@ -1049,12 +1064,14 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
                     }
                 }
             } else {
-                Avx2Math::gemv(pleias_gate, *lt.inp_gate, embedding_scratch_.data(), 256, D_emb);
+                if (exact_math_mode_) Avx2Math::gemv_f32(pleias_gate, *lt.inp_gate, embedding_scratch_.data(), 256, D_emb);
+                else                  Avx2Math::gemv(pleias_gate, *lt.inp_gate, embedding_scratch_.data(), 256, D_emb);
                 Avx2Math::gelu(pleias_gate, 256);
                 for (int i = 0; i < 256; ++i) {
                     pleias_gate[i] *= layer_emb_slice[i];
                 }
-                Avx2Math::gemv(pleias_proj, *lt.proj, pleias_gate, D_emb, 256);
+                if (exact_math_mode_) Avx2Math::gemv_f32(pleias_proj, *lt.proj, pleias_gate, D_emb, 256);
+                else                  Avx2Math::gemv(pleias_proj, *lt.proj, pleias_gate, D_emb, 256);
             }
 
             if (lt.post_norm) {
@@ -1096,7 +1113,8 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
         tpu_backend_->matmul_resident_nt(norm_scratch_.data(), 1, tpu_lm_head_, out_logits)) {
         // Computed 262k LM head directly on TPU HBM3 + MXU
     } else if (output_tensor_) {
-        Avx2Math::gemv(out_logits, *output_tensor_, norm_scratch_.data(), cfg.vocab_size, cfg.embedding_dim);
+        if (exact_math_mode_) Avx2Math::gemv_f32(out_logits, *output_tensor_, norm_scratch_.data(), cfg.vocab_size, cfg.embedding_dim);
+        else                  Avx2Math::gemv(out_logits, *output_tensor_, norm_scratch_.data(), cfg.vocab_size, cfg.embedding_dim);
     } else {
         for (size_t v = 0; v < cfg.vocab_size; ++v) {
             out_logits[v] = std::sin((float)v * 0.05f) * norm_scratch_[v % cfg.embedding_dim];
@@ -1109,8 +1127,18 @@ void HavenEngine::forward(uint32_t token, int pos, float* out_logits, uint32_t a
     }
 }
 
-// Fast AVX2 GeGLU activation: dst[i] = gelu_tanh(gate[i]) * up[i] using [7/6] Pade tanh (~1e-6 accuracy)
-static inline void geglu_avx2_range(float* dst, const float* gate, const float* up, int n) {
+// Fast AVX2 GeGLU activation: dst[i] = gelu_tanh(gate[i]) * up[i]
+// Uses [7/6] Pade tanh in fast mode, or exact FP64 std::tanh in exact_math mode.
+static inline void geglu_avx2_range(float* dst, const float* gate, const float* up, int n, bool exact_math = false) {
+    if (exact_math) {
+        constexpr double s2pi = 0.79788456080286535588;
+        for (int i = 0; i < n; ++i) {
+            const double g = static_cast<double>(gate[i]);
+            const double act = 0.5 * g * (1.0 + std::tanh(s2pi * (g + 0.044715 * g * g * g)));
+            dst[i] = static_cast<float>(act * static_cast<double>(up[i]));
+        }
+        return;
+    }
     const __m256 c_half   = _mm256_set1_ps(0.5f);
     const __m256 c_one    = _mm256_set1_ps(1.0f);
     const __m256 c_neg1   = _mm256_set1_ps(-1.0f);
@@ -1140,9 +1168,9 @@ static inline void geglu_avx2_range(float* dst, const float* gate, const float* 
         _mm256_storeu_ps(dst + i, _mm256_mul_ps(act, u));
     }
     for (; i < n; ++i) {
-        const float g = gate[i];
-        const float act = 0.5f * g * (1.0f + std::tanh(0.7978845608f * (g + 0.044715f * g * g * g)));
-        dst[i] = act * up[i];
+        const double g = static_cast<double>(gate[i]);
+        const double act = 0.5 * g * (1.0 + std::tanh(0.79788456080286535588 * (g + 0.044715 * g * g * g)));
+        dst[i] = static_cast<float>(act * static_cast<double>(up[i]));
     }
 }
 
@@ -1241,7 +1269,7 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
         const bool is_last_chunk = (chunk_off + S == n_tokens);
 
         // 1. Batched Token Embedding Lookup
-        const float emb_scale = cfg.is_gemma ? std::sqrt(static_cast<float>(D)) : 1.0f;
+        const float emb_scale = cfg.is_gemma ? static_cast<float>(std::sqrt(static_cast<double>(D))) : 1.0f;
         #pragma omp parallel for if(S >= 8) schedule(static)
         for (int t = 0; t < S; ++t) {
             const uint32_t tok = tokens[chunk_off + t];
@@ -1258,7 +1286,7 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
 
         // 1a-2. Batched Pleias Per-Layer Embeddings + Batched BF16 Projection
         if (has_pleias_branch) {
-            const float tok_scale = std::sqrt(256.0f);
+            const float tok_scale = 16.0f;
             #pragma omp parallel for if(S >= 4) schedule(static)
             for (int t = 0; t < S; ++t) {
                 const uint32_t tok = tokens[chunk_off + t];
@@ -1272,9 +1300,10 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
             }
 
             if (per_layer_model_proj_tensor_) {
-                Avx2Math::gemm(pl_proj_buf.data(), pleias_total, *per_layer_model_proj_tensor_, X.data(), D, S, pleias_total, D);
-                const float proj_scale = 1.0f / std::sqrt(static_cast<float>(D));
-                const float input_scale = 1.0f / std::sqrt(2.0f);
+                if (exact_math_mode_) Avx2Math::gemm_f32(pl_proj_buf.data(), pleias_total, *per_layer_model_proj_tensor_, X.data(), D, S, pleias_total, D);
+                else                  Avx2Math::gemm(pl_proj_buf.data(), pleias_total, *per_layer_model_proj_tensor_, X.data(), D, S, pleias_total, D);
+                const float proj_scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(D)));
+                const float input_scale = static_cast<float>(1.0 / std::sqrt(2.0));
                 const float* proj_norm_w = safe_f32_weights(per_layer_proj_norm_tensor_, 256);
 
                 #pragma omp parallel for schedule(static)
@@ -1321,8 +1350,8 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
             const float attn_scale = cfg.is_gemma4
                 ? 1.0f
                 : (cfg.query_pre_attn_scalar > 0.0f
-                    ? (1.0f / std::sqrt(cfg.query_pre_attn_scalar))
-                    : (1.0f / std::sqrt(static_cast<float>(actual_head_dim))));
+                    ? static_cast<float>(1.0 / std::sqrt(static_cast<double>(cfg.query_pre_attn_scalar)))
+                    : static_cast<float>(1.0 / std::sqrt(static_cast<double>(actual_head_dim))));
             const int gqa_ratio = std::max(1u, cfg.num_heads / std::max(1u, layer_n_kv_heads));
 
             // 2a. Batched Pre-Attention RMSNorm (+ optional Gemma 4.5 Turbo Block-FWHT)
@@ -1357,34 +1386,38 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
             const bool k_q832 = !eff_k || Avx2Math::supports_q8_32_gemm(eff_k->type, D);
             const bool v_q832 = !eff_v || Avx2Math::supports_q8_32_gemm(eff_v->type, D);
 
-            if (q_q8k && k_q8k && v_q8k) {
+            if (!exact_math_mode_ && q_q8k && k_q8k && v_q8k) {
                 Q8KBatch qkv_batch;
                 Avx2Math::pack_q8k_batch(norm_buf.data(), D, D, S, qkv_batch);
                 Avx2Math::gemm_slice_q8k(q_buf.data(), q_dim, *lt.attn_q, 0, qkv_batch, q_dim, D, true);
                 if (eff_k) Avx2Math::gemm_slice_q8k(k_buf.data(), kv_dim, *eff_k, 0, qkv_batch, kv_dim, D, true);
                 if (eff_v) Avx2Math::gemm_slice_q8k(v_buf.data(), kv_dim, *eff_v, 0, qkv_batch, kv_dim, D, true);
-            } else if (q_q832 && k_q832 && v_q832) {
+            } else if (!exact_math_mode_ && q_q832 && k_q832 && v_q832) {
                 Q8_32Batch qkv_batch;
                 Avx2Math::pack_q8_32_batch(norm_buf.data(), D, D, S, qkv_batch);
                 Avx2Math::gemm_slice_q8_32(q_buf.data(), q_dim, *lt.attn_q, 0, qkv_batch, q_dim, D, true);
                 if (eff_k) Avx2Math::gemm_slice_q8_32(k_buf.data(), kv_dim, *eff_k, 0, qkv_batch, kv_dim, D, true);
                 if (eff_v) Avx2Math::gemm_slice_q8_32(v_buf.data(), kv_dim, *eff_v, 0, qkv_batch, kv_dim, D, true);
             } else {
-                if (lt.attn_q) Avx2Math::gemm(q_buf.data(), q_dim, *lt.attn_q, norm_buf.data(), D, S, q_dim, D);
+                auto run_gemm = [&](float* Y, int sy, const TensorDesc& w, const float* Xin, int sx, int nt, int rows, int cols) {
+                    if (exact_math_mode_) Avx2Math::gemm_f32(Y, sy, w, Xin, sx, nt, rows, cols);
+                    else                  Avx2Math::gemm(Y, sy, w, Xin, sx, nt, rows, cols);
+                };
+                if (lt.attn_q) run_gemm(q_buf.data(), q_dim, *lt.attn_q, norm_buf.data(), D, S, q_dim, D);
                 else {
                     for (int t = 0; t < S; ++t)
                         for (int i = 0; i < q_dim; ++i)
                             q_buf[static_cast<size_t>(t) * static_cast<size_t>(q_dim) + static_cast<size_t>(i)] =
                                 norm_buf[static_cast<size_t>(t) * static_cast<size_t>(D) + static_cast<size_t>(i % D)];
                 }
-                if (eff_k) Avx2Math::gemm(k_buf.data(), kv_dim, *eff_k, norm_buf.data(), D, S, kv_dim, D);
+                if (eff_k) run_gemm(k_buf.data(), kv_dim, *eff_k, norm_buf.data(), D, S, kv_dim, D);
                 else if (!is_shared_kv) {
                     for (int t = 0; t < S; ++t)
                         for (int i = 0; i < kv_dim; ++i)
                             k_buf[static_cast<size_t>(t) * static_cast<size_t>(kv_dim) + static_cast<size_t>(i)] =
                                 norm_buf[static_cast<size_t>(t) * static_cast<size_t>(D) + static_cast<size_t>(i % D)];
                 }
-                if (eff_v) Avx2Math::gemm(v_buf.data(), kv_dim, *eff_v, norm_buf.data(), D, S, kv_dim, D);
+                if (eff_v) run_gemm(v_buf.data(), kv_dim, *eff_v, norm_buf.data(), D, S, kv_dim, D);
             }
 
             if (lt.attn_q_bias || (eff_k && lt.attn_k_bias) || (eff_v && lt.attn_v_bias) || (eff_k && !eff_v) || (!eff_v && !eff_k && !is_shared_kv)) {
@@ -1535,7 +1568,8 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
 
             // 2f. Batched Attention Output Projection + Post-Attention Norm + Residual 1
             if (lt.attn_output) {
-                Avx2Math::gemm(attn_out_buf.data(), D, *lt.attn_output, attn_heads_buf.data(), q_dim, S, D, q_dim);
+                if (exact_math_mode_) Avx2Math::gemm_f32(attn_out_buf.data(), D, *lt.attn_output, attn_heads_buf.data(), q_dim, S, D, q_dim);
+                else                  Avx2Math::gemm(attn_out_buf.data(), D, *lt.attn_output, attn_heads_buf.data(), q_dim, S, D, q_dim);
             } else {
                 for (int t = 0; t < S; ++t)
                     for (int i = 0; i < D; ++i)
@@ -1572,16 +1606,19 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
                 std::memset(ffn_down_buf.data(), 0, static_cast<size_t>(S) * static_cast<size_t>(D) * sizeof(float));
             } else {
                 if (lt.ffn_gate && lt.ffn_up) {
-                    if (Avx2Math::supports_q8k_gemm(lt.ffn_gate->type, D) && Avx2Math::supports_q8k_gemm(lt.ffn_up->type, D)) {
+                    if (!exact_math_mode_ && Avx2Math::supports_q8k_gemm(lt.ffn_gate->type, D) && Avx2Math::supports_q8k_gemm(lt.ffn_up->type, D)) {
                         Q8KBatch ffn_batch;
                         Avx2Math::pack_q8k_batch(norm_buf.data(), D, D, S, ffn_batch);
                         Avx2Math::gemm_slice_q8k(ffn_gate_buf.data(), layer_F, *lt.ffn_gate, 0, ffn_batch, layer_F, D, true);
                         Avx2Math::gemm_slice_q8k(ffn_up_buf.data(),   layer_F, *lt.ffn_up,   0, ffn_batch, layer_F, D, true);
-                    } else if (Avx2Math::supports_q8_32_gemm(lt.ffn_gate->type, D) && Avx2Math::supports_q8_32_gemm(lt.ffn_up->type, D)) {
+                    } else if (!exact_math_mode_ && Avx2Math::supports_q8_32_gemm(lt.ffn_gate->type, D) && Avx2Math::supports_q8_32_gemm(lt.ffn_up->type, D)) {
                         Q8_32Batch ffn_batch;
                         Avx2Math::pack_q8_32_batch(norm_buf.data(), D, D, S, ffn_batch);
                         Avx2Math::gemm_slice_q8_32(ffn_gate_buf.data(), layer_F, *lt.ffn_gate, 0, ffn_batch, layer_F, D, true);
                         Avx2Math::gemm_slice_q8_32(ffn_up_buf.data(),   layer_F, *lt.ffn_up,   0, ffn_batch, layer_F, D, true);
+                    } else if (exact_math_mode_) {
+                        Avx2Math::gemm_f32(ffn_gate_buf.data(), layer_F, *lt.ffn_gate, norm_buf.data(), D, S, layer_F, D);
+                        Avx2Math::gemm_f32(ffn_up_buf.data(),   layer_F, *lt.ffn_up,   norm_buf.data(), D, S, layer_F, D);
                     } else {
                         Avx2Math::gemm(ffn_gate_buf.data(), layer_F, *lt.ffn_gate, norm_buf.data(), D, S, layer_F, D);
                         Avx2Math::gemm(ffn_up_buf.data(),   layer_F, *lt.ffn_up,   norm_buf.data(), D, S, layer_F, D);
@@ -1592,7 +1629,7 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
                         #pragma omp parallel for schedule(static)
                         for (int t = 0; t < S; ++t) {
                             const size_t off = static_cast<size_t>(t) * static_cast<size_t>(layer_F);
-                            geglu_avx2_range(ffn_gate_buf.data() + off, ffn_gate_buf.data() + off, ffn_up_buf.data() + off, layer_F);
+                            geglu_avx2_range(ffn_gate_buf.data() + off, ffn_gate_buf.data() + off, ffn_up_buf.data() + off, layer_F, exact_math_mode_);
                             if (h_ffn_dn > 0) Avx2Math::fwht_block_inplace(ffn_gate_buf.data() + off, layer_F, h_ffn_dn);
                         }
                     } else {
@@ -1602,8 +1639,8 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
                             float* gb = ffn_gate_buf.data() + off;
                             const float* ub = ffn_up_buf.data() + off;
                             for (int idx = 0; idx < layer_F; ++idx) {
-                                const float g = gb[idx];
-                                gb[idx] = (g / (1.0f + std::exp(-g))) * ub[idx];
+                                const double g = static_cast<double>(gb[idx]);
+                                gb[idx] = static_cast<float>((g / (1.0 + std::exp(-g))) * static_cast<double>(ub[idx]));
                             }
                             if (h_ffn_dn > 0) Avx2Math::fwht_block_inplace(gb, layer_F, h_ffn_dn);
                         }
@@ -1616,7 +1653,8 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
                 }
 
                 if (lt.ffn_down) {
-                    Avx2Math::gemm(ffn_down_buf.data(), D, *lt.ffn_down, ffn_gate_buf.data(), layer_F, S, D, layer_F);
+                    if (exact_math_mode_) Avx2Math::gemm_f32(ffn_down_buf.data(), D, *lt.ffn_down, ffn_gate_buf.data(), layer_F, S, D, layer_F);
+                    else                  Avx2Math::gemm(ffn_down_buf.data(), D, *lt.ffn_down, ffn_gate_buf.data(), layer_F, S, D, layer_F);
                 } else {
                     for (int t = 0; t < S; ++t)
                         for (int i = 0; i < D; ++i)
@@ -1642,7 +1680,7 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
                 const int two_F = 2 * F_exp;
 
                 // Router input norm + scale for all S tokens
-                const float inv_sqrt_d = 1.0f / std::sqrt(static_cast<float>(D));
+                const float inv_sqrt_d = static_cast<float>(1.0 / std::sqrt(static_cast<double>(D)));
                 const float* rscale = (!cfg.turbo_folded_scales && lt.ffn_gate_inp_scale) ? safe_f32_weights(lt.ffn_gate_inp_scale, cfg.embedding_dim) : nullptr;
                 #pragma omp parallel for if(S >= 8) schedule(static)
                 for (int t = 0; t < S; ++t) {
@@ -1652,8 +1690,8 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
                     for (int i = 0; i < D; ++i) mn[i] *= inv_sqrt_d * (rscale ? rscale[i] : 1.0f);
                 }
 
-                // Batched Router GEMM [S, E]
-                Avx2Math::gemm(moe_router_buf.data(), E, *lt.ffn_gate_inp, moe_norm_buf.data(), D, S, E, D);
+                // Exact FP32-activation Batched Router GEMM [S, E] (prevents Top-K expert misrouting!)
+                Avx2Math::gemm_f32(moe_router_buf.data(), E, *lt.ffn_gate_inp, moe_norm_buf.data(), D, S, E, D);
 
                 // Group routed (token, weight) pairs into per-expert buckets so each expert is read ONCE!
                 struct ExpertHit { int tok; float weight; };
@@ -1667,12 +1705,12 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
                     for (int e = 0; e < E; ++e) idx_tmp[static_cast<size_t>(e)] = e;
                     std::partial_sort(idx_tmp.begin(), idx_tmp.begin() + K_used, idx_tmp.end(),
                         [&](int a, int b) { return rlogits[a] > rlogits[b]; });
-                    float w_sum = 0.0f;
-                    for (int k = 0; k < K_used; ++k) w_sum += rlogits[idx_tmp[static_cast<size_t>(k)]];
-                    if (w_sum < 6.103515625e-5f) w_sum = 6.103515625e-5f;
+                    double w_sum = 0.0;
+                    for (int k = 0; k < K_used; ++k) w_sum += static_cast<double>(rlogits[idx_tmp[static_cast<size_t>(k)]]);
+                    if (w_sum < 6.103515625e-5) w_sum = 6.103515625e-5;
                     for (int k = 0; k < K_used; ++k) {
                         const int e = idx_tmp[static_cast<size_t>(k)];
-                        const float we = (rlogits[e] / w_sum) * (down_s ? down_s[e] : 1.0f);
+                        const float we = static_cast<float>((static_cast<double>(rlogits[e]) / w_sum) * (down_s ? static_cast<double>(down_s[e]) : 1.0));
                         buckets[static_cast<size_t>(e)].push_back({t, we});
                     }
                 }
@@ -1709,14 +1747,14 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
                 const int n_active = static_cast<int>(active_exps.size());
 
                 // Dynamic-scheduled parallel execution over active experts: each expert's weights stream ONCE!
-                const bool gu_is_q8k  = lt.ffn_gate_up_exps
+                const bool gu_is_q8k  = !exact_math_mode_ && (lt.ffn_gate_up_exps
                     ? Avx2Math::supports_q8k_gemm(lt.ffn_gate_up_exps->type, D)
-                    : (Avx2Math::supports_q8k_gemm(lt.ffn_gate_exps->type, D) && Avx2Math::supports_q8k_gemm(lt.ffn_up_exps->type, D));
-                const bool gu_is_q832 = lt.ffn_gate_up_exps
+                    : (Avx2Math::supports_q8k_gemm(lt.ffn_gate_exps->type, D) && Avx2Math::supports_q8k_gemm(lt.ffn_up_exps->type, D)));
+                const bool gu_is_q832 = !exact_math_mode_ && (lt.ffn_gate_up_exps
                     ? Avx2Math::supports_q8_32_gemm(lt.ffn_gate_up_exps->type, D)
-                    : (Avx2Math::supports_q8_32_gemm(lt.ffn_gate_exps->type, D) && Avx2Math::supports_q8_32_gemm(lt.ffn_up_exps->type, D));
-                const bool dn_is_q8k  = Avx2Math::supports_q8k_gemm(lt.ffn_down_exps->type, F_exp);
-                const bool dn_is_q832 = Avx2Math::supports_q8_32_gemm(lt.ffn_down_exps->type, F_exp);
+                    : (Avx2Math::supports_q8_32_gemm(lt.ffn_gate_exps->type, D) && Avx2Math::supports_q8_32_gemm(lt.ffn_up_exps->type, D)));
+                const bool dn_is_q8k  = !exact_math_mode_ && Avx2Math::supports_q8k_gemm(lt.ffn_down_exps->type, F_exp);
+                const bool dn_is_q832 = !exact_math_mode_ && Avx2Math::supports_q8_32_gemm(lt.ffn_down_exps->type, F_exp);
 
                 #pragma omp parallel
                 {
@@ -1774,23 +1812,38 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
                                                            exp_q832, F_exp, D, false);
                             }
                         } else if (lt.ffn_gate_up_exps) {
-                            Avx2Math::gemm_slice(exp_gu.data(), two_F, *lt.ffn_gate_up_exps,
-                                                 static_cast<size_t>(e) * static_cast<size_t>(two_F),
-                                                 exp_in.data(), D, cnt, two_F, D, false);
+                            if (exact_math_mode_) {
+                                Avx2Math::gemm_slice_f32(exp_gu.data(), two_F, *lt.ffn_gate_up_exps,
+                                                         static_cast<size_t>(e) * static_cast<size_t>(two_F),
+                                                         exp_in.data(), D, cnt, two_F, D, false);
+                            } else {
+                                Avx2Math::gemm_slice(exp_gu.data(), two_F, *lt.ffn_gate_up_exps,
+                                                     static_cast<size_t>(e) * static_cast<size_t>(two_F),
+                                                     exp_in.data(), D, cnt, two_F, D, false);
+                            }
                         } else {
-                            Avx2Math::gemm_slice(exp_gu.data(), two_F, *lt.ffn_gate_exps,
-                                                 static_cast<size_t>(e) * static_cast<size_t>(F_exp),
-                                                 exp_in.data(), D, cnt, F_exp, D, false);
-                            Avx2Math::gemm_slice(exp_gu.data() + F_exp, two_F, *lt.ffn_up_exps,
-                                                 static_cast<size_t>(e) * static_cast<size_t>(F_exp),
-                                                 exp_in.data(), D, cnt, F_exp, D, false);
+                            if (exact_math_mode_) {
+                                Avx2Math::gemm_slice_f32(exp_gu.data(), two_F, *lt.ffn_gate_exps,
+                                                         static_cast<size_t>(e) * static_cast<size_t>(F_exp),
+                                                         exp_in.data(), D, cnt, F_exp, D, false);
+                                Avx2Math::gemm_slice_f32(exp_gu.data() + F_exp, two_F, *lt.ffn_up_exps,
+                                                         static_cast<size_t>(e) * static_cast<size_t>(F_exp),
+                                                         exp_in.data(), D, cnt, F_exp, D, false);
+                            } else {
+                                Avx2Math::gemm_slice(exp_gu.data(), two_F, *lt.ffn_gate_exps,
+                                                     static_cast<size_t>(e) * static_cast<size_t>(F_exp),
+                                                     exp_in.data(), D, cnt, F_exp, D, false);
+                                Avx2Math::gemm_slice(exp_gu.data() + F_exp, two_F, *lt.ffn_up_exps,
+                                                     static_cast<size_t>(e) * static_cast<size_t>(F_exp),
+                                                     exp_in.data(), D, cnt, F_exp, D, false);
+                            }
                         }
 
                         if (use_gelu) {
                             for (int j = 0; j < cnt; ++j) {
                                 const float* gu = exp_gu.data() + static_cast<size_t>(j) * static_cast<size_t>(two_F);
                                 float* ac = exp_act.data() + static_cast<size_t>(j) * static_cast<size_t>(F_exp);
-                                geglu_avx2_range(ac, gu, gu + F_exp, F_exp);
+                                geglu_avx2_range(ac, gu, gu + F_exp, F_exp, exact_math_mode_);
                                 if (h_moe_dn > 0) Avx2Math::fwht_block_inplace(ac, F_exp, h_moe_dn);
                             }
                         } else {
@@ -1798,8 +1851,8 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
                                 const float* gu = exp_gu.data() + static_cast<size_t>(j) * static_cast<size_t>(two_F);
                                 float* ac = exp_act.data() + static_cast<size_t>(j) * static_cast<size_t>(F_exp);
                                 for (int f = 0; f < F_exp; ++f) {
-                                    const float g = gu[f];
-                                    ac[f] = (g / (1.0f + std::exp(-g))) * gu[F_exp + f];
+                                    const double g = static_cast<double>(gu[f]);
+                                    ac[f] = static_cast<float>((g / (1.0 + std::exp(-g))) * static_cast<double>(gu[F_exp + f]));
                                 }
                                 if (h_moe_dn > 0) Avx2Math::fwht_block_inplace(ac, F_exp, h_moe_dn);
                             }
@@ -1815,6 +1868,10 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
                             Avx2Math::gemm_slice_q8_32(exp_dn.data(), D, *lt.ffn_down_exps,
                                                        static_cast<size_t>(e) * static_cast<size_t>(D),
                                                        exp_q832, D, F_exp, false);
+                        } else if (exact_math_mode_) {
+                            Avx2Math::gemm_slice_f32(exp_dn.data(), D, *lt.ffn_down_exps,
+                                                     static_cast<size_t>(e) * static_cast<size_t>(D),
+                                                     exp_act.data(), F_exp, cnt, D, F_exp, false);
                         } else {
                             Avx2Math::gemm_slice(exp_dn.data(), D, *lt.ffn_down_exps,
                                                  static_cast<size_t>(e) * static_cast<size_t>(D),
@@ -1868,18 +1925,20 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
 
             // 2-pleias. Batched Per-Layer Token Injection (Gemma 4 E4B/E2B)
             if (lt.inp_gate && lt.proj && has_pleias_branch && (static_cast<size_t>(l) + 1ULL) * 256ULL <= static_cast<size_t>(pleias_total)) {
-                Avx2Math::gemm(pl_gate_buf.data(), 256, *lt.inp_gate, X.data(), D, S, 256, D);
+                if (exact_math_mode_) Avx2Math::gemm_f32(pl_gate_buf.data(), 256, *lt.inp_gate, X.data(), D, S, 256, D);
+                else                  Avx2Math::gemm(pl_gate_buf.data(), 256, *lt.inp_gate, X.data(), D, S, 256, D);
                 #pragma omp parallel for if(S >= 8) schedule(static)
                 for (int t = 0; t < S; ++t) {
                     float* pg = pl_gate_buf.data() + static_cast<size_t>(t) * 256ULL;
                     const float* pe = pl_emb_buf.data() + static_cast<size_t>(t) * static_cast<size_t>(pleias_total) + static_cast<size_t>(l) * 256ULL;
                     for (int i = 0; i < 256; ++i) {
-                        const float g = pg[i];
-                        const float cdf = 0.5f * (1.0f + std::tanh(0.7978845608f * (g + 0.044715f * g * g * g)));
-                        pg[i] = (g * cdf) * pe[i];
+                        const double g = static_cast<double>(pg[i]);
+                        const double cdf = 0.5 * (1.0 + std::tanh(0.79788456080286535588 * (g + 0.044715 * g * g * g)));
+                        pg[i] = static_cast<float>((g * cdf) * static_cast<double>(pe[i]));
                     }
                 }
-                Avx2Math::gemm(pl_out_buf.data(), D, *lt.proj, pl_gate_buf.data(), 256, S, D, 256);
+                if (exact_math_mode_) Avx2Math::gemm_f32(pl_out_buf.data(), D, *lt.proj, pl_gate_buf.data(), 256, S, D, 256);
+                else                  Avx2Math::gemm(pl_out_buf.data(), D, *lt.proj, pl_gate_buf.data(), 256, S, D, 256);
                 const float* post_w = lt.post_norm ? safe_f32_weights(lt.post_norm, cfg.embedding_dim) : nullptr;
                 #pragma omp parallel for if(S >= 8) schedule(static)
                 for (int t = 0; t < S; ++t) {
@@ -1922,7 +1981,8 @@ void HavenEngine::forward_batch(const uint32_t* tokens, int n_tokens, int start_
                 Avx2Math::rms_norm(norm_scratch_.data(), embedding_scratch_.data(), out_norm_w, D, cfg.rms_norm_eps);
 
                 if (output_tensor_) {
-                    Avx2Math::gemv(out_last_logits, *output_tensor_, norm_scratch_.data(), cfg.vocab_size, cfg.embedding_dim);
+                    if (exact_math_mode_) Avx2Math::gemv_f32(out_last_logits, *output_tensor_, norm_scratch_.data(), cfg.vocab_size, cfg.embedding_dim);
+                    else                  Avx2Math::gemv(out_last_logits, *output_tensor_, norm_scratch_.data(), cfg.vocab_size, cfg.embedding_dim);
                 } else {
                     for (size_t v = 0; v < cfg.vocab_size; ++v) {
                         out_last_logits[v] = std::sin(static_cast<float>(v) * 0.05f) * norm_scratch_[v % cfg.embedding_dim];
@@ -2089,6 +2149,11 @@ HAVEN_API void haven_set_persona(void* engine, const float* persona_vector, int 
 HAVEN_API void haven_set_yarn_scale(void* engine, float scale) {
     if (!engine) return;
     reinterpret_cast<haven::HavenEngine*>(engine)->set_yarn_context_scale(scale);
+}
+
+HAVEN_API void haven_set_exact_math(void* engine, bool enabled) {
+    if (!engine) return;
+    reinterpret_cast<haven::HavenEngine*>(engine)->set_exact_math(enabled);
 }
 
 HAVEN_API uint64_t haven_fork_sequence(void* engine, uint64_t parent_id, uint64_t child_id) {

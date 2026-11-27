@@ -22,6 +22,10 @@ struct SessionConfig {
     int  max_seq_len = 4096;
     int  max_prefill_chunk = 512;
     bool use_cuda_graph = true;
+    bool exact_math = false;            // Enable exact FP32-activation math across CPU & CUDA (0.999999+ parity)
+    bool fp32_kv_cache = false;         // Enable FP32 KV cache on CUDA (auto-enabled when exact_math == true)
+    bool fp32_prefill = false;          // Enable FP32 cuBLAS prefill on CUDA (auto-enabled when exact_math == true)
+    bool host_resident_pleias = false;  // Keep Gemma 4 Pleias token table on host RAM to save ~2.1 GiB VRAM
     bool verbose = false;
 };
 

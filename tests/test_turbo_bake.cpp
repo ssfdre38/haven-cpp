@@ -122,17 +122,17 @@ static void test_norm_fold_hadamard_and_r2_math() {
         std::exit(1);
     }
 
-    // Compare Q8_K (per-256 block dynamic quantization) error BEFORE vs AFTER baking on the 662x spike!
+    // Compare Q8_K (per-32-elem dynamic-scale Q8KBatch) error BEFORE vs AFTER baking on the 662x spike!
     Q8KBatch b_raw, b_baked;
     Avx2Math::pack_q8k_batch(xn_raw.data(), D, D, 1, b_raw);
     Avx2Math::pack_q8k_batch(xn_unit.data(), D, D, 1, b_baked);
 
     auto dequant_q8k_dot = [](const std::vector<float>& mat, const Q8KBatch& b, int rows, int cols) {
         std::vector<float> out(rows, 0.0f);
-        float d = b.tiles[0].d[0];
         std::vector<float> xq(cols);
         for (int ib = 0; ib < 8; ++ib) {
-            const int8_t* qp = b.tiles[0].qs.data() + ib * 256;
+            const float d = b.tiles[0].d[static_cast<size_t>(ib) * 8ULL];
+            const int8_t* qp = b.tiles[0].qs.data() + static_cast<size_t>(ib) * 256ULL;
             for (int j = 0; j < 32; ++j) xq[ib * 32 + j] = d * static_cast<float>(qp[j]);
         }
         for (int r = 0; r < rows; ++r) out[r] = Avx2Math::vec_dot_f32(cols, mat.data() + r * cols, xq.data());

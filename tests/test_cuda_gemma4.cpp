@@ -31,6 +31,11 @@ int main(int argc, char** argv) {
     int repeats = 3;
     int device_id = 0;
     bool skip_cpu_parity = false;
+    bool exact_mode = false;
+    bool fp32_act = false;
+    bool fp32_kv = false;
+    bool fp32_prefill = false;
+    bool host_pleias = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -40,6 +45,11 @@ int main(int argc, char** argv) {
         else if (a == "--pp" && i + 1 < argc) pp_len = std::stoi(argv[++i]);
         else if (a == "--repeats" && i + 1 < argc) repeats = std::max(1, std::stoi(argv[++i]));
         else if (a == "--skip-parity") skip_cpu_parity = true;
+        else if (a == "--exact") { exact_mode = true; fp32_act = true; fp32_kv = true; fp32_prefill = true; }
+        else if (a == "--fp32-act") fp32_act = true;
+        else if (a == "--fp32-kv") fp32_kv = true;
+        else if (a == "--fp32-prefill") fp32_prefill = true;
+        else if (a == "--host-pleias") host_pleias = true;
         else if (a == "--probe-only") {
             std::cout << "CUDA Compiled: " << (HavenCudaEngine::is_cuda_compiled() ? "YES" : "NO")
                       << " | Devices: " << HavenCudaEngine::get_device_count()
@@ -63,7 +73,7 @@ int main(int argc, char** argv) {
     }
 
     if (model_path.empty()) {
-        std::cerr << "Usage: test-cuda-gemma4 <model.gguf> [--steps 128] [--pp 512] [--repeats 3] [--skip-parity]\n";
+        std::cerr << "Usage: test-cuda-gemma4 <model.gguf> [--steps 128] [--pp 512] [--repeats 3] [--skip-parity] [--exact] [--fp32-act] [--fp32-kv] [--fp32-prefill] [--host-pleias]\n";
         return 1;
     }
 
@@ -72,17 +82,26 @@ int main(int argc, char** argv) {
         std::cerr << "Failed to load GGUF: " << model_path << "\n";
         return 1;
     }
+    if (exact_mode || fp32_act) {
+        host_engine.set_exact_math(true);
+    }
     const auto& mc = host_engine.get_config();
     std::cout << "Loaded Model: " << model_path << " (" << mc.architecture
               << ", " << mc.num_layers << "L, D=" << mc.embedding_dim
               << ", F=" << mc.hidden_dim << ", V=" << mc.vocab_size
               << ", MoE=" << (mc.expert_count > 0 ? (std::to_string(mc.expert_count) + "E/top" + std::to_string(mc.expert_used_count)) : "dense")
-              << ", TurboV=" << mc.turbo_version << ")\n";
+              << ", TurboV=" << mc.turbo_version
+              << ", Precision=" << (exact_mode ? "EXACT(F32-Act+F32-KV+F32-Prefill)" : (fp32_act ? "F32-Act" : "FAST-Q8"))
+              << (host_pleias ? ", HostPleias" : "") << ")\n";
 
     CudaEngineConfig ccfg;
     ccfg.device_id = device_id;
     ccfg.max_seq_len = max_seq_len;
     ccfg.max_prefill_chunk = 256;
+    ccfg.exact_fp32_activations = fp32_act;
+    ccfg.fp32_kv_cache = fp32_kv;
+    ccfg.fp32_prefill = fp32_prefill;
+    ccfg.host_resident_pleias = host_pleias;
 
     HavenCudaEngine cuda_eng;
     if (!cuda_eng.initialize(host_engine, ccfg)) {
@@ -125,11 +144,18 @@ int main(int argc, char** argv) {
         }
         double cos1 = cosine_sim(cpu_lg1.data(), gpu_lg1.data(), mc.vocab_size);
         double cos2 = cosine_sim(cpu_lg2.data(), gpu_lg2.data(), mc.vocab_size);
+        double max_d1 = 0.0, max_d2 = 0.0;
+        for (size_t i = 0; i < mc.vocab_size; ++i) {
+            max_d1 = std::max(max_d1, std::fabs(static_cast<double>(cpu_lg1[i]) - static_cast<double>(gpu_lg1[i])));
+            max_d2 = std::max(max_d2, std::fabs(static_cast<double>(cpu_lg2[i]) - static_cast<double>(gpu_lg2[i])));
+        }
         std::cout << "[PARITY vs F32 CPU (" << std::setprecision(0)
                   << std::chrono::duration<double, std::milli>(c1 - c0).count() << " ms CPU)]\n"
-                  << "  Prefill (S=" << prompt_toks.size() << "): Cosine=" << std::setprecision(6) << cos1
+                  << "  Prefill (S=" << prompt_toks.size() << "): Cosine=" << std::setprecision(7) << cos1
+                  << " | max_abs=" << std::scientific << std::setprecision(2) << max_d1 << std::fixed
                   << " | Top1=" << gpu_t1 << " (CPU=" << cpu_t1 << ", Match=" << (gpu_t1 == cpu_t1 ? "YES" : "NO") << ")\n"
-                  << "  Decode  (S=1) : Cosine=" << std::setprecision(6) << cos2
+                  << "  Decode  (S=1) : Cosine=" << std::setprecision(7) << cos2
+                  << " | max_abs=" << std::scientific << std::setprecision(2) << max_d2 << std::fixed
                   << " | Top1=" << gpu_t2 << " (CPU=" << cpu_t2 << ", Match=" << (gpu_t2 == cpu_t2 ? "YES" : "NO") << ")\n";
         if (cos1 < 0.99 || cos2 < 0.99) {
             std::cerr << "[FAIL] Native CUDA parity below 0.99! Check kernel math!\n";

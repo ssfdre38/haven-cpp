@@ -29,6 +29,7 @@ jobs:
             haven-bake \
             haven-modules \
             test-turbo-bake \
+            test-math-parity \
             test-security-fuzz \
             test-secure-cluster \
             test-multi-model-arch \
@@ -46,6 +47,7 @@ jobs:
       - name: Run zero-GGUF security, architecture, intelligence, lean session, cluster, sway & TPU StableHLO tests
         run: |
           ./build/test-turbo-bake
+          ./build/test-math-parity
           ./build/test-security-fuzz
           ./build/test-secure-cluster
           ./build/test-multi-model-arch
@@ -62,7 +64,8 @@ jobs:
       - name: Verify ultra-lean desktop/edge build (-DHAVEN_ENABLE_TPU=OFF)
         run: |
           cmake -B build-lean -G Ninja -DCMAKE_BUILD_TYPE=Release -DHAVEN_ENABLE_TPU=OFF
-          cmake --build build-lean --target haven-cli haven-server haven-bake haven-modules test-model-intelligence test-lean-session -j$(nproc)
+          cmake --build build-lean --target haven-cli haven-server haven-bake haven-modules test-math-parity test-model-intelligence test-lean-session -j$(nproc)
+          ./build-lean/test-math-parity
           ./build-lean/test-model-intelligence
           ./build-lean/test-lean-session
 
@@ -88,6 +91,7 @@ jobs:
             haven-bake `
             haven-modules `
             test-turbo-bake `
+            test-math-parity `
             test-security-fuzz `
             test-secure-cluster `
             test-multi-model-arch `
@@ -109,6 +113,7 @@ jobs:
       - name: Run zero-GGUF security, architecture, intelligence, lean session, cluster, sway & TPU StableHLO tests
         run: |
           .\build\test-turbo-bake.exe
+          .\build\test-math-parity.exe
           .\build\test-security-fuzz.exe
           .\build\test-secure-cluster.exe
           .\build\test-multi-model-arch.exe
@@ -125,6 +130,7 @@ jobs:
       - name: Verify ultra-lean desktop/edge build (-DHAVEN_ENABLE_TPU=OFF)
         run: |
           cmake -B build-lean -G Ninja -DCMAKE_BUILD_TYPE=Release -DHAVEN_ENABLE_TPU=OFF
-          cmake --build build-lean --target haven-cli haven-server haven-bake haven-modules test-model-intelligence test-lean-session
+          cmake --build build-lean --target haven-cli haven-server haven-bake haven-modules test-math-parity test-model-intelligence test-lean-session
+          .\build-lean\test-math-parity.exe
           .\build-lean\test-model-intelligence.exe
           .\build-lean\test-lean-session.exe

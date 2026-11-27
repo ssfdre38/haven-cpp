@@ -29,15 +29,15 @@ struct Q8Act32 {
     int nb = 0;
 };
 
-// Block-major packed 256-elem Q8_K activation batch for register-tiled 1x8 / 1x4 AVX2 GEMM
-// Supports IQ4_XS, Q4_K, Q5_K, Q6_K with pure-integer inner loops (1 float FMA / 256 weights).
+// Block-major packed 32-elem-scaled Q8 activation batch for register-tiled 1x8 / 1x4 AVX2 GEMM
+// Supports IQ4_XS, Q4_K, Q5_K, Q6_K with per-32-element dynamic scales matching Q8Act32 & CUDA Q8_1!
 struct Q8KBatch {
     struct Tile {
         int n_tok = 0;                 // 1..8 active tokens in this tile
         std::vector<int8_t>  qs;       // [nb256 * 8 * 8 * 32] contiguous per 32-elem sub-block
-        std::vector<float>   d;        // [nb256 * 8]
+        std::vector<float>   d;        // [nb256 * 8 * 8] per-32-elem dynamic scale (zero 256-elem outlier crush!)
         std::vector<float>   sumf;     // [nb256 * 8 * 8] exact FP32 32-elem sums (for Q4_K/Q5_K)
-        std::vector<int16_t> bsum16;   // [nb256 * 16 * 8] exact 16-elem int8 sums (for Q6_K)
+        std::vector<int16_t> bsum16;   // [nb256 * 8 * 8 * 2] exact 16-elem int8 sums per 32-elem sub-block (for Q6_K)
     };
     int nb256 = 0;
     int n_tokens = 0;
@@ -148,11 +148,19 @@ public:
     // Dequantizes a single row of a tensor into float buffer (e.g. token embedding lookup)
     static void dequantize_row(float* out, const TensorDesc& weight, int row, int cols);
 
-    // Matrix-Vector Multiplication: y = W * x
+    // Matrix-Vector Multiplication: y = W * x (uses fast Q8Act32 integer AVX2 when rows >= 16)
     static void gemv(float* y, const TensorDesc& weight, const float* x, int rows, int cols);
 
     // Matrix-Vector Multiplication on a contiguous row slice (e.g. expert e inside 3D [cols, rows, E] tensor)
     static void gemv_slice(float* y, const TensorDesc& weight, size_t row_offset, const float* x, int rows, int cols);
+
+    // Exact FP32-Activation Matrix-Vector Multiplication (zero Q8 activation quantization error!)
+    static void gemv_f32(float* y, const TensorDesc& weight, const float* x, int rows, int cols);
+    static void gemv_slice_f32(float* y, const TensorDesc& weight, size_t row_offset, const float* x, int rows, int cols);
+
+    // Exact FP32-Activation Multi-Token GEMM (zero Q8 activation quantization error!)
+    static void gemm_f32(float* Y, int stride_y, const TensorDesc& weight, const float* X, int stride_x, int n_tokens, int rows, int cols);
+    static void gemm_slice_f32(float* Y, int stride_y, const TensorDesc& weight, size_t row_offset, const float* X, int stride_x, int n_tokens, int rows, int cols, bool parallel = true);
 
     // Single-row quantized/float dot product for fused parallel callers (no internal OpenMP fork)
     static float dot_row(const TensorDesc& weight, size_t row, const float* x, int cols);
