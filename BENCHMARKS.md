@@ -24,6 +24,7 @@ Tests span both **worst-case local host hardware** (6-core Xeon CPU + mechanical
 | • Live Single HTTP/SSE:     248.3 tok/s E4B / 192.4 tok/s Ava 26B (12.51 ms TTFT)     |
 | • Live Multi-Tenant SSE:    3,711.1 tok/s (Ava 26B 128-cli) / 3,050.0 (64-cli)        |
 | • Ava 26B-A4B MoE (v6e-4):  9,871.4 B=256 | 8,172.7 B=128 | 8.63ms TTFT | 0.9978 cos  |
+| • Consumer GPU (RTX 2070 MQ): 40.7 tg128 | 899.8 pp512 | 35.2 SSE | 0.99996 cos   |
 | • 262k Top-Tail Sampler:    0.15 ms/tok (150x speedup vs 22.6 ms full-vocab sort) |
 | • AVX2/F16C SIMD Kernel:    34.81 GFLOPS (3.64x speedup over 9.57 GFLOPS)         |
 | • 64-Bit Memory Scaling:    100,000 memories scanned in 9.86 ms on CPU (71.3 MB)  |
@@ -211,6 +212,33 @@ Measured live on 4-chip Cloud TPU `v6e-4` (`europe-west4-a`, 128 GB HBM3, 180-vC
 - **SHCP v2 Live Wire Attacks**: Replay counter rejection, Poly1305 ciphertext tamper rejection, and plaintext-downgrade rejection PASS.
 - **Parser & Binary Fuzzing**: RFC 8259 JSON (150 mutants), GGUF v3 binary loader (150 mutants), `.hmb` binary vault (100 mutants) — 0 crashes, 0 ASan/UBSan findings.
 - **Hardened Plugin Defenses**: Win32 Job Object terminal sandbox, canonical workspace/vault containment, and DNS-SSRF browser defense PASS.
+
+---
+
+## 7. Consumer / Non-Server NVIDIA CUDA GPU Benchmarks (`RTX 2070 Max-Q`, Turing `sm_75`)
+
+Verified live on a non-server consumer laptop setup (**Intel Core i7-10750H** 6C/12T AVX2/FMA, **32 GB RAM**, **NVIDIA GeForce RTX 2070 with Max-Q Design** — 80W Turing `sm_75`, 36 SMs, **8 GiB GDDR6 VRAM**, ~6.6 GiB free under Windows 11 desktop; compiled cleanly with MSVC 19.51 + CUDA 13.3 via `-DHAVEN_ENABLE_CUDA=ON -DHAVEN_ENABLE_TPU=OFF -DCMAKE_CUDA_ARCHITECTURES=75`, commit `927ea7c`).
+
+Tested with **[`ssfdre38/gemma4.5-turbo-gguf/gemma4.5-e4b-iq4xs.gguf`](https://huggingface.co/ssfdre38/gemma4.5-turbo-gguf/blob/main/gemma4.5-e4b-iq4xs.gguf)** (`4.71 GiB`, 42-layer Gemma 4 E4B It, `D=2560`, `F=10240`, `V=262,144`, SWA-512, 18 Shared-KV layers, Pleias; tensor mix: `Q6_K` 2.67 GiB embeddings + `IQ4_XS` 1.87 GiB / 313 block tensors + `Q5_K` 0.11 GiB + `BF16` 0.05 GiB + `F32` norms):
+
+### 7A. Native Zero-Compile CUDA V2 Verification & Throughput (`test-cuda-gemma4` & `haven-server --gpu`)
+
+| Workload (`gemma4.5-e4b-iq4xs.gguf`) | Mode & Silicon | Parity vs F32 CPU | Latency / TTFT | Avg Throughput | Peak / Notes |
+| :--- | :--- | :---: | ---: | ---: | :--- |
+| **Model Intelligence Probe** | `haven-cli --inspect` (zero-mmap) | — | `18.3 ms` | — | Auto-routed `CUDA_NATIVE` (`2/10` DLLs resident) |
+| **Zero-Compile VRAM Load** | `RTX 2070 Max-Q` (`sm_75`, 8 GiB) | — | `2.46–5.11 s` upload | — | `4.70 GiB` weights + `112 MiB` KV + `126 MiB` scratch (`0.0 ms` compile) |
+| **262k-Logit Parity (Prefill `S=120`)** | Native CUDA V2 vs F32 CPU | **`0.999790`** / Exact | — | — | `Top1 = 1509 == 1509` (262,144 logits) |
+| **262k-Logit Parity (Decode `S=1`)** | Native CUDA V2 vs F32 CPU | **`0.999957`** / Exact | — | — | `Top1 = 11906 == 11906` (262,144 logits) |
+| **Tensor Core Prefill (`pp128`)** | cuBLAS FP16 Tensor Core (`3x` avg) | Exact | `162.25 ms` | **788.9 tok/s** | **796.4 tok/s** peak |
+| **Tensor Core Prefill (`pp512`)** | cuBLAS FP16 Tensor Core (`3x` avg) | Exact | `582.15 ms` | **879.5 tok/s** | **899.8 tok/s** peak |
+| **Warp-GEMV Decode (`tg128`, `B=1`)** | `Q8_1` `__dp4a` + CUDA Graph (`3x` avg) | Exact | **`24.67 ms/tok`** | **40.54 tok/s** | **40.69 tok/s** peak (`190 GiB/s` total-wt / `~103 GiB/s` active-stream BW) |
+| **Live `haven-server --gpu` SSE (Cold)** | 1 Client HTTP/SSE (`128t`, Full Sampler) | Coherent | `834.5 ms` TTFT | **34.64 tok/s** | `28.44 tok/s` e2e (`4.50 s` wall) |
+| **Live `haven-server --gpu` SSE (Cached)** | 1 Client HTTP/SSE (`128t`, Prefix Cache) | Coherent | **`160.7 ms`** TTFT | **35.17 tok/s** | **`33.93 tok/s`** e2e (`3.77 s` wall) |
+| **Interactive `haven-cli` Prefill (`88t`)** | `RTX 2070 Max-Q` vs `i7-10750H` AVX2 | Exact | `266.6 ms` vs `3,204.6 ms` | **330.1 vs 27.5 tok/s** | **12.0x** prompt prefill speedup over 12-thread CPU |
+
+### 7B. Consumer-GPU Notes (`8 GiB` Laptop VRAM)
+- **Turing (`sm_75`) Compatibility:** All CUDA V2 kernels (`__shfl_sync` IQ4NL LUT, `Q8_1` `__dp4a` integer GEMV, FP16 Tensor Core `cublasGemmEx`, and CUDA Graph capture) run natively on Turing `sm_75` when built with `-DCMAKE_CUDA_ARCHITECTURES=75`.
+- **VRAM Headroom & Pleias Footprint:** The full 42-layer model + `2048`-token KV cache fits in **~4.93 GiB VRAM**, leaving >1.5 GiB headroom on an 8 GiB Windows desktop GPU. Notably, `per_layer_token_embd.weight` (`Q6_K`, `2.15 GiB`) accounts for 46% of weight VRAM while reading only ~8.8 KB per decode token (single-row lookup), meaning host-resident Pleias embeddings can drop E4B VRAM to ~2.8 GiB for 4–6 GiB consumer GPUs.
 
 ---
 
