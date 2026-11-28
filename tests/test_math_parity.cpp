@@ -431,7 +431,7 @@ static int test_quant_gemv_parity() {
         return 0;
     };
 
-    // Synthesize valid blocks for ALL 9 integer-Q8/FP32-tiled formats: IQ4_XS, IQ4_NL, Q6_K, Q5_K, Q4_K, Q5_1, Q5_0, Q4_0, Q8_0
+    // Synthesize valid blocks for ALL 10 quantized GEMV/GEMM formats: IQ4_XS, IQ4_NL, Q6_K, Q5_K, Q4_K, Q3_K, Q5_1, Q5_0, Q4_0, Q8_0
     {
         std::vector<block_iq4_xs> blk(rows * (cols / 256));
         for (auto& b : blk) {
@@ -480,6 +480,16 @@ static int test_quant_gemv_parity() {
             for (int i = 0; i < 128; ++i) b.qs[i] = static_cast<uint8_t>(rng() & 0xFFu);
         }
         if (run_format("Q4_K", QuantType::Q4_K, blk.data(), blk.size() * sizeof(block_q4_K)) != 0) return 1;
+    }
+    {
+        std::vector<block_q3_K> blk(rows * (cols / 256));
+        for (auto& b : blk) {
+            b.d = f32_to_f16(0.016f);
+            for (int i = 0; i < 32; ++i) b.hmask[i] = static_cast<uint8_t>(rng() & 0xFFu);
+            for (int i = 0; i < 64; ++i) b.qs[i] = static_cast<uint8_t>(rng() & 0xFFu);
+            for (int i = 0; i < 12; ++i) b.scales[i] = static_cast<uint8_t>(rng() & 0xFFu);
+        }
+        if (run_format("Q3_K", QuantType::Q3_K, blk.data(), blk.size() * sizeof(block_q3_K)) != 0) return 1;
     }
     {
         std::vector<block_q5_1> blk(rows * (cols / 32));

@@ -249,39 +249,39 @@ struct MlirEmitter {
     }
 
     // Unpack packed group-G symmetric signed INT4 matrix [N, K/2] (i8) + [N, K/G] (f32) -> [N, K] (bf16)
-    // Pure standard StableHLO ops (shift_left + shift_right_arithmetic + convert + concat + broadcast_in_dim + multiply),
-    // fused by XLA directly into TPU VMEM / CUDA Tensor Core registers with zero S4 buffer ABI dependencies!
+    // Pure standard StableHLO ops (shift_left + shift_right_arithmetic + convert i8->f32 + multiply exact f32 scale -> single bf16 convert),
+    // eliminating BF16 scale double-rounding while XLA fuses directly into TPU VMEM / CUDA Tensor Core registers!
     std::string emit_unpack_s4_2d(const std::string& w_p, const std::string& s_2d, int N, int K) {
         const int K2 = K / 2;
         const int G  = HavenTpuGemma4Engine::compute_w4_group_size(K);
         const int NG = K / G;
         const std::string tp_i8 = "tensor<" + std::to_string(N) + "x" + std::to_string(K2) + "xi8>";
-        const std::string tp_bf = "tensor<" + std::to_string(N) + "x" + std::to_string(K2) + "xbf16>";
-        const std::string t3_1  = "tensor<" + std::to_string(N) + "x" + std::to_string(K2) + "x1xbf16>";
-        const std::string t3_2  = "tensor<" + std::to_string(N) + "x" + std::to_string(K2) + "x2xbf16>";
-        const std::string t_grp = "tensor<" + std::to_string(N) + "x" + std::to_string(NG) + "x" + std::to_string(G) + "xbf16>";
+        const std::string tp_f  = "tensor<" + std::to_string(N) + "x" + std::to_string(K2) + "xf32>";
+        const std::string t3_1  = "tensor<" + std::to_string(N) + "x" + std::to_string(K2) + "x1xf32>";
+        const std::string t3_2  = "tensor<" + std::to_string(N) + "x" + std::to_string(K2) + "x2xf32>";
+        const std::string t_grp = "tensor<" + std::to_string(N) + "x" + std::to_string(NG) + "x" + std::to_string(G) + "xf32>";
         const std::string ts_f  = "tensor<" + std::to_string(N) + "x" + std::to_string(NG) + "xf32>";
-        const std::string ts_b  = "tensor<" + std::to_string(N) + "x" + std::to_string(NG) + "xbf16>";
+        const std::string wf_t  = "tensor<" + std::to_string(N) + "x" + std::to_string(K) + "xf32>";
         const std::string wb_t  = "tensor<" + std::to_string(N) + "x" + std::to_string(K) + "xbf16>";
 
         std::string c4 = tmp("c4"), shl = tmp("w4sl"), lo = tmp("w4lo"), hi = tmp("w4hi");
-        std::string lob = tmp("w4lb"), hib = tmp("w4hb"), lo3 = tmp("w4l3"), hi3 = tmp("w4h3");
-        std::string cat = tmp("w4ct"), grp = tmp("w4gr"), sbf = tmp("w4sb"), sbc = tmp("w4bc");
-        std::string dq  = tmp("w4dq"), out = tmp("w4bf");
+        std::string lof = tmp("w4lf"), hif = tmp("w4hf"), lo3 = tmp("w4l3"), hi3 = tmp("w4h3");
+        std::string cat = tmp("w4ct"), grp = tmp("w4gr"), sbc = tmp("w4bc");
+        std::string dq  = tmp("w4dq"), dqf = tmp("w4f2"), out = tmp("w4bf");
         ss << "    " << c4  << " = stablehlo.constant dense<4> : " << tp_i8 << "\n"
            << "    " << shl << " = stablehlo.shift_left " << w_p << ", " << c4 << " : " << tp_i8 << "\n"
            << "    " << lo  << " = stablehlo.shift_right_arithmetic " << shl << ", " << c4 << " : " << tp_i8 << "\n"
            << "    " << hi  << " = stablehlo.shift_right_arithmetic " << w_p << ", " << c4 << " : " << tp_i8 << "\n"
-           << "    " << lob << " = stablehlo.convert " << lo << " : (" << tp_i8 << ") -> " << tp_bf << "\n"
-           << "    " << hib << " = stablehlo.convert " << hi << " : (" << tp_i8 << ") -> " << tp_bf << "\n"
-           << "    " << lo3 << " = stablehlo.reshape " << lob << " : (" << tp_bf << ") -> " << t3_1 << "\n"
-           << "    " << hi3 << " = stablehlo.reshape " << hib << " : (" << tp_bf << ") -> " << t3_1 << "\n"
+           << "    " << lof << " = stablehlo.convert " << lo << " : (" << tp_i8 << ") -> " << tp_f << "\n"
+           << "    " << hif << " = stablehlo.convert " << hi << " : (" << tp_i8 << ") -> " << tp_f << "\n"
+           << "    " << lo3 << " = stablehlo.reshape " << lof << " : (" << tp_f << ") -> " << t3_1 << "\n"
+           << "    " << hi3 << " = stablehlo.reshape " << hif << " : (" << tp_f << ") -> " << t3_1 << "\n"
            << "    " << cat << " = stablehlo.concatenate " << lo3 << ", " << hi3 << ", dim = 2 : (" << t3_1 << ", " << t3_1 << ") -> " << t3_2 << "\n"
            << "    " << grp << " = stablehlo.reshape " << cat << " : (" << t3_2 << ") -> " << t_grp << "\n"
-           << "    " << sbf << " = stablehlo.convert " << s_2d << " : (" << ts_f << ") -> " << ts_b << "\n"
-           << "    " << sbc << " = stablehlo.broadcast_in_dim " << sbf << ", dims = [0, 1] : (" << ts_b << ") -> " << t_grp << "\n"
+           << "    " << sbc << " = stablehlo.broadcast_in_dim " << s_2d << ", dims = [0, 1] : (" << ts_f << ") -> " << t_grp << "\n"
            << "    " << dq  << " = stablehlo.multiply " << grp << ", " << sbc << " : " << t_grp << "\n"
-           << "    " << out << " = stablehlo.reshape " << dq << " : (" << t_grp << ") -> " << wb_t << "\n";
+           << "    " << dqf << " = stablehlo.reshape " << dq << " : (" << t_grp << ") -> " << wf_t << "\n"
+           << "    " << out << " = stablehlo.convert " << dqf << " : (" << wf_t << ") -> " << wb_t << "\n";
         return out;
     }
 
@@ -539,8 +539,8 @@ struct MlirEmitter {
            << "        %rc = stablehlo.maximum %ra, %rb : tensor<f32>\n"
            << "        stablehlo.return %rc : tensor<f32>\n"
            << "      }\n"
-           << "    " << c_i127 << " = stablehlo.constant dense<7.8740157e-03> : " << t1_f << "\n"
-           << "    " << c_eps  << " = stablehlo.constant dense<1.0000000e-06> : " << t1_f << "\n"
+           << "    " << c_i127 << " = stablehlo.constant dense<" << fmt_f32(1.0f / 127.0f) << "> : " << t1_f << "\n"
+           << "    " << c_eps  << " = stablehlo.constant dense<1.0000000e-12> : " << t1_f << "\n"
            << "    " << sc0    << " = stablehlo.multiply " << mx << ", " << c_i127 << " : " << t1_f << "\n"
            << "    " << sc     << " = stablehlo.maximum " << sc0 << ", " << c_eps << " : " << t1_f << "\n"
            << "    " << scb    << " = stablehlo.broadcast_in_dim " << sc << ", dims = [0] : (" << t1_f << ") -> " << t2_f << "\n"
@@ -2794,19 +2794,33 @@ bool HavenTpuGemma4Engine::build_and_upload_weights(const HavenEngine& host_engi
                         #pragma omp for schedule(static)
                         for (int r = 0; r < V_sh; ++r) {
                             Avx2Math::dequantize_row(row_f32.data(), *td, row_base + r, cols);
-                            float max_abs = 0.0f;
+                            double max_abs = 0.0;
                             for (int c = 0; c < cols; ++c) {
-                                float a = std::fabs(row_f32[static_cast<size_t>(c)]);
+                                const double a = std::fabs(static_cast<double>(row_f32[static_cast<size_t>(c)]));
                                 if (a > max_abs) max_abs = a;
                             }
-                            const float scale = (max_abs > 1e-12f) ? (max_abs / 127.0f) : 1.0f;
-                            const float inv_scale = (max_abs > 1e-12f) ? (127.0f / max_abs) : 0.0f;
-                            sc[static_cast<size_t>(r)] = scale;
                             int8_t* dst_r = sq.data() + static_cast<size_t>(r) * static_cast<size_t>(cols);
-                            for (int c = 0; c < cols; ++c) {
-                                int q = static_cast<int>(std::lrintf(row_f32[static_cast<size_t>(c)] * inv_scale));
-                                dst_r[c] = static_cast<int8_t>(std::clamp(q, -127, 127));
+                            if (max_abs <= 1e-12) {
+                                sc[static_cast<size_t>(r)] = 1.0f;
+                                std::memset(dst_r, 0, static_cast<size_t>(cols));
+                                continue;
                             }
+                            const double inv_scale = 127.0 / max_abs;
+                            double sum_wq = 0.0;
+                            double sum_qq = 0.0;
+                            for (int c = 0; c < cols; ++c) {
+                                const double w = static_cast<double>(row_f32[static_cast<size_t>(c)]);
+                                int q = static_cast<int>(std::lrint(w * inv_scale));
+                                q = std::clamp(q, -127, 127);
+                                dst_r[c] = static_cast<int8_t>(q);
+                                const double qd = static_cast<double>(q);
+                                sum_wq += w * qd;
+                                sum_qq += qd * qd;
+                            }
+                            // Closed-form FP64 least-squares optimal scale minimizes L2 quantization error on vocab/LM head
+                            sc[static_cast<size_t>(r)] = (sum_qq > 0.0)
+                                ? static_cast<float>(sum_wq / sum_qq)
+                                : static_cast<float>(max_abs / 127.0);
                         }
                     }
                 }
