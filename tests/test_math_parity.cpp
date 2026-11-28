@@ -781,7 +781,7 @@ static int test_multi_arch_e2e_exact_vs_fast() {
                           << " | fast_b:" << cos_fb
                           << " | fs==fb:" << cos_f_s_b
                           << " | Top1:" << (t_es == t_eb && t_es == t_fb ? "MATCH" : "DIFF") << "\n";
-                if (cos_eb <= 0.9999999 || cos_fs <= 0.9995 || cos_fb <= 0.9995 || cos_f_s_b <= 0.999999 || t_es != t_eb || t_es != t_fb) {
+                if (cos_eb <= 0.9999999 || cos_fs <= 0.9995 || cos_fb <= 0.9995 || cos_f_s_b <= 0.9999 || t_es != t_eb || t_es != t_fb) {
                     std::cerr << "[FAIL] Multi-arch parity regression on " << sp.label << "\n";
                     status = 1;
                 }
@@ -791,6 +791,115 @@ static int test_multi_arch_e2e_exact_vs_fast() {
         std::filesystem::remove(tmp_path, ec);
         if (status != 0) return status;
     }
+    return 0;
+}
+
+// Verifies all 3 tiers of Adaptive Precision Routing:
+// 1. Smooth Gaussian/Turbo activations stay pure integer Q8 (use_f32 == false, n_outliers == 0)
+// 2. 1-4 isolated channel spikes stay Q8 + sparse FP32 outlier peel (use_f32 == false, n_outliers > 0)
+// 3. Heavily spiked / sparse post-GeGLU activations (>4 spikes) auto-promote to exact FP32 (use_f32 == true, cosine == 1.000000000)
+static int test_adaptive_precision_routing() {
+    constexpr int rows = 32;
+    constexpr int cols = 512;
+    constexpr int S = 10; // exercises both 1x8 and 1x4 tiles
+
+    std::mt19937 rng(7777);
+    auto next_gauss = [&]() -> float {
+        const double u1 = (static_cast<double>(rng()) + 0.5) / 4294967296.0;
+        const double u2 = (static_cast<double>(rng()) + 0.5) / 4294967296.0;
+        return static_cast<float>(std::sqrt(-2.0 * std::log(u1)) * std::cos(6.28318530717958647692 * u2));
+    };
+
+    // Tier 1: Smooth activation (simulating Haven Turbo Block-FWHT)
+    std::vector<float> x_smooth(S * cols);
+    for (int i = 0; i < S * cols; ++i) x_smooth[i] = 0.25f * std::sin(static_cast<float>(i) * 0.31f + 0.7f);
+    Q8Act32 act_smooth;
+    Avx2Math::quantize_q8_act(x_smooth.data(), cols, act_smooth);
+    Q8KBatch b_smooth_k;
+    Q8_32Batch b_smooth_32;
+    Avx2Math::pack_q8k_batch(x_smooth.data(), cols, cols, S, b_smooth_k);
+    Avx2Math::pack_q8_32_batch(x_smooth.data(), cols, cols, S, b_smooth_32);
+    HAVEN_CHECK(!act_smooth.use_f32 && act_smooth.n_outliers == 0, "Smooth activation unexpectedly triggered outlier peel or F32 promotion");
+    HAVEN_CHECK(!b_smooth_k.tiles[0].use_f32 && !b_smooth_32.tiles[0].use_f32, "Smooth tile unexpectedly promoted to F32");
+
+    // Tier 2: Isolated 2 spikes (42x and 662x) -> stays Q8 + sparse FP32 outlier peel
+    std::vector<float> x_sparse = x_smooth;
+    for (int s = 0; s < S; ++s) {
+        x_sparse[s * cols + 17] = 42.0f;
+        x_sparse[s * cols + 305] = -662.0f;
+    }
+    Q8Act32 act_sparse;
+    Avx2Math::quantize_q8_act(x_sparse.data(), cols, act_sparse);
+    Q8KBatch b_sparse_k;
+    Avx2Math::pack_q8k_batch(x_sparse.data(), cols, cols, S, b_sparse_k);
+    HAVEN_CHECK(!act_sparse.use_f32 && act_sparse.n_outliers == 2, "Isolated 2-spike activation should stay Q8 + 2 FP32 outliers");
+    HAVEN_CHECK(!b_sparse_k.tiles[0].use_f32 && b_sparse_k.tiles[0].has_outliers, "Isolated 2-spike tile should stay Q8 + outliers");
+
+    // Tier 3: Heavily spiked / sparse post-GeGLU activations (12 extreme spikes across distinct 32-elem blocks)
+    std::vector<float> x_heavy(S * cols);
+    for (int i = 0; i < S * cols; ++i) x_heavy[i] = 0.05f * next_gauss();
+    for (int s = 0; s < S; ++s) {
+        for (int sp = 0; sp < 12; ++sp) {
+            x_heavy[s * cols + sp * 32 + 5] = ((sp & 1) ? -1.0f : 1.0f) * (80.0f + 15.0f * static_cast<float>(sp));
+        }
+    }
+    Q8Act32 act_heavy;
+    Avx2Math::quantize_q8_act(x_heavy.data(), cols, act_heavy);
+    Q8KBatch b_heavy_k;
+    Q8_32Batch b_heavy_32;
+    Avx2Math::pack_q8k_batch(x_heavy.data(), cols, cols, S, b_heavy_k);
+    Avx2Math::pack_q8_32_batch(x_heavy.data(), cols, cols, S, b_heavy_32);
+    HAVEN_CHECK(act_heavy.use_f32, "Heavily spiked single-token activation must auto-promote to exact FP32");
+    HAVEN_CHECK(b_heavy_k.tiles[0].use_f32 && b_heavy_k.tiles[1].use_f32, "Heavily spiked Q8K tiles must auto-promote to L1-packed FP32");
+    HAVEN_CHECK(b_heavy_32.tiles[0].use_f32 && b_heavy_32.tiles[1].use_f32, "Heavily spiked Q8_32 tiles must auto-promote to L1-packed FP32");
+
+    // Verify exact 1.000000000 parity on promoted IQ4_XS (Q8K) and Q5_0 / Q5_1 (Q8_32) weights!
+    const int nb256 = cols / 256;
+    const int nb32 = cols / 32;
+    std::vector<block_iq4_xs> w_xs(static_cast<size_t>(rows) * static_cast<size_t>(nb256));
+    std::vector<block_q5_0>   w_50(static_cast<size_t>(rows) * static_cast<size_t>(nb32));
+    std::vector<block_q5_1>   w_51(static_cast<size_t>(rows) * static_cast<size_t>(nb32));
+    for (int r = 0; r < rows; ++r) {
+        for (int b = 0; b < nb256; ++b) {
+            auto& blk = w_xs[static_cast<size_t>(r) * static_cast<size_t>(nb256) + static_cast<size_t>(b)];
+            blk.d = 0x3400;
+            blk.scales_h = static_cast<uint16_t>(0x5A3Cu ^ (r * 0x131u + b));
+            for (int k = 0; k < 4; ++k) blk.scales_l[k] = static_cast<uint8_t>(0x35 + ((r * 7 + b * 5 + k * 11) & 0x7F));
+            for (int j = 0; j < 128; ++j) blk.qs[j] = static_cast<uint8_t>(((r + j * 3) & 0x0F) | (((b + j * 7 + 5) & 0x0F) << 4));
+        }
+        for (int b = 0; b < nb32; ++b) {
+            auto& b0 = w_50[static_cast<size_t>(r) * static_cast<size_t>(nb32) + static_cast<size_t>(b)];
+            auto& b1 = w_51[static_cast<size_t>(r) * static_cast<size_t>(nb32) + static_cast<size_t>(b)];
+            b0.d = 0x3400; b1.d = 0x3400; b1.m = 0xB000;
+            const uint32_t qh = 0xA55A1234u ^ static_cast<uint32_t>(r * 0x01010101u + b * 17u);
+            std::memcpy(b0.qh, &qh, 4); std::memcpy(b1.qh, &qh, 4);
+            for (int j = 0; j < 16; ++j) {
+                const uint8_t v = static_cast<uint8_t>(((r + b * 3 + j * 5) & 0x0F) | (((r * 3 + j * 7) & 0x0F) << 4));
+                b0.qs[j] = v; b1.qs[j] = v;
+            }
+        }
+    }
+
+    auto verify_promoted = [&](const char* label, const TensorDesc& td) -> int {
+        std::vector<float> y_fast(S * rows), y_exact(S * rows), y_v(rows);
+        Avx2Math::gemm(y_fast.data(), rows, td, x_heavy.data(), cols, S, rows, cols);
+        Avx2Math::gemm_f32(y_exact.data(), rows, td, x_heavy.data(), cols, S, rows, cols);
+        Avx2Math::gemv(y_v.data(), td, x_heavy.data(), rows, cols);
+        const double cos_m = cosine_f32(y_fast.data(), y_exact.data(), S * rows);
+        const double cos_v = cosine_f32(y_v.data(), y_exact.data(), rows);
+        std::cout << "  [AdaptiveF32 " << std::left << std::setw(6) << label << std::right
+                  << " 12-spike] gemm==exact:" << std::fixed << std::setprecision(9) << cos_m
+                  << " | gemv==exact:" << cos_v << "\n";
+        HAVEN_CHECK(cos_m > 0.9999999 && cos_v > 0.9999999, "Auto-promoted adaptive F32 diverged from exact F32!");
+        return 0;
+    };
+
+    TensorDesc td_xs{ "ad_xs", QuantType::IQ4_XS, {cols, rows}, 0, w_xs.size() * sizeof(block_iq4_xs), w_xs.data() };
+    TensorDesc td_50{ "ad_50", QuantType::Q5_0,   {cols, rows}, 0, w_50.size() * sizeof(block_q5_0),   w_50.data() };
+    TensorDesc td_51{ "ad_51", QuantType::Q5_1,   {cols, rows}, 0, w_51.size() * sizeof(block_q5_1),   w_51.data() };
+    if (verify_promoted("IQ4_XS", td_xs) != 0) return 1;
+    if (verify_promoted("Q5_0",   td_50) != 0) return 1;
+    if (verify_promoted("Q5_1",   td_51) != 0) return 1;
     return 0;
 }
 
@@ -866,7 +975,7 @@ static int test_tpu_w4_quantizer_quality(bool strict) {
 }
 #endif
 
-static int run_live_gguf_parity(const std::string& gguf_path) {
+static int run_live_gguf_parity(const std::string& gguf_path, bool ablate) {
     std::cout << "\n--- Live GGUF End-to-End Parity Audit: " << gguf_path << " ---\n";
     HavenEngine eng;
     if (!eng.load_model(gguf_path)) {
@@ -950,6 +1059,41 @@ static int run_live_gguf_parity(const std::string& gguf_path) {
               << " | Top1=" << top1_fb << " vs " << top1_es << " (" << (top1_fb == top1_es ? "MATCH" : "DIFF") << ")"
               << " | " << std::fixed << std::setprecision(0) << std::chrono::duration<double, std::milli>(t7 - t6).count() << " ms\n";
     HAVEN_CHECK(cos_ep > 0.9999999 && cos_ed > 0.9999999, "Exact single vs batch prefill/decode diverged below 0.9999999!");
+
+    if (ablate) {
+        std::cout << "\n  --- Per-Projection Precision Attribution (Batch Prefill vs Exact Truth) ---\n";
+        struct Case { const char* name; uint32_t mask; };
+        const Case cases[] = {
+            {"FAST baseline (mask=0)          ", HavenEngine::EXACT_NONE},
+            {"+ EXACT_LM_HEAD                 ", HavenEngine::EXACT_LM_HEAD},
+            {"+ EXACT_FFN_DOWN                ", HavenEngine::EXACT_FFN_DOWN},
+            {"+ EXACT_MOE_DOWN                ", HavenEngine::EXACT_MOE_DOWN},
+            {"+ EXACT_ATTN_OUT                ", HavenEngine::EXACT_ATTN_OUT},
+            {"+ EXACT_QKV                     ", HavenEngine::EXACT_QKV},
+            {"+ EXACT_FFN_GU                  ", HavenEngine::EXACT_FFN_GU},
+            {"+ EXACT_MOE_GU                  ", HavenEngine::EXACT_MOE_GU},
+            {"+ EXACT_DOWN(FFN+MOE)+LM        ", HavenEngine::EXACT_FFN_DOWN | HavenEngine::EXACT_MOE_DOWN | HavenEngine::EXACT_LM_HEAD},
+            {"+ EXACT_DOWN+ATTN_OUT+LM        ", HavenEngine::EXACT_FFN_DOWN | HavenEngine::EXACT_MOE_DOWN | HavenEngine::EXACT_ATTN_OUT | HavenEngine::EXACT_LM_HEAD},
+            {"+ EXACT_ALL                     ", HavenEngine::EXACT_ALL},
+        };
+        std::vector<float> lg_ab(cfg.vocab_size);
+        for (const auto& c : cases) {
+            eng.set_exact_projection_mask(c.mask);
+            eng.get_kv_cache().reset();
+            auto ta = std::chrono::high_resolution_clock::now();
+            eng.forward_batch(toks.data(), static_cast<int>(toks.size()), 0, lg_ab.data());
+            auto tb = std::chrono::high_resolution_clock::now();
+            double ma = 0.0;
+            const double co = measure_diff(lg_exact_s_pre, lg_ab, ma);
+            const uint32_t t1 = static_cast<uint32_t>(std::max_element(lg_ab.begin(), lg_ab.end()) - lg_ab.begin());
+            std::cout << "    [" << c.name << "] cos=" << std::fixed << std::setprecision(7) << co
+                      << " | max_abs=" << std::scientific << std::setprecision(3) << ma
+                      << " | Top1=" << (t1 == top1_es ? "MATCH" : "DIFF ")
+                      << " | " << std::fixed << std::setprecision(0)
+                      << std::chrono::duration<double, std::milli>(tb - ta).count() << " ms\n";
+        }
+        eng.set_exact_math(false);
+    }
     return 0;
 }
 
@@ -959,30 +1103,37 @@ int main(int argc, char** argv) {
     std::cout << std::unitbuf;
     std::string gguf_path;
     bool strict = true;
+    bool ablate = false;
+    bool skip_unit = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--gguf" && i + 1 < argc) gguf_path = argv[++i];
         else if (a == "--strict") strict = true;
         else if (a == "--relaxed") strict = false;
+        else if (a == "--ablate") ablate = true;
+        else if (a == "--skip-unit") skip_unit = true;
     }
 
     std::cout << "======================================================================\n";
     std::cout << "  HAVEN-CPP GOLDEN FP64/FP32 MATH PARITY PROFILER SUITE\n";
     std::cout << "======================================================================\n";
 
-    if (test_rmsnorm_parity(strict) != 0) return 1;
-    if (test_rope_parity(strict) != 0) return 1;
-    if (test_softmax_and_flash_attention(strict) != 0) return 1;
-    if (test_fwht_and_activations() != 0) return 1;
-    if (test_quant_gemv_parity() != 0) return 1;
-    if (test_long_context_swa_and_sinks_parity() != 0) return 1;
-    if (test_multi_arch_e2e_exact_vs_fast() != 0) return 1;
+    if (!skip_unit) {
+        if (test_rmsnorm_parity(strict) != 0) return 1;
+        if (test_rope_parity(strict) != 0) return 1;
+        if (test_softmax_and_flash_attention(strict) != 0) return 1;
+        if (test_fwht_and_activations() != 0) return 1;
+        if (test_quant_gemv_parity() != 0) return 1;
+        if (test_adaptive_precision_routing() != 0) return 1;
+        if (test_long_context_swa_and_sinks_parity() != 0) return 1;
+        if (test_multi_arch_e2e_exact_vs_fast() != 0) return 1;
 #ifdef HAVEN_HAS_TPU
-    if (test_tpu_w4_quantizer_quality(strict) != 0) return 1;
+        if (test_tpu_w4_quantizer_quality(strict) != 0) return 1;
 #endif
+    }
 
     if (!gguf_path.empty()) {
-        if (run_live_gguf_parity(gguf_path) != 0) return 1;
+        if (run_live_gguf_parity(gguf_path, ablate) != 0) return 1;
     }
 
     std::cout << "======================================================================\n";

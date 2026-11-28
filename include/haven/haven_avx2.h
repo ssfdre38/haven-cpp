@@ -38,13 +38,21 @@ struct Q8Act32 {
 
     Q8Outlier outliers[MAX_OUTLIERS];
     int n_outliers = 0;
+
+    // Adaptive Precision Routing: when a vector has excessive channel spikes (e.g. un-baked stock
+    // post-GeGLU or norm spikes), bypassing Q8+scalar outliers to exact FP32 is both faster & exact!
+    bool use_f32 = false;
+    std::vector<float> x_f32_buf;
 };
 
 // Block-major packed 32-elem-scaled Q8 activation batch for register-tiled 1x8 / 1x4 AVX2 GEMM
 // Supports IQ4_XS, Q4_K, Q5_K, Q6_K with per-32-element dynamic scales matching Q8Act32 & CUDA Q8_1!
+// Tiles with heavy outlier density auto-promote to L1-packed contiguous FP32 1x4/1x8 microkernels.
 struct Q8KBatch {
     struct Tile {
         int n_tok = 0;                 // 1..8 active tokens in this tile
+        bool use_f32 = false;          // Adaptive exact FP32 tile promotion for heavily spiked tiles
+        std::vector<float>   x_f32;    // [cols * NTok] L1-packed [cols/8][NTok][8] when use_f32 == true
         std::vector<int8_t>  qs;       // [nb256 * 8 * 8 * 32] contiguous per 32-elem sub-block
         std::vector<float>   d;        // [nb256 * 8 * 8] per-32-elem dynamic scale (zero 256-elem outlier crush!)
         std::vector<float>   sumf;     // [nb256 * 8 * 8] exact FP32 32-elem sums (for Q4_K/Q5_K)
@@ -63,6 +71,8 @@ struct Q8KBatch {
 struct Q8_32Batch {
     struct Tile {
         int n_tok = 0;                 // 1..8 active tokens in this tile
+        bool use_f32 = false;          // Adaptive exact FP32 tile promotion for heavily spiked tiles
+        std::vector<float>   x_f32;    // [cols * NTok] L1-packed [cols/8][NTok][8] when use_f32 == true
         std::vector<int8_t>  qs;       // [nb32 * 8 * 32]
         std::vector<float>   d;        // [nb32 * 8]
         std::vector<float>   sumf;     // [nb32 * 8]

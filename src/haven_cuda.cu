@@ -1254,7 +1254,10 @@ __global__ void k_dequant_rows_f32(const uint8_t* __restrict__ W, QuantType qtyp
 
 __global__ void k_f32_to_f16(const float* __restrict__ src, __half* __restrict__ dst, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dst[i] = __float2half(src[i]);
+    if (i < n) {
+        const float v = fminf(fmaxf(src[i], -65504.0f), 65504.0f);
+        dst[i] = __float2half(v);
+    }
 }
 
 __global__ void k_add_bias_2d(float* __restrict__ y, const float* __restrict__ bias, int S, int N) {
@@ -2713,7 +2716,9 @@ struct HavenCudaEngine::Impl {
             if (mc.turbo_hadamard_ffn_down > 0 && (F_hid % static_cast<int>(mc.turbo_hadamard_ffn_down)) == 0) {
                 launch_fwht(d_ffn_g, S * F_hid, static_cast<int>(mc.turbo_hadamard_ffn_down));
             }
-            linear_forward(gl.ffn_down, nullptr, d_ffn_g, d_ffn_d, S);
+            // Adaptive exact FP32 ffn_down for bandwidth-bound S==1 decode on un-baked stock models (post-GeGLU spikes)
+            const bool exact_ffn_dn = exact_fp32_act || (S == 1 && mc.turbo_hadamard_ffn_down == 0);
+            linear_forward(gl.ffn_down, nullptr, d_ffn_g, d_ffn_d, S, 1.0f, false, exact_ffn_dn);
 
             // 2i. Optional Parallel Sparse MoE Branch (100% GPU-resident, zero host sync!)
             if (gl.has_moe) {
@@ -2760,8 +2765,10 @@ struct HavenCudaEngine::Impl {
                     if (mc.turbo_hadamard_moe_down > 0 && (F_exp % static_cast<int>(mc.turbo_hadamard_moe_down)) == 0) {
                         launch_fwht(d_moe_act, S * K_used * F_exp, static_cast<int>(mc.turbo_hadamard_moe_down));
                     }
+                    // Adaptive exact FP32 MoE down on un-baked stock models (skips Q8_1 quantize, uses 8-tok FP32 grouped kernel!)
+                    const bool exact_moe_dn = exact_fp32_act || (mc.turbo_hadamard_moe_down == 0);
                     const block_q8_1_gpu* aq_grp = nullptr;
-                    if (!exact_fp32_act) {
+                    if (!exact_moe_dn) {
                         quantize_q8(d_moe_act, d_moe_act_q8, S * K_used * F_exp);
                         aq_grp = d_moe_act_q8;
                     }
@@ -2788,8 +2795,9 @@ struct HavenCudaEngine::Impl {
                     if (mc.turbo_hadamard_moe_down > 0 && (F_exp % static_cast<int>(mc.turbo_hadamard_moe_down)) == 0) {
                         launch_fwht(d_moe_act, S * K_used * F_exp, static_cast<int>(mc.turbo_hadamard_moe_down));
                     }
+                    const bool exact_moe_dn = exact_fp32_act || (mc.turbo_hadamard_moe_down == 0);
                     const block_q8_1_gpu* aq_moe = nullptr;
-                    if (!exact_fp32_act) {
+                    if (!exact_moe_dn) {
                         quantize_q8(d_moe_act, d_moe_act_q8, S * K_used * F_exp);
                         aq_moe = d_moe_act_q8;
                     }
@@ -2826,11 +2834,11 @@ struct HavenCudaEngine::Impl {
             }
         }
 
-        // 3. Final Output RMSNorm + 262k LM Head + Softcap + Optional On-GPU Argmax
+        // 3. Final Output RMSNorm + 262k LM Head (exact FP32-act, bandwidth-bound!) + Softcap + Optional On-GPU Argmax
         if (compute_lm_head) {
             const float* d_x_last = d_x + static_cast<size_t>(S - 1) * static_cast<size_t>(D);
             k_rms_norm_rows<<<1, 256, 0, stream>>>(d_norm, d_x_last, d_out_norm, D, mc.rms_norm_eps);
-            linear_forward(lm_head, nullptr, d_norm, d_logits, 1);
+            linear_forward(lm_head, nullptr, d_norm, d_logits, 1, 1.0f, false, true);
             if (mc.final_logit_softcapping > 0.0f) {
                 k_softcap_inplace<<<(V + 255) / 256, 256, 0, stream>>>(d_logits, V, mc.final_logit_softcapping);
             }

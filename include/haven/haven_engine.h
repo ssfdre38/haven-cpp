@@ -154,10 +154,33 @@ public:
     float get_speculative_acceptance_rate() const { return speculative_engine_.get_acceptance_rate(); }
     void set_speculative_enabled(bool enabled) { speculative_enabled_ = enabled; }
     bool is_speculative_enabled() const { return speculative_enabled_; }
+    // Fine-grained per-projection FP32-activation precision bitmask (for adaptive precision & attribution profiling)
+    enum ExactProjectionMask : uint32_t {
+        EXACT_NONE     = 0u,
+        EXACT_QKV      = 1u << 0,
+        EXACT_ATTN_OUT = 1u << 1,
+        EXACT_FFN_GU   = 1u << 2,
+        EXACT_FFN_DOWN = 1u << 3,
+        EXACT_MOE_GU   = 1u << 4,
+        EXACT_MOE_DOWN = 1u << 5,
+        EXACT_LM_HEAD  = 1u << 6,
+        EXACT_PLEIAS   = 1u << 7,
+        EXACT_GEGLU    = 1u << 8,
+        EXACT_ALL      = 0x1FFu
+    };
+
     // Exact FP32-Activation Math Mode: bypasses 8-bit Q8Act32 activation quantization across all projections
     // while keeping weights compressed in native GGUF blocks (targets 0.999999+ / 1.0000 parity).
-    void set_exact_math(bool enabled) { exact_math_mode_ = enabled; }
+    void set_exact_math(bool enabled) {
+        exact_math_mode_ = enabled;
+        exact_mask_ = enabled ? EXACT_ALL : EXACT_NONE;
+    }
     bool is_exact_math() const { return exact_math_mode_; }
+    void set_exact_projection_mask(uint32_t mask) {
+        exact_mask_ = mask;
+        exact_math_mode_ = ((mask & EXACT_ALL) == EXACT_ALL);
+    }
+    uint32_t get_exact_projection_mask() const { return exact_mask_; }
     SpeculativeEngine& get_speculative_engine() { return speculative_engine_; }
     const SpeculativeEngine& get_speculative_engine() const { return speculative_engine_; }
     std::string get_json_telemetry(int pos, uint32_t token) const { return telemetry_engine_.to_json_telemetry(pos, token); }
@@ -223,6 +246,7 @@ private:
     SpeculativeEngine speculative_engine_;
     bool speculative_enabled_ = false;
     bool exact_math_mode_ = false;
+    uint32_t exact_mask_ = EXACT_NONE;
     FlashAttentionCpu flash_attn_;
     ChunkedPrefillScheduler chunked_prefill_;
     
