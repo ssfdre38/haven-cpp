@@ -439,16 +439,15 @@ int main(int argc, char** argv) {
     auto prompt_toks = host_engine.tokenize(prompt_str, true);
     std::cout << "Prompt tokens: " << prompt_toks.size() << "\n";
 
+    // Always compute CPU ground truth in exact FP64/FP32 batch mode (fast + exact reference!)
+    host_engine.set_exact_math(true);
     std::vector<float> cpu_ref_logits(mc.vocab_size, 0.0f);
     host_engine.get_kv_cache().reset();
     auto cpu0 = std::chrono::high_resolution_clock::now();
-    for (size_t i = 0; i < prompt_toks.size(); ++i) {
-        bool is_last = (i + 1 == prompt_toks.size());
-        host_engine.forward(prompt_toks[i], static_cast<int>(i), is_last ? cpu_ref_logits.data() : nullptr);
-    }
+    host_engine.forward_batch(prompt_toks.data(), static_cast<int>(prompt_toks.size()), 0, cpu_ref_logits.data());
     auto cpu1 = std::chrono::high_resolution_clock::now();
     uint32_t cpu_top1 = static_cast<uint32_t>(std::max_element(cpu_ref_logits.begin(), cpu_ref_logits.end()) - cpu_ref_logits.begin());
-    std::cout << "[CPU Ground Truth] Prefill (" << prompt_toks.size() << " toks): "
+    std::cout << "[EXACT CPU Ground Truth] Prefill (" << prompt_toks.size() << " toks): "
               << std::fixed << std::setprecision(1)
               << std::chrono::duration<double, std::milli>(cpu1 - cpu0).count()
               << " ms | Top1 Token=" << cpu_top1 << " (\"" << host_engine.detokenize(cpu_top1) << "\")\n";
@@ -483,9 +482,7 @@ int main(int argc, char** argv) {
             gt.lg1.assign(mc.vocab_size, 0.0f);
             gt.lg2.assign(mc.vocab_size, 0.0f);
             host_engine.get_kv_cache().reset();
-            for (size_t i = 0; i < toks.size(); ++i) {
-                host_engine.forward(toks[i], static_cast<int>(i), (i + 1 == toks.size()) ? gt.lg1.data() : nullptr);
-            }
+            host_engine.forward_batch(toks.data(), static_cast<int>(toks.size()), 0, gt.lg1.data());
             gt.t1 = static_cast<uint32_t>(std::max_element(gt.lg1.begin(), gt.lg1.end()) - gt.lg1.begin());
             host_engine.forward(gt.t1, static_cast<int>(toks.size()), gt.lg2.data());
             gt.t2 = static_cast<uint32_t>(std::max_element(gt.lg2.begin(), gt.lg2.end()) - gt.lg2.begin());
@@ -655,7 +652,12 @@ int main(int argc, char** argv) {
 
         if (full_logits && tpu_logits.size() >= mc.vocab_size) {
             double cos_v = cosine_sim(cpu_ref_logits.data(), tpu_logits.data(), mc.vocab_size);
-            std::cout << "  Parity vs CPU  : Cosine=" << std::setprecision(6) << cos_v
+            double max_d = 0.0;
+            for (size_t i = 0; i < mc.vocab_size; ++i) {
+                max_d = std::max(max_d, std::fabs(static_cast<double>(cpu_ref_logits[i]) - static_cast<double>(tpu_logits[i])));
+            }
+            std::cout << "  Parity vs CPU  : Cosine=" << std::setprecision(7) << cos_v
+                      << " | max_abs=" << std::scientific << std::setprecision(2) << max_d << std::fixed
                       << " | Top1=" << first_tok << " (CPU=" << cpu_top1
                       << ", Match=" << (first_tok == cpu_top1 ? "YES" : "NO") << ")\n";
         } else {

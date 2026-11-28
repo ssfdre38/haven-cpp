@@ -82,9 +82,9 @@ int main(int argc, char** argv) {
         std::cerr << "Failed to load GGUF: " << model_path << "\n";
         return 1;
     }
-    if (exact_mode || fp32_act) {
-        host_engine.set_exact_math(true);
-    }
+    // Always evaluate CPU ground truth in exact FP64/FP32 mode so both FAST-Q8 and EXACT GPU modes
+    // are measured honestly against the true uncompressed dequantized reference!
+    host_engine.set_exact_math(true);
     const auto& mc = host_engine.get_config();
     std::cout << "Loaded Model: " << model_path << " (" << mc.architecture
               << ", " << mc.num_layers << "L, D=" << mc.embedding_dim
@@ -126,9 +126,7 @@ int main(int argc, char** argv) {
         std::vector<float> cpu_lg1(mc.vocab_size, 0.0f), cpu_lg2(mc.vocab_size, 0.0f);
         host_engine.get_kv_cache().reset();
         auto c0 = std::chrono::high_resolution_clock::now();
-        for (size_t i = 0; i < prompt_toks.size(); ++i) {
-            host_engine.forward(prompt_toks[i], static_cast<int>(i), (i + 1 == prompt_toks.size()) ? cpu_lg1.data() : nullptr);
-        }
+        host_engine.forward_batch(prompt_toks.data(), static_cast<int>(prompt_toks.size()), 0, cpu_lg1.data());
         uint32_t cpu_t1 = static_cast<uint32_t>(std::max_element(cpu_lg1.begin(), cpu_lg1.end()) - cpu_lg1.begin());
         host_engine.forward(cpu_t1, static_cast<int>(prompt_toks.size()), cpu_lg2.data());
         uint32_t cpu_t2 = static_cast<uint32_t>(std::max_element(cpu_lg2.begin(), cpu_lg2.end()) - cpu_lg2.begin());
@@ -149,12 +147,12 @@ int main(int argc, char** argv) {
             max_d1 = std::max(max_d1, std::fabs(static_cast<double>(cpu_lg1[i]) - static_cast<double>(gpu_lg1[i])));
             max_d2 = std::max(max_d2, std::fabs(static_cast<double>(cpu_lg2[i]) - static_cast<double>(gpu_lg2[i])));
         }
-        std::cout << "[PARITY vs F32 CPU (" << std::setprecision(0)
+        std::cout << "[PARITY vs EXACT F32/F64 CPU (" << std::setprecision(0)
                   << std::chrono::duration<double, std::milli>(c1 - c0).count() << " ms CPU)]\n"
-                  << "  Prefill (S=" << prompt_toks.size() << "): Cosine=" << std::setprecision(7) << cos1
+                  << "  Prefill (S=" << prompt_toks.size() << "): Cosine=" << std::setprecision(8) << cos1
                   << " | max_abs=" << std::scientific << std::setprecision(2) << max_d1 << std::fixed
                   << " | Top1=" << gpu_t1 << " (CPU=" << cpu_t1 << ", Match=" << (gpu_t1 == cpu_t1 ? "YES" : "NO") << ")\n"
-                  << "  Decode  (S=1) : Cosine=" << std::setprecision(7) << cos2
+                  << "  Decode  (S=1) : Cosine=" << std::setprecision(8) << cos2
                   << " | max_abs=" << std::scientific << std::setprecision(2) << max_d2 << std::fixed
                   << " | Top1=" << gpu_t2 << " (CPU=" << cpu_t2 << ", Match=" << (gpu_t2 == cpu_t2 ? "YES" : "NO") << ")\n";
         if (cos1 < 0.99 || cos2 < 0.99) {
