@@ -112,8 +112,11 @@ __device__ __forceinline__ float d_to_f32<__half>(__half v) { return __half2floa
 
 __device__ __forceinline__ float d_gelu_tanh(float g) {
     const double gd = static_cast<double>(g);
-    const double cdf = 0.5 * (1.0 + tanh(0.79788456080286535588 * (gd + 0.044715 * gd * gd * gd)));
-    return static_cast<float>(gd * cdf);
+    const double gc = fmin(15.0, fmax(-15.0, gd));
+    const double z  = 0.79788456080286535588 * (gc + 0.044715 * gc * gc * gc);
+    if (z < -350.0) return 0.0f;
+    if (z >  350.0) return g;
+    return static_cast<float>(gd / (1.0 + exp(-2.0 * z)));
 }
 
 __device__ __forceinline__ float d_silu(float g) {

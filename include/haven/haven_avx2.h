@@ -16,9 +16,9 @@ struct Q8Outlier {
 };
 
 // Cache-aligned 32-element INT8 activation buffer for high-throughput AVX2 vpmaddubsw/vpmaddwd GEMV
-// Stack-backed up to 16,384 elements (512 blocks) for zero heap allocations on the hot inference path.
+// Stack-backed up to 24,576 elements (768 blocks) for zero heap allocations even on 31B F=21504 FFN Down!
 struct Q8Act32 {
-    static constexpr int MAX_STACK_BLOCKS = 512;
+    static constexpr int MAX_STACK_BLOCKS = 768;
     static constexpr int MAX_OUTLIERS     = 128;
     alignas(32) int8_t  qs_stack[MAX_STACK_BLOCKS * 32];
     alignas(32) float   d_stack[MAX_STACK_BLOCKS];

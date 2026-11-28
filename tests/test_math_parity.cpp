@@ -323,7 +323,7 @@ static int test_fwht_and_activations() {
     HAVEN_CHECK(std::fabs(n1 - n0) / n0 < 1e-6, "FWHT norm preservation exceeded 1e-6");
     HAVEN_CHECK(inv_err < 1e-4, "FWHT roundtrip error exceeded 1e-4");
 
-    // GELU & SiLU accuracy over [-12, +12]
+    // GELU & SiLU accuracy over [-12, +12] + extreme negative/positive dead-neuron check [-500, +500]
     const int M = 2401;
     std::vector<float> g_in(M), s_in(M);
     std::vector<double> g_ref(M), s_ref(M);
@@ -339,8 +339,14 @@ static int test_fwht_and_activations() {
     Avx2Math::silu(s_in.data(), M);
     const double eg = max_abs_f64_vs_f32(g_ref.data(), g_in.data(), M);
     const double es = max_abs_f64_vs_f32(s_ref.data(), s_in.data(), M);
-    std::cout << "  [Activations [-12,+12]]     gelu_max_abs=" << std::scientific << std::setprecision(3) << eg
-              << " | silu_max_abs=" << es << "\n";
+    std::vector<float> g_ext = {-500.0f, -100.0f, -30.0f, -15.0f, 15.0f, 30.0f, 100.0f, 500.0f};
+    Avx2Math::gelu(g_ext.data(), static_cast<int>(g_ext.size()));
+    HAVEN_CHECK(g_ext[0] == 0.0f && g_ext[1] == 0.0f && g_ext[2] == 0.0f && g_ext[3] == 0.0f,
+                "GELU dead negative neuron leaked non-zero value!");
+    HAVEN_CHECK(g_ext[4] == 15.0f && g_ext[5] == 30.0f && g_ext[6] == 100.0f && g_ext[7] == 500.0f,
+                "GELU positive saturation drifted from exact identity!");
+    std::cout << "  [Activations [-500,+500]]   gelu_max_abs=" << std::scientific << std::setprecision(3) << eg
+              << " | silu_max_abs=" << es << " | dead_neg=0.0\n";
     HAVEN_CHECK(eg < 2e-6 && es < 2e-6, "GELU/SiLU accuracy exceeded 2e-6");
     return 0;
 }
@@ -1082,6 +1088,7 @@ static int run_live_gguf_parity(const std::string& gguf_path, bool ablate) {
             {"+ EXACT_QKV                     ", HavenEngine::EXACT_QKV},
             {"+ EXACT_FFN_GU                  ", HavenEngine::EXACT_FFN_GU},
             {"+ EXACT_MOE_GU                  ", HavenEngine::EXACT_MOE_GU},
+            {"+ EXACT_GEGLU                   ", HavenEngine::EXACT_GEGLU},
             {"+ EXACT_DOWN(FFN+MOE)+LM        ", HavenEngine::EXACT_FFN_DOWN | HavenEngine::EXACT_MOE_DOWN | HavenEngine::EXACT_LM_HEAD},
             {"+ EXACT_DOWN+ATTN_OUT+LM        ", HavenEngine::EXACT_FFN_DOWN | HavenEngine::EXACT_MOE_DOWN | HavenEngine::EXACT_ATTN_OUT | HavenEngine::EXACT_LM_HEAD},
             {"+ EXACT_ALL                     ", HavenEngine::EXACT_ALL},

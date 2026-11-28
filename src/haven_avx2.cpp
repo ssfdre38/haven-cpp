@@ -2,6 +2,9 @@
 #include <algorithm>
 #include <cstring>
 #include <iostream>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace haven {
 
@@ -696,14 +699,17 @@ float Avx2Math::vec_dot_f32(int n, const float* vx, const float* vy) {
 }
 
 // Exact FP64-evaluated In-Place GELU for Gemma 4 (GeGLU)
+// Uses cancellation-free identity g / (1 + exp(-2z)) so dead negative neurons hit exact 0.0 with full 53-bit SNR!
 void Avx2Math::gelu(float* x, int size) {
     constexpr double sqrt_2_over_pi = 0.79788456080286535588;
     constexpr double coef = 0.044715;
     #pragma omp parallel for if(size >= 2048) schedule(static)
     for (int i = 0; i < size; ++i) {
         const double xi = static_cast<double>(x[i]);
-        const double cdf = 0.5 * (1.0 + std::tanh(sqrt_2_over_pi * (xi + coef * xi * xi * xi)));
-        x[i] = static_cast<float>(xi * cdf);
+        const double xc = std::clamp(xi, -15.0, 15.0);
+        const double z = sqrt_2_over_pi * (xc + coef * xc * xc * xc);
+        const double res = (z < -350.0) ? 0.0 : ((z > 350.0) ? xi : (xi / (1.0 + std::exp(-2.0 * z))));
+        x[i] = static_cast<float>(res);
     }
 }
 
@@ -1810,8 +1816,15 @@ void Avx2Math::pack_q8k_batch(const float* X, int stride_x, int cols, int n_toke
     const int nb32 = out.nb256 * 8;
     out.tiles.resize(static_cast<size_t>(n_tiles));
 
-    Q8Act32 tmp;
+#ifdef _OPENMP
+    const bool do_parallel = (n_tiles >= 2) && !omp_in_parallel();
+#else
+    const bool do_parallel = false;
+#endif
+
+    #pragma omp parallel for if(do_parallel) schedule(static)
     for (int g = 0; g < n_tiles; ++g) {
+        Q8Act32 tmp;
         auto& tile = out.tiles[static_cast<size_t>(g)];
         const int t_base = g * 8;
         const int n_tok = std::min(8, n_tokens - t_base);
@@ -1819,17 +1832,21 @@ void Avx2Math::pack_q8k_batch(const float* X, int stride_x, int cols, int n_toke
         tile.use_f32 = false;
         tile.has_outliers = false;
         tile.x_f32.clear();
-        tile.qs.assign(static_cast<size_t>(nb32) * 8ULL * 32ULL, 0);
-        tile.d.assign(static_cast<size_t>(nb32) * 8ULL, 0.0f);
-        tile.sumf.assign(static_cast<size_t>(nb32) * 8ULL, 0.0f);
-        tile.bsum16.assign(static_cast<size_t>(nb32) * 8ULL * 2ULL, 0);
 
+        bool alloc_q8 = false;
         bool promote_f32 = false;
         for (int t = 0; t < n_tok; ++t) {
             quantize_q8_act(X + static_cast<size_t>(t_base + t) * static_cast<size_t>(stride_x), cols, tmp, extract_outliers);
             if (extract_outliers && tmp.use_f32) {
                 promote_f32 = true;
                 break;
+            }
+            if (!alloc_q8) {
+                tile.qs.assign(static_cast<size_t>(nb32) * 8ULL * 32ULL, 0);
+                tile.d.assign(static_cast<size_t>(nb32) * 8ULL, 0.0f);
+                tile.sumf.assign(static_cast<size_t>(nb32) * 8ULL, 0.0f);
+                tile.bsum16.assign(static_cast<size_t>(nb32) * 8ULL * 2ULL, 0);
+                alloc_q8 = true;
             }
             tile.n_outliers[t] = tmp.n_outliers;
             if (tmp.n_outliers > 0) {
@@ -1849,10 +1866,12 @@ void Avx2Math::pack_q8k_batch(const float* X, int stride_x, int cols, int n_toke
             // Heavily spiked tile: skip Q8+scalar outliers & route straight to L1-packed 1x4/1x8 Exact FP32!
             tile.use_f32 = true;
             tile.has_outliers = false;
-            tile.qs.clear();
-            tile.d.clear();
-            tile.sumf.clear();
-            tile.bsum16.clear();
+            if (alloc_q8) {
+                tile.qs.clear();
+                tile.d.clear();
+                tile.sumf.clear();
+                tile.bsum16.clear();
+            }
             for (int t = 0; t < 8; ++t) tile.n_outliers[t] = 0;
             const float* x_tile = X + static_cast<size_t>(t_base) * static_cast<size_t>(stride_x);
             if (n_tok <= 4) pack_f32_tile<4>(x_tile, stride_x, cols, n_tok, tile.x_f32);
@@ -1872,8 +1891,15 @@ void Avx2Math::pack_q8_32_batch(const float* X, int stride_x, int cols, int n_to
     const int n_tiles = (n_tokens + 7) / 8;
     out.tiles.resize(static_cast<size_t>(n_tiles));
 
-    Q8Act32 tmp;
+#ifdef _OPENMP
+    const bool do_parallel = (n_tiles >= 2) && !omp_in_parallel();
+#else
+    const bool do_parallel = false;
+#endif
+
+    #pragma omp parallel for if(do_parallel) schedule(static)
     for (int g = 0; g < n_tiles; ++g) {
+        Q8Act32 tmp;
         auto& tile = out.tiles[static_cast<size_t>(g)];
         const int t_base = g * 8;
         const int n_tok = std::min(8, n_tokens - t_base);
@@ -1881,17 +1907,21 @@ void Avx2Math::pack_q8_32_batch(const float* X, int stride_x, int cols, int n_to
         tile.use_f32 = false;
         tile.has_outliers = false;
         tile.x_f32.clear();
-        tile.qs.assign(static_cast<size_t>(out.nb32) * 8ULL * 32ULL, 0);
-        tile.d.assign(static_cast<size_t>(out.nb32) * 8ULL, 0.0f);
-        tile.sumf.assign(static_cast<size_t>(out.nb32) * 8ULL, 0.0f);
-        tile.bsum32.assign(static_cast<size_t>(out.nb32) * 8ULL, 0);
 
+        bool alloc_q8 = false;
         bool promote_f32 = false;
         for (int t = 0; t < n_tok; ++t) {
             quantize_q8_act(X + static_cast<size_t>(t_base + t) * static_cast<size_t>(stride_x), cols, tmp, extract_outliers);
             if (extract_outliers && tmp.use_f32) {
                 promote_f32 = true;
                 break;
+            }
+            if (!alloc_q8) {
+                tile.qs.assign(static_cast<size_t>(out.nb32) * 8ULL * 32ULL, 0);
+                tile.d.assign(static_cast<size_t>(out.nb32) * 8ULL, 0.0f);
+                tile.sumf.assign(static_cast<size_t>(out.nb32) * 8ULL, 0.0f);
+                tile.bsum32.assign(static_cast<size_t>(out.nb32) * 8ULL, 0);
+                alloc_q8 = true;
             }
             tile.n_outliers[t] = tmp.n_outliers;
             if (tmp.n_outliers > 0) {
@@ -1910,10 +1940,12 @@ void Avx2Math::pack_q8_32_batch(const float* X, int stride_x, int cols, int n_to
         if (promote_f32) {
             tile.use_f32 = true;
             tile.has_outliers = false;
-            tile.qs.clear();
-            tile.d.clear();
-            tile.sumf.clear();
-            tile.bsum32.clear();
+            if (alloc_q8) {
+                tile.qs.clear();
+                tile.d.clear();
+                tile.sumf.clear();
+                tile.bsum32.clear();
+            }
             for (int t = 0; t < 8; ++t) tile.n_outliers[t] = 0;
             const float* x_tile = X + static_cast<size_t>(t_base) * static_cast<size_t>(stride_x);
             if (n_tok <= 4) pack_f32_tile<4>(x_tile, stride_x, cols, n_tok, tile.x_f32);
